@@ -44,6 +44,14 @@ Prune unused Docker resources.
 
 At least one option must be true.
 
+### GET /version
+Returns the currently deployed tag.
+
+**Response:**
+```json
+{"status": "ok", "tag": "v1.0.0"}
+```
+
 ### POST /git/checkout
 Checkout a specific git tag.
 
@@ -60,7 +68,7 @@ Checkout a specific git tag.
 |----------|----------|---------|-------------|
 | `GITHUB_REPO` | Yes | - | GitHub repository URL (e.g., `https://github.com/owner/repo`) |
 | `BEARER_TOKEN` | Yes | - | Bearer token for authenticating requests |
-| `REPO_PATH` | No | `/app/repo` | Local path to clone repository |
+| `WORK_DIR` | No | `/app/work` | Directory for downloaded compose files |
 | `MIN_TAG_AGE_HOURS` | No | `48` | Minimum tag age in hours before checkout is allowed |
 
 ## Usage
@@ -70,7 +78,7 @@ Checkout a specific git tag.
 ```bash
 export GITHUB_REPO="https://github.com/owner/repo"
 export BEARER_TOKEN="your-secret-token"
-export REPO_PATH="/tmp/repo"
+export WORK_DIR="/tmp/work"
 export MIN_TAG_AGE_HOURS="0"  # Optional: disable age check for testing
 
 cargo run --release
@@ -110,6 +118,28 @@ curl -X POST http://localhost:8080/docker/clean \
   -H "Authorization: Bearer your-secret-token" \
   -H "Content-Type: application/json" \
   -d '{"volumes": true, "images": true}'
+```
+
+### Docker Compose
+
+```yaml
+services:
+  compose-manager:
+    image: ${DOCKER_REGISTRY_USER}/compose-manager:latest
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      GITHUB_REPO: "https://github.com/owner/repo"
+      BEARER_TOKEN: "${BEARER_TOKEN}"
+      WORK_DIR: "/app/work"
+      MIN_TAG_AGE_HOURS: "48"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - work:/app/work
+
+volumes:
+  work:
 ```
 
 ### Docker
