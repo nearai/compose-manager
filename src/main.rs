@@ -133,6 +133,35 @@ mod dstack {
 
 // --- Application State ---
 
+fn actions_file(work_dir: &Path) -> PathBuf {
+    work_dir.join("actions.json")
+}
+
+fn load_actions_from_disk(work_dir: &Path) -> Vec<DeploymentAction> {
+    match std::fs::read_to_string(actions_file(work_dir)) {
+        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn persist_actions_to_disk(work_dir: &Path, actions: &[DeploymentAction]) {
+    let json = match serde_json::to_string(actions) {
+        Ok(s) => s,
+        Err(e) => {
+            error!(error = %e, "Failed to serialize actions for persistence");
+            return;
+        }
+    };
+    let tmp = work_dir.join("actions.json.tmp");
+    if let Err(e) = std::fs::write(&tmp, &json) {
+        error!(error = %e, "Failed to write actions.json.tmp");
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp, actions_file(work_dir)) {
+        error!(error = %e, "Failed to rename actions.json.tmp to actions.json");
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct DeploymentAction {
     timestamp: String,
@@ -731,16 +760,20 @@ async fn compose_up(
         Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
 
-    state.actions.write().await.push(DeploymentAction {
-        timestamp: Utc::now().to_rfc3339(),
-        action: "compose_up".into(),
-        tag: Some(payload.tag.clone()),
-        commit: Some(tag_info.commit_sha.clone()),
-        file: Some(file.clone()),
-        file_sha256: Some(file_sha256.clone()),
-        services: payload.services,
-        container: None,
-    });
+    {
+        let mut actions = state.actions.write().await;
+        actions.push(DeploymentAction {
+            timestamp: Utc::now().to_rfc3339(),
+            action: "compose_up".into(),
+            tag: Some(payload.tag.clone()),
+            commit: Some(tag_info.commit_sha.clone()),
+            file: Some(file.clone()),
+            file_sha256: Some(file_sha256.clone()),
+            services: payload.services,
+            container: None,
+        });
+        persist_actions_to_disk(&state.work_dir, &actions);
+    }
     *state.deployed_tag.write().await = Some(payload.tag);
     *state.deployed_commit.write().await = Some(tag_info.commit_sha);
     *state.deployed_file.write().await = Some(file);
@@ -800,16 +833,20 @@ async fn compose_down(
         Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
 
-    state.actions.write().await.push(DeploymentAction {
-        timestamp: Utc::now().to_rfc3339(),
-        action: "compose_down".into(),
-        tag: Some(payload.tag),
-        commit: Some(tag_info.commit_sha),
-        file: Some(file),
-        file_sha256: None,
-        services: payload.services,
-        container: None,
-    });
+    {
+        let mut actions = state.actions.write().await;
+        actions.push(DeploymentAction {
+            timestamp: Utc::now().to_rfc3339(),
+            action: "compose_down".into(),
+            tag: Some(payload.tag),
+            commit: Some(tag_info.commit_sha),
+            file: Some(file),
+            file_sha256: None,
+            services: payload.services,
+            container: None,
+        });
+        persist_actions_to_disk(&state.work_dir, &actions);
+    }
 
     Response::builder()
         .status(StatusCode::OK)
@@ -867,7 +904,8 @@ async fn docker_restart(
 
     match run_command("docker", &["restart", &payload.container]) {
         Ok(_) => {
-            state.actions.write().await.push(DeploymentAction {
+            let mut actions = state.actions.write().await;
+            actions.push(DeploymentAction {
                 timestamp: Utc::now().to_rfc3339(),
                 action: "docker_restart".into(),
                 tag: None,
@@ -877,6 +915,8 @@ async fn docker_restart(
                 services: vec![],
                 container: Some(payload.container),
             });
+            persist_actions_to_disk(&state.work_dir, &actions);
+            drop(actions);
             ok(None)
         }
         Err(e) => {
@@ -901,7 +941,8 @@ async fn docker_clean(
 
     match run_docker_prune(payload.volumes, payload.images) {
         Ok(_) => {
-            state.actions.write().await.push(DeploymentAction {
+            let mut actions = state.actions.write().await;
+            actions.push(DeploymentAction {
                 timestamp: Utc::now().to_rfc3339(),
                 action: "docker_clean".into(),
                 tag: None,
@@ -911,6 +952,8 @@ async fn docker_clean(
                 services: vec![],
                 container: None,
             });
+            persist_actions_to_disk(&state.work_dir, &actions);
+            drop(actions);
             ok(None)
         }
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
@@ -1103,16 +1146,20 @@ async fn dstack_agent_action(
 
     // start/stop/restart: log the attempt regardless of outcome (failed restarts
     // are valuable forensic signal), then map systemctl exit to HTTP status.
-    state.actions.write().await.push(DeploymentAction {
-        timestamp: Utc::now().to_rfc3339(),
-        action: format!("dstack_agent_{}", action),
-        tag: None,
-        commit: None,
-        file: None,
-        file_sha256: None,
-        services: vec![],
-        container: None,
-    });
+    {
+        let mut actions = state.actions.write().await;
+        actions.push(DeploymentAction {
+            timestamp: Utc::now().to_rfc3339(),
+            action: format!("dstack_agent_{}", action),
+            tag: None,
+            commit: None,
+            file: None,
+            file_sha256: None,
+            services: vec![],
+            container: None,
+        });
+        persist_actions_to_disk(&state.work_dir, &actions);
+    }
 
     if !result.success {
         error!(
@@ -1300,18 +1347,24 @@ async fn main() -> Result<()> {
 
     let (github_owner, github_repo_name) = parse_github_url(&github_repo)?;
 
+    let work_dir = PathBuf::from(work_dir);
+    let initial_actions = load_actions_from_disk(&work_dir);
+    if !initial_actions.is_empty() {
+        info!(count = initial_actions.len(), "Loaded action log from disk");
+    }
+
     let state = Arc::new(AppState {
         bearer_token,
         github_owner,
         github_repo_name,
         min_tag_age_hours,
-        work_dir: PathBuf::from(work_dir),
+        work_dir,
         env_files,
         deployed_tag: RwLock::new(None),
         deployed_commit: RwLock::new(None),
         deployed_file: RwLock::new(None),
         deployed_file_sha256: RwLock::new(None),
-        actions: RwLock::new(Vec::new()),
+        actions: RwLock::new(initial_actions),
         http: reqwest::Client::new(),
     });
 
