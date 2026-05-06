@@ -151,22 +151,13 @@ fn load_actions_from_disk(work_dir: &Path) -> Vec<DeploymentAction> {
     }
 }
 
-async fn persist_actions_to_disk(work_dir: &Path, actions: &[DeploymentAction]) {
-    let json = match serde_json::to_string(actions) {
-        Ok(s) => s,
-        Err(e) => {
-            error!(error = %e, "Failed to serialize actions for persistence");
-            return;
-        }
-    };
+async fn persist_actions_to_disk(work_dir: &Path, actions: &[DeploymentAction]) -> std::io::Result<()> {
+    let json = serde_json::to_string(actions)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     let tmp = work_dir.join("actions.json.tmp");
-    if let Err(e) = tokio::fs::write(&tmp, &json).await {
-        error!(error = %e, "Failed to write actions.json.tmp");
-        return;
-    }
-    if let Err(e) = tokio::fs::rename(&tmp, actions_file(work_dir)).await {
-        error!(error = %e, "Failed to rename actions.json.tmp to actions.json");
-    }
+    tokio::fs::write(&tmp, &json).await?;
+    tokio::fs::rename(&tmp, actions_file(work_dir)).await?;
+    Ok(())
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -767,7 +758,7 @@ async fn compose_up(
         Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
 
-    let actions_snapshot = {
+    {
         let mut actions = state.actions.write().await;
         actions.push(DeploymentAction {
             timestamp: Utc::now().to_rfc3339(),
@@ -779,9 +770,11 @@ async fn compose_up(
             services: payload.services,
             container: None,
         });
-        actions.clone()
-    };
-    persist_actions_to_disk(&state.work_dir, &actions_snapshot).await;
+        if let Err(e) = persist_actions_to_disk(&state.work_dir, &*actions).await {
+            error!(error = %e, "Failed to persist action log to disk");
+            return err_response(StatusCode::INTERNAL_SERVER_ERROR, "Failed to persist action log");
+        }
+    }
     *state.deployed_tag.write().await = Some(payload.tag);
     *state.deployed_commit.write().await = Some(tag_info.commit_sha);
     *state.deployed_file.write().await = Some(file);
@@ -841,7 +834,7 @@ async fn compose_down(
         Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
 
-    let actions_snapshot = {
+    {
         let mut actions = state.actions.write().await;
         actions.push(DeploymentAction {
             timestamp: Utc::now().to_rfc3339(),
@@ -853,9 +846,11 @@ async fn compose_down(
             services: payload.services,
             container: None,
         });
-        actions.clone()
-    };
-    persist_actions_to_disk(&state.work_dir, &actions_snapshot).await;
+        if let Err(e) = persist_actions_to_disk(&state.work_dir, &*actions).await {
+            error!(error = %e, "Failed to persist action log to disk");
+            return err_response(StatusCode::INTERNAL_SERVER_ERROR, "Failed to persist action log");
+        }
+    }
 
     Response::builder()
         .status(StatusCode::OK)
@@ -913,7 +908,7 @@ async fn docker_restart(
 
     match run_command("docker", &["restart", &payload.container]) {
         Ok(_) => {
-            let actions_snapshot = {
+            {
                 let mut actions = state.actions.write().await;
                 actions.push(DeploymentAction {
                     timestamp: Utc::now().to_rfc3339(),
@@ -925,9 +920,11 @@ async fn docker_restart(
                     services: vec![],
                     container: Some(payload.container),
                 });
-                actions.clone()
-            };
-            persist_actions_to_disk(&state.work_dir, &actions_snapshot).await;
+                if let Err(e) = persist_actions_to_disk(&state.work_dir, &*actions).await {
+                    error!(error = %e, "Failed to persist action log to disk");
+                    return err(StatusCode::INTERNAL_SERVER_ERROR, "Failed to persist action log");
+                }
+            }
             ok(None)
         }
         Err(e) => {
@@ -952,7 +949,7 @@ async fn docker_clean(
 
     match run_docker_prune(payload.volumes, payload.images) {
         Ok(_) => {
-            let actions_snapshot = {
+            {
                 let mut actions = state.actions.write().await;
                 actions.push(DeploymentAction {
                     timestamp: Utc::now().to_rfc3339(),
@@ -964,9 +961,11 @@ async fn docker_clean(
                     services: vec![],
                     container: None,
                 });
-                actions.clone()
-            };
-            persist_actions_to_disk(&state.work_dir, &actions_snapshot).await;
+                if let Err(e) = persist_actions_to_disk(&state.work_dir, &*actions).await {
+                    error!(error = %e, "Failed to persist action log to disk");
+                    return err(StatusCode::INTERNAL_SERVER_ERROR, "Failed to persist action log");
+                }
+            }
             ok(None)
         }
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
@@ -1159,7 +1158,7 @@ async fn dstack_agent_action(
 
     // start/stop/restart: log the attempt regardless of outcome (failed restarts
     // are valuable forensic signal), then map systemctl exit to HTTP status.
-    let actions_snapshot = {
+    {
         let mut actions = state.actions.write().await;
         actions.push(DeploymentAction {
             timestamp: Utc::now().to_rfc3339(),
@@ -1171,9 +1170,11 @@ async fn dstack_agent_action(
             services: vec![],
             container: None,
         });
-        actions.clone()
-    };
-    persist_actions_to_disk(&state.work_dir, &actions_snapshot).await;
+        if let Err(e) = persist_actions_to_disk(&state.work_dir, &*actions).await {
+            error!(error = %e, "Failed to persist action log to disk");
+            return err(StatusCode::INTERNAL_SERVER_ERROR, "Failed to persist action log");
+        }
+    }
 
     if !result.success {
         error!(
@@ -1362,6 +1363,8 @@ async fn main() -> Result<()> {
     let (github_owner, github_repo_name) = parse_github_url(&github_repo)?;
 
     let work_dir = PathBuf::from(work_dir);
+    tokio::fs::create_dir_all(&work_dir).await
+        .with_context(|| format!("Failed to create WORK_DIR: {}", work_dir.display()))?;
     let initial_actions = load_actions_from_disk(&work_dir);
     if !initial_actions.is_empty() {
         info!(count = initial_actions.len(), "Loaded action log from disk");
@@ -1427,7 +1430,7 @@ mod tests {
             services: vec!["nginx".into()],
             container: None,
         }];
-        persist_actions_to_disk(&dir, &actions).await;
+        persist_actions_to_disk(&dir, &actions).await.unwrap();
         let loaded = load_actions_from_disk(&dir);
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].action, "compose_up");
@@ -1456,7 +1459,7 @@ mod tests {
     #[tokio::test]
     async fn persist_is_atomic_tmp_rename() {
         let dir = temp_work_dir();
-        persist_actions_to_disk(&dir, &[]).await;
+        persist_actions_to_disk(&dir, &[]).await.unwrap();
         // tmp file must not be left behind after a successful write
         assert!(!dir.join("actions.json.tmp").exists());
         assert!(actions_file(&dir).exists());
