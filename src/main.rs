@@ -1099,14 +1099,28 @@ const SYSTEMCTL_TIMEOUT: Duration = Duration::from_secs(120);
 // so this is reapplied at every compose-manager startup) and unloads the
 // module if currently loaded. The dstack-OS rootfs is dm-verity readonly, so
 // `/etc/modprobe.d/` cannot be used; `/run/modprobe.d/` is also read by kmod.
+// Also unloads sibling algif_* modules (hash, skcipher, rng) — the `algif`
+// parent install-rule blocks future loads of any algif_*, but already-loaded
+// siblings need explicit removal.
+//
+// `set -e` makes the write half fail loud (otherwise a printf failure would
+// silently leave the blacklist file missing while the script still exited 0).
+// modprobe -r is `|| true` because the module legitimately may not be loaded.
+// The final lsmod check fails the script if any algif* module is still
+// resident — that's the only signal the caller has that mitigation took.
 //
 // Mitigates CVE-2026-31431 ("Copy Fail") in the AF_ALG userspace crypto API.
 const ALGIF_BLACKLIST_SCRIPT: &str = "\
-mkdir -p /run/modprobe.d && \
-printf 'install algif_aead /bin/true\\ninstall algif /bin/true\\n' > /run/modprobe.d/disable-algif-aead.conf && \
-modprobe -r algif_aead 2>/dev/null; \
-modprobe -r algif 2>/dev/null; \
-true";
+set -e; \
+mkdir -p /run/modprobe.d; \
+printf 'install algif_aead /bin/true\\ninstall algif /bin/true\\n' > /run/modprobe.d/disable-algif-aead.conf; \
+for m in algif_aead algif_hash algif_skcipher algif_rng algif; do \
+    modprobe -r \"$m\" 2>/dev/null || true; \
+done; \
+if lsmod | awk '{print $1}' | grep -q '^algif'; then \
+    echo 'algif module still resident after unload' >&2; \
+    exit 1; \
+fi";
 
 const ALGIF_BLACKLIST_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -1172,7 +1186,33 @@ async fn algif_blacklist_action(
         return e;
     }
 
-    let result = match apply_algif_blacklist_on_host().await {
+    let result = apply_algif_blacklist_on_host().await;
+
+    // Log the attempt regardless of outcome — a failed re-apply is valuable
+    // forensic signal, matching the dstack-agent action-logging pattern.
+    let action_name = match &result {
+        Ok(r) if r.success => "kernel_algif_blacklist_ok",
+        Ok(_) => "kernel_algif_blacklist_script_failed",
+        Err(_) => "kernel_algif_blacklist_invocation_failed",
+    };
+    {
+        let mut actions = state.actions.write().await;
+        actions.push(DeploymentAction {
+            timestamp: Utc::now().to_rfc3339(),
+            action: action_name.into(),
+            tag: None,
+            commit: None,
+            file: None,
+            file_sha256: None,
+            services: vec![],
+            container: None,
+        });
+        if let Err(e) = persist_actions_to_disk(&state.work_dir, &actions).await {
+            error!(error = %e, "Failed to persist action log to disk");
+        }
+    }
+
+    let result = match result {
         Ok(r) => r,
         Err(e) => {
             error!(error = %e, "Failed to apply algif blacklist on host");
@@ -1711,8 +1751,45 @@ mod tests {
     fn algif_blacklist_script_unloads_running_modules() {
         // If the module was loaded before mitigation, we must explicitly
         // remove it — the modprobe.d install rule only blocks future loads.
-        assert!(ALGIF_BLACKLIST_SCRIPT.contains("modprobe -r algif_aead"));
-        assert!(ALGIF_BLACKLIST_SCRIPT.contains("modprobe -r algif"));
+        // We also unload sibling algif_* (hash, skcipher, rng) since the
+        // parent install-rule blocks new loads but doesn't touch resident
+        // siblings.
+        for m in &["algif_aead", "algif_hash", "algif_skcipher", "algif_rng", "algif"] {
+            assert!(
+                ALGIF_BLACKLIST_SCRIPT.contains(m),
+                "blacklist script must reference module {}",
+                m
+            );
+        }
+        assert!(ALGIF_BLACKLIST_SCRIPT.contains("modprobe -r"));
+    }
+
+    #[test]
+    fn algif_blacklist_script_fails_fast_on_write_errors() {
+        // Regression guard: an earlier draft used `&&`-then-`;` chaining which
+        // meant a printf failure (i.e. blacklist file never written) was
+        // masked by a trailing `true`, so the script lied about success.
+        // `set -e` makes the write half fail loud while still letting
+        // `modprobe -r || true` ignore not-loaded modules.
+        assert!(
+            ALGIF_BLACKLIST_SCRIPT.contains("set -e"),
+            "blacklist script must use `set -e` so write failures aren't masked"
+        );
+    }
+
+    #[test]
+    fn algif_blacklist_script_verifies_unload() {
+        // The script must fail (exit non-zero) if any algif* module remains
+        // loaded after the unload loop — otherwise the caller has no signal
+        // that mitigation actually took effect.
+        assert!(
+            ALGIF_BLACKLIST_SCRIPT.contains("lsmod"),
+            "blacklist script must verify with lsmod"
+        );
+        assert!(
+            ALGIF_BLACKLIST_SCRIPT.contains("exit 1"),
+            "blacklist script must exit 1 on residual modules"
+        );
     }
 
     #[test]
