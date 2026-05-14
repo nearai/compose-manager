@@ -1088,6 +1088,113 @@ const DSTACK_AGENT_ACTIONS: &[&str] = &["start", "stop", "restart", "status"];
 // indefinitely.
 const SYSTEMCTL_TIMEOUT: Duration = Duration::from_secs(120);
 
+// --- algif_aead kernel blacklist (CVE-2026-31431) ---
+
+// SECURITY: this MUST stay a compile-time constant. The script runs via
+// `nsenter -- sh -c <script>` into PID 1's namespaces with CAP_SYS_ADMIN.
+// An attacker-controlled fragment would give them arbitrary RCE on the CVM
+// host.
+//
+// Writes `/run/modprobe.d/disable-algif-aead.conf` (tmpfs — wiped on reboot,
+// so this is reapplied at every compose-manager startup) and unloads the
+// module if currently loaded. The dstack-OS rootfs is dm-verity readonly, so
+// `/etc/modprobe.d/` cannot be used; `/run/modprobe.d/` is also read by kmod.
+//
+// Mitigates CVE-2026-31431 ("Copy Fail") in the AF_ALG userspace crypto API.
+const ALGIF_BLACKLIST_SCRIPT: &str = "\
+mkdir -p /run/modprobe.d && \
+printf 'install algif_aead /bin/true\\ninstall algif /bin/true\\n' > /run/modprobe.d/disable-algif-aead.conf && \
+modprobe -r algif_aead 2>/dev/null; \
+modprobe -r algif 2>/dev/null; \
+true";
+
+const ALGIF_BLACKLIST_TIMEOUT: Duration = Duration::from_secs(15);
+
+struct AlgifBlacklistOutput {
+    stdout: String,
+    stderr: String,
+    success: bool,
+}
+
+impl AlgifBlacklistOutput {
+    fn combined(&self) -> String {
+        match (self.stdout.is_empty(), self.stderr.is_empty()) {
+            (true, true) => String::new(),
+            (false, true) => self.stdout.clone(),
+            (true, false) => self.stderr.clone(),
+            (false, false) => format!("{}\n{}", self.stdout, self.stderr),
+        }
+    }
+}
+
+// Runs ALGIF_BLACKLIST_SCRIPT against the CVM host's PID 1 namespaces via
+// nsenter. Requires the container to be started with `pid: host` and
+// CAP_SYS_ADMIN (already required by the existing host-systemctl path).
+async fn apply_algif_blacklist_on_host() -> Result<AlgifBlacklistOutput> {
+    info!(
+        command = "nsenter ... sh -c <algif blacklist>",
+        timeout_secs = ALGIF_BLACKLIST_TIMEOUT.as_secs(),
+        "Applying algif_aead kernel blacklist on host"
+    );
+
+    let invocation = AsyncCommand::new("nsenter")
+        .args([
+            "-t", "1", "-m", "-u", "-i", "-n", "-p", "--",
+            "sh", "-c", ALGIF_BLACKLIST_SCRIPT,
+        ])
+        .output();
+
+    let output = match tokio::time::timeout(ALGIF_BLACKLIST_TIMEOUT, invocation).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => {
+            return Err(anyhow!(e).context("Failed to execute: nsenter -- sh -c <algif blacklist>"));
+        }
+        Err(_) => {
+            return Err(anyhow!(
+                "nsenter -- sh -c <algif blacklist> timed out after {}s",
+                ALGIF_BLACKLIST_TIMEOUT.as_secs()
+            ));
+        }
+    };
+
+    Ok(AlgifBlacklistOutput {
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        success: output.status.success(),
+    })
+}
+
+async fn algif_blacklist_action(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = verify_bearer_token(&headers, &state.bearer_token) {
+        return e;
+    }
+
+    let result = match apply_algif_blacklist_on_host().await {
+        Ok(r) => r,
+        Err(e) => {
+            error!(error = %e, "Failed to apply algif blacklist on host");
+            return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+        }
+    };
+
+    if !result.success {
+        error!(
+            stdout = %result.stdout,
+            stderr = %result.stderr,
+            "algif blacklist script reported non-zero exit"
+        );
+        return err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("algif blacklist script failed: {}", result.combined()),
+        );
+    }
+
+    ok_output(result.combined())
+}
+
 fn is_valid_dstack_action(action: &str) -> bool {
     DSTACK_AGENT_ACTIONS.contains(&action)
 }
@@ -1362,6 +1469,34 @@ async fn main() -> Result<()> {
 
     let (github_owner, github_repo_name) = parse_github_url(&github_repo)?;
 
+    // Apply CVE-2026-31431 (Copy Fail) mitigation on the CVM host kernel.
+    // Idempotent: /run/modprobe.d is tmpfs, so this must re-run on every
+    // compose-manager start (which is also every CVM reboot). Best-effort —
+    // failure is logged but does NOT block compose-manager startup, since
+    // dropping the API entirely would be worse than leaving the kernel
+    // mitigation unapplied (operators can re-trigger via the admin route).
+    match apply_algif_blacklist_on_host().await {
+        Ok(out) if out.success => {
+            info!(
+                output = %out.combined(),
+                "Applied algif_aead kernel blacklist on host"
+            );
+        }
+        Ok(out) => {
+            error!(
+                stdout = %out.stdout,
+                stderr = %out.stderr,
+                "algif blacklist script exited non-zero; module may still be loadable"
+            );
+        }
+        Err(e) => {
+            error!(
+                error = %e,
+                "Failed to apply algif blacklist on host; module may still be loadable"
+            );
+        }
+    }
+
     let work_dir = PathBuf::from(work_dir);
     tokio::fs::create_dir_all(&work_dir).await
         .with_context(|| format!("Failed to create WORK_DIR: {}", work_dir.display()))?;
@@ -1393,6 +1528,7 @@ async fn main() -> Result<()> {
         .route("/docker/ps", get(docker_ps))
         .route("/docker/restart", post(docker_restart))
         .route("/dstack-agent/:action", post(dstack_agent_action))
+        .route("/admin/kernel/algif-blacklist", post(algif_blacklist_action))
         .route("/v1/attestation/report", get(attestation_report))
         .route("/version", get(version))
         .with_state(state);
@@ -1547,5 +1683,66 @@ mod tests {
             success: true,
         };
         assert_eq!(o.combined(), "");
+    }
+
+    #[test]
+    fn algif_blacklist_script_writes_to_run_modprobe_d() {
+        // /etc is dm-verity readonly inside dstack-OS CVMs — the script MUST
+        // target /run/modprobe.d, which is on tmpfs and writable.
+        assert!(
+            ALGIF_BLACKLIST_SCRIPT.contains("/run/modprobe.d/disable-algif-aead.conf"),
+            "blacklist script must write to /run/modprobe.d"
+        );
+        assert!(
+            !ALGIF_BLACKLIST_SCRIPT.contains("/etc/modprobe.d/"),
+            "blacklist script must not target /etc/modprobe.d (rootfs is dm-verity readonly)"
+        );
+    }
+
+    #[test]
+    fn algif_blacklist_script_blocks_both_modules() {
+        // kmod loads `algif` as the parent of `algif_aead`; both must be
+        // pinned to /bin/true so neither can be (auto)loaded.
+        assert!(ALGIF_BLACKLIST_SCRIPT.contains("install algif_aead /bin/true"));
+        assert!(ALGIF_BLACKLIST_SCRIPT.contains("install algif /bin/true"));
+    }
+
+    #[test]
+    fn algif_blacklist_script_unloads_running_modules() {
+        // If the module was loaded before mitigation, we must explicitly
+        // remove it — the modprobe.d install rule only blocks future loads.
+        assert!(ALGIF_BLACKLIST_SCRIPT.contains("modprobe -r algif_aead"));
+        assert!(ALGIF_BLACKLIST_SCRIPT.contains("modprobe -r algif"));
+    }
+
+    #[test]
+    fn algif_blacklist_output_combined_handles_all_cases() {
+        let empty = AlgifBlacklistOutput {
+            stdout: String::new(),
+            stderr: String::new(),
+            success: true,
+        };
+        assert_eq!(empty.combined(), "");
+
+        let out_only = AlgifBlacklistOutput {
+            stdout: "ok".into(),
+            stderr: String::new(),
+            success: true,
+        };
+        assert_eq!(out_only.combined(), "ok");
+
+        let err_only = AlgifBlacklistOutput {
+            stdout: String::new(),
+            stderr: "bad".into(),
+            success: false,
+        };
+        assert_eq!(err_only.combined(), "bad");
+
+        let both = AlgifBlacklistOutput {
+            stdout: "ok".into(),
+            stderr: "warn".into(),
+            success: true,
+        };
+        assert_eq!(both.combined(), "ok\nwarn");
     }
 }
