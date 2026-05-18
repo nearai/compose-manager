@@ -1097,11 +1097,15 @@ const SYSTEMCTL_TIMEOUT: Duration = Duration::from_secs(120);
 //
 // Writes `/run/modprobe.d/disable-algif-aead.conf` (tmpfs — wiped on reboot,
 // so this is reapplied at every compose-manager startup) and unloads the
-// module if currently loaded. The dstack-OS rootfs is dm-verity readonly, so
+// modules if currently loaded. The dstack-OS rootfs is dm-verity readonly, so
 // `/etc/modprobe.d/` cannot be used; `/run/modprobe.d/` is also read by kmod.
-// Also unloads sibling algif_* modules (hash, skcipher, rng) — the `algif`
-// parent install-rule blocks future loads of any algif_*, but already-loaded
-// siblings need explicit removal.
+//
+// kmod install-rules key on the RESOLVED MODULE NAME, not on transitive
+// deps — so a rule for the `algif` parent does NOT block loads of children
+// like `algif_hash`. We need one install-rule per module name (verified
+// live on gpu03: with only `algif`+`algif_aead` rules in place, `modprobe
+// algif_hash` still loaded the module). The unload loop covers already-
+// resident modules; the install-rules block future (auto)loads.
 //
 // `set -e` makes the write half fail loud (otherwise a printf failure would
 // silently leave the blacklist file missing while the script still exited 0).
@@ -1113,7 +1117,7 @@ const SYSTEMCTL_TIMEOUT: Duration = Duration::from_secs(120);
 const ALGIF_BLACKLIST_SCRIPT: &str = "\
 set -e; \
 mkdir -p /run/modprobe.d; \
-printf 'install algif_aead /bin/true\\ninstall algif /bin/true\\n' > /run/modprobe.d/disable-algif-aead.conf; \
+printf 'install algif_aead /bin/true\\ninstall algif_hash /bin/true\\ninstall algif_skcipher /bin/true\\ninstall algif_rng /bin/true\\ninstall algif /bin/true\\n' > /run/modprobe.d/disable-algif-aead.conf; \
 for m in algif_aead algif_hash algif_skcipher algif_rng algif; do \
     modprobe -r \"$m\" 2>/dev/null || true; \
 done; \
@@ -1740,11 +1744,20 @@ mod tests {
     }
 
     #[test]
-    fn algif_blacklist_script_blocks_both_modules() {
-        // kmod loads `algif` as the parent of `algif_aead`; both must be
-        // pinned to /bin/true so neither can be (auto)loaded.
-        assert!(ALGIF_BLACKLIST_SCRIPT.contains("install algif_aead /bin/true"));
-        assert!(ALGIF_BLACKLIST_SCRIPT.contains("install algif /bin/true"));
+    fn algif_blacklist_script_installs_rule_per_module() {
+        // kmod install-rules key on the resolved module name, not on
+        // transitive deps — verified live on gpu03 that a rule on the
+        // `algif` parent alone does NOT block child loads. We need one
+        // explicit `install <name> /bin/true` line for every module we
+        // want to block from (auto)loading.
+        for m in &["algif_aead", "algif_hash", "algif_skcipher", "algif_rng", "algif"] {
+            let rule = format!("install {} /bin/true", m);
+            assert!(
+                ALGIF_BLACKLIST_SCRIPT.contains(&rule),
+                "blacklist script missing install-rule: {}",
+                rule
+            );
+        }
     }
 
     #[test]
