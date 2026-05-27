@@ -191,6 +191,24 @@ struct InFlightOp {
 #[derive(Debug)]
 struct ComposeLockBusy;
 
+/// RAII guard that holds the compose lock and clears `in_flight` metadata on Drop.
+/// This ensures `in_flight` is always cleaned up regardless of how the guard
+/// goes out of scope — early returns, handler completion, or NdjsonStream drop.
+struct ComposeGuard {
+    _inner: tokio::sync::OwnedMutexGuard<()>,
+    in_flight: Arc<RwLock<Option<InFlightOp>>>,
+}
+
+impl Drop for ComposeGuard {
+    fn drop(&mut self) {
+        // Best-effort: use try_write to avoid blocking in a drop context.
+        if let Ok(mut guard) = self.in_flight.try_write() {
+            *guard = None;
+        }
+        info!(action = "compose_op", "Released compose lock");
+    }
+}
+
 struct AppState {
     bearer_token: String,
     github_owner: String,
@@ -212,13 +230,14 @@ struct AppState {
 }
 
 impl AppState {
-    /// Try to acquire the compose lock. Returns `Ok(guard)` if the lock was
+    /// Try to acquire the compose lock. Returns `Ok(ComposeGuard)` if the lock was
     /// available, or `Err(ComposeLockBusy)` if another operation is in progress.
+    /// The returned `ComposeGuard` clears `in_flight` on Drop.
     async fn try_acquire_compose_lock(
         self: &Arc<Self>,
         action: &str,
         tag: Option<String>,
-    ) -> Result<tokio::sync::OwnedMutexGuard<()>, ComposeLockBusy> {
+    ) -> Result<ComposeGuard, ComposeLockBusy> {
         match self.compose_lock.clone().try_lock_owned() {
             Ok(guard) => {
                 *self.in_flight.write().await = Some(InFlightOp {
@@ -227,7 +246,10 @@ impl AppState {
                     tag: tag.clone(),
                 });
                 info!(action = action, tag = ?tag, "Acquired compose lock");
-                Ok(guard)
+                Ok(ComposeGuard {
+                    _inner: guard,
+                    in_flight: self.in_flight.clone(),
+                })
             }
             Err(_) => {
                 let in_flight = self.in_flight.read().await.clone();
@@ -235,6 +257,15 @@ impl AppState {
                 Err(ComposeLockBusy)
             }
         }
+    }
+
+    /// Build a 409 Conflict error message describing the currently in-flight operation.
+    async fn conflict_message(&self) -> String {
+        let in_flight = self.in_flight.read().await.clone();
+        format!(
+            "another docker operation is already in progress: {}",
+            in_flight.map(|op| op.action).unwrap_or_else(|| "unknown".into())
+        )
     }
 }
 
@@ -523,10 +554,8 @@ struct NdjsonStream {
     temp_env_file: Option<PathBuf>,
     done: bool,
     /// Held while a mutating docker/compose operation is in flight.
-    /// Released on Drop, allowing the next operation to proceed.
-    _compose_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
-    /// Cleared on Drop so /status stops reporting this operation.
-    in_flight_handle: Option<Arc<RwLock<Option<InFlightOp>>>>,
+    /// Released on Drop (via ComposeGuard), allowing the next operation to proceed.
+    compose_guard: Option<ComposeGuard>,
 }
 
 impl Stream for NdjsonStream {
@@ -653,16 +682,12 @@ impl Stream for NdjsonStream {
 
 impl Drop for NdjsonStream {
     fn drop(&mut self) {
-        // Clear in_flight metadata so /status stops reporting this operation.
-        // Best-effort: use try_write to avoid blocking in a drop.
-        if let Some(ref in_flight_handle) = self.in_flight_handle {
-            if let Ok(mut guard) = in_flight_handle.try_write() {
-                *guard = None;
+        // ComposeGuard's Drop clears in_flight and releases the compose lock.
+        // Clean up temp env file (mirrors the pre-existing cleanup in Stream::poll_next).
+        if let Some(ref path) = self.temp_env_file {
+            if !self.done {
+                let _ = std::fs::remove_file(path);
             }
-        }
-        // The OwnedMutexGuard is dropped automatically here, releasing the compose lock.
-        if self._compose_guard.is_some() {
-            info!(action = "compose_op", "Released compose lock");
         }
     }
 }
@@ -745,8 +770,7 @@ fn stream_docker_compose_phased(
         pending_commands: commands,
         temp_env_file,
         done: false,
-        _compose_guard: None,
-        in_flight_handle: None,
+        compose_guard: None,
     })
 }
 
@@ -777,11 +801,7 @@ async fn compose_up(
     let guard = match state.try_acquire_compose_lock("compose_up", Some(payload.tag.clone())).await {
         Ok(g) => g,
         Err(_) => {
-            let in_flight = state.in_flight.read().await.clone();
-            return err_response(
-                StatusCode::CONFLICT,
-                format!("another docker operation is already in progress: {}", in_flight.map(|op| format!("{}" , op.action)).unwrap_or_else(|| "unknown".into())),
-            );
+            return err_response(StatusCode::CONFLICT, state.conflict_message().await);
         }
     };
 
@@ -838,8 +858,7 @@ async fn compose_up(
         Ok(s) => s,
         Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
-    stream._compose_guard = Some(guard);
-    stream.in_flight_handle = Some(state.in_flight.clone());
+    stream.compose_guard = Some(guard);
 
     {
         let mut actions = state.actions.write().await;
@@ -882,11 +901,7 @@ async fn compose_down(
     let guard = match state.try_acquire_compose_lock("compose_down", Some(payload.tag.clone())).await {
         Ok(g) => g,
         Err(_) => {
-            let in_flight = state.in_flight.read().await.clone();
-            return err_response(
-                StatusCode::CONFLICT,
-                format!("another docker operation is already in progress: {}", in_flight.map(|op| format!("{}", op.action)).unwrap_or_else(|| "unknown".into())),
-            );
+            return err_response(StatusCode::CONFLICT, state.conflict_message().await);
         }
     };
 
@@ -927,8 +942,7 @@ async fn compose_down(
         Ok(s) => s,
         Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
-    stream._compose_guard = Some(guard);
-    stream.in_flight_handle = Some(state.in_flight.clone());
+    stream.compose_guard = Some(guard);
 
     {
         let mut actions = state.actions.write().await;
@@ -1003,11 +1017,7 @@ async fn docker_restart(
     let _guard = match state.try_acquire_compose_lock("docker_restart", None).await {
         Ok(g) => g,
         Err(_) => {
-            let in_flight = state.in_flight.read().await.clone();
-            return err(
-                StatusCode::CONFLICT,
-                format!("another docker operation is already in progress: {}", in_flight.map(|op| format!("{}", op.action)).unwrap_or_else(|| "unknown".into())),
-            );
+            return err(StatusCode::CONFLICT, state.conflict_message().await);
         }
     };
 
@@ -1057,11 +1067,7 @@ async fn docker_clean(
     let _guard = match state.try_acquire_compose_lock("docker_clean", None).await {
         Ok(g) => g,
         Err(_) => {
-            let in_flight = state.in_flight.read().await.clone();
-            return err(
-                StatusCode::CONFLICT,
-                format!("another docker operation is already in progress: {}", in_flight.map(|op| format!("{}", op.action)).unwrap_or_else(|| "unknown".into())),
-            );
+            return err(StatusCode::CONFLICT, state.conflict_message().await);
         }
     };
 
@@ -2013,14 +2019,10 @@ mod tests {
             assert!(in_flight.is_some(), "in_flight should be set while lock is held");
             assert_eq!(in_flight.unwrap().action, "compose_up");
         }
-        // After dropping the guard, in_flight should be cleared.
-        let _in_flight = state.in_flight.read().await.clone();
-        // Note: in_flight is only cleared when NdjsonStream drops, not when
-        // the raw guard drops. For the streaming ops the guard is embedded in
-        // NdjsonStream. For non-streaming ops (docker_restart, docker_clean),
-        // the guard is dropped at end of handler — in_flight is set by
-        // try_acquire_compose_lock but won't be auto-cleared by guard drop.
-        // This is acceptable: the next try_acquire_compose_lock will overwrite it.
+        // After dropping the ComposeGuard, in_flight must be cleared
+        // (ComposeGuard::Drop clears it).
+        let in_flight = state.in_flight.read().await.clone();
+        assert!(in_flight.is_none(), "in_flight should be cleared after ComposeGuard drops");
     }
 
     #[tokio::test]
