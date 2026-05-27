@@ -1,0 +1,90 @@
+name: Promote to Production
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "promote" to confirm promoting :staging to :latest'
+        required: true
+
+env:
+  REGISTRY: docker.io
+  IMAGE_REPOSITORY: ${{ vars.DOCKER_REGISTRY_USER }}/compose-manager
+  LAUNCHER_IMAGE_REPOSITORY: ${{ vars.DOCKER_REGISTRY_USER }}/compose-manager-launcher
+
+jobs:
+  promote:
+    name: Promote staging → latest
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate confirmation
+        run: |
+          if [ "${{ inputs.confirm }}" != "promote" ]; then
+            echo "Confirmation input must be exactly 'promote'" >&2
+            exit 1
+          fi
+
+      - name: Log in to Docker registry
+        uses: docker/login-action@0567fa5ae8c9a197cb207537dc5cbb43ca3d803f
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ vars.DOCKER_REGISTRY_USER }}
+          password: ${{ secrets.DOCKER_REGISTRY_TOKEN }}
+
+      - name: Install skopeo
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y skopeo
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d07f1d8e8f0afacf  # v3.8.2
+
+      - name: Promote compose-manager :staging → :latest
+        run: |
+          STAGING_REF="${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}:staging"
+          LATEST_REF="${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}:latest"
+
+          echo "Copying ${STAGING_REF} → ${LATEST_REF}..."
+          skopeo copy --insecure-policy \
+            "docker://${STAGING_REF}" \
+            "docker://${LATEST_REF}"
+
+          DIGEST=$(skopeo inspect "docker://${LATEST_REF}" | jq -r '.Digest')
+          echo "Promoted digest: ${DIGEST}"
+          echo "CM_DIGEST=${DIGEST}" >> "$GITHUB_ENV"
+
+      - name: Sign promoted compose-manager :latest
+        run: |
+          cosign sign --yes "${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}@${{ env.CM_DIGEST }}"
+
+      - name: Promote compose-manager-launcher :staging → :latest
+        run: |
+          STAGING_REF="${{ env.REGISTRY }}/${{ env.LAUNCHER_IMAGE_REPOSITORY }}:staging"
+          LATEST_REF="${{ env.REGISTRY }}/${{ env.LAUNCHER_IMAGE_REPOSITORY }}:latest"
+
+          echo "Copying ${STAGING_REF} → ${LATEST_REF}..."
+          skopeo copy --insecure-policy \
+            "docker://${STAGING_REF}" \
+            "docker://${LATEST_REF}"
+
+          DIGEST=$(skopeo inspect "docker://${LATEST_REF}" | jq -r '.Digest')
+          echo "Promoted digest: ${DIGEST}"
+          echo "LAUNCHER_DIGEST=${DIGEST}" >> "$GITHUB_ENV"
+
+      - name: Sign promoted compose-manager-launcher :latest
+        run: |
+          cosign sign --yes "${{ env.REGISTRY }}/${{ env.LAUNCHER_IMAGE_REPOSITORY }}@${{ env.LAUNCHER_DIGEST }}"
+
+      - name: Generate build summary
+        run: |
+          {
+            echo "## Promotion: staging → latest"
+            echo ""
+            echo "### compose-manager"
+            echo "- digest: \`${{ env.CM_DIGEST }}\`"
+            echo ""
+            echo "### compose-manager-launcher"
+            echo "- digest: \`${{ env.LAUNCHER_DIGEST }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
