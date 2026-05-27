@@ -24,7 +24,7 @@ use std::{
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::Command as AsyncCommand,
-    sync::RwLock,
+    sync::{Mutex, RwLock},
 };
 use tracing::{error, info};
 
@@ -178,6 +178,37 @@ struct DeploymentAction {
     container: Option<String>,
 }
 
+/// Tracks the currently-running mutating docker/compose operation (if any)
+/// for observability and nicer 409 Conflict error messages.
+#[derive(Clone, Debug, Serialize)]
+struct InFlightOp {
+    action: String,
+    started_at: String,
+    tag: Option<String>,
+}
+
+/// Error returned when a mutating docker operation is already in progress.
+#[derive(Debug)]
+struct ComposeLockBusy;
+
+/// RAII guard that holds the compose lock and clears `in_flight` metadata on Drop.
+/// This ensures `in_flight` is always cleaned up regardless of how the guard
+/// goes out of scope — early returns, handler completion, or NdjsonStream drop.
+struct ComposeGuard {
+    _inner: tokio::sync::OwnedMutexGuard<()>,
+    in_flight: Arc<RwLock<Option<InFlightOp>>>,
+}
+
+impl Drop for ComposeGuard {
+    fn drop(&mut self) {
+        // Best-effort: use try_write to avoid blocking in a drop context.
+        if let Ok(mut guard) = self.in_flight.try_write() {
+            *guard = None;
+        }
+        info!(action = "compose_op", "Released compose lock");
+    }
+}
+
 struct AppState {
     bearer_token: String,
     github_owner: String,
@@ -191,6 +222,51 @@ struct AppState {
     deployed_file_sha256: RwLock<Option<String>>,
     actions: RwLock<Vec<DeploymentAction>>,
     http: reqwest::Client,
+    /// Mutual-exclusion lock for mutating docker/compose operations.
+    /// Uses `try_lock` semantics — concurrent requests receive HTTP 409.
+    compose_lock: Arc<Mutex<()>>,
+    /// Metadata about the currently-running operation (for 409 messages & /status).
+    in_flight: Arc<RwLock<Option<InFlightOp>>>,
+}
+
+impl AppState {
+    /// Try to acquire the compose lock. Returns `Ok(ComposeGuard)` if the lock was
+    /// available, or `Err(ComposeLockBusy)` if another operation is in progress.
+    /// The returned `ComposeGuard` clears `in_flight` on Drop.
+    async fn try_acquire_compose_lock(
+        self: &Arc<Self>,
+        action: &str,
+        tag: Option<String>,
+    ) -> Result<ComposeGuard, ComposeLockBusy> {
+        match self.compose_lock.clone().try_lock_owned() {
+            Ok(guard) => {
+                *self.in_flight.write().await = Some(InFlightOp {
+                    action: action.to_string(),
+                    started_at: Utc::now().to_rfc3339(),
+                    tag: tag.clone(),
+                });
+                info!(action = action, tag = ?tag, "Acquired compose lock");
+                Ok(ComposeGuard {
+                    _inner: guard,
+                    in_flight: self.in_flight.clone(),
+                })
+            }
+            Err(_) => {
+                let in_flight = self.in_flight.read().await.clone();
+                error!(action = action, in_flight = ?in_flight, "Compose lock busy — rejecting request");
+                Err(ComposeLockBusy)
+            }
+        }
+    }
+
+    /// Build a 409 Conflict error message describing the currently in-flight operation.
+    async fn conflict_message(&self) -> String {
+        let in_flight = self.in_flight.read().await.clone();
+        format!(
+            "another docker operation is already in progress: {}",
+            in_flight.map(|op| op.action).unwrap_or_else(|| "unknown".into())
+        )
+    }
 }
 
 // --- API Types ---
@@ -477,6 +553,9 @@ struct NdjsonStream {
     pending_commands: VecDeque<AsyncCommand>,
     temp_env_file: Option<PathBuf>,
     done: bool,
+    /// Held while a mutating docker/compose operation is in flight.
+    /// Released on Drop (via ComposeGuard), allowing the next operation to proceed.
+    compose_guard: Option<ComposeGuard>,
 }
 
 impl Stream for NdjsonStream {
@@ -601,6 +680,18 @@ impl Stream for NdjsonStream {
     }
 }
 
+impl Drop for NdjsonStream {
+    fn drop(&mut self) {
+        // ComposeGuard's Drop clears in_flight and releases the compose lock.
+        // Clean up temp env file (mirrors the pre-existing cleanup in Stream::poll_next).
+        if let Some(ref path) = self.temp_env_file {
+            if !self.done {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+}
+
 fn build_compose_cmd(
     work_dir: &Path,
     args: &[&str],
@@ -679,6 +770,7 @@ fn stream_docker_compose_phased(
         pending_commands: commands,
         temp_env_file,
         done: false,
+        compose_guard: None,
     })
 }
 
@@ -703,6 +795,15 @@ async fn compose_up(
     if let Err((code, msg)) = verify_bearer_token_raw(&headers, &state.bearer_token) {
         return err_response(code, msg);
     }
+
+    // Acquire compose lock early (before GitHub fetch) to prevent parallel
+    // operations from racing on the same compose file on disk.
+    let guard = match state.try_acquire_compose_lock("compose_up", Some(payload.tag.clone())).await {
+        Ok(g) => g,
+        Err(_) => {
+            return err_response(StatusCode::CONFLICT, state.conflict_message().await);
+        }
+    };
 
     let tag_info = match validate_tag(&state, &payload.tag).await {
         Ok(info) => info,
@@ -746,7 +847,7 @@ async fn compose_up(
         up_args.push("--force-recreate");
     }
 
-    let stream = match stream_docker_compose_phased(
+    let mut stream = match stream_docker_compose_phased(
         &state.work_dir,
         &[&["pull", "--ignore-buildable"], &["build"], &up_args],
         &file,
@@ -757,6 +858,7 @@ async fn compose_up(
         Ok(s) => s,
         Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
+    stream.compose_guard = Some(guard);
 
     {
         let mut actions = state.actions.write().await;
@@ -796,6 +898,13 @@ async fn compose_down(
         return err_response(code, msg);
     }
 
+    let guard = match state.try_acquire_compose_lock("compose_down", Some(payload.tag.clone())).await {
+        Ok(g) => g,
+        Err(_) => {
+            return err_response(StatusCode::CONFLICT, state.conflict_message().await);
+        }
+    };
+
     let tag_info = match validate_tag(&state, &payload.tag).await {
         Ok(info) => info,
         Err((code, msg)) => return err_response(code, msg),
@@ -822,7 +931,7 @@ async fn compose_down(
         None
     };
 
-    let stream = match stream_docker_compose(
+    let mut stream = match stream_docker_compose(
         &state.work_dir,
         &args,
         &file,
@@ -833,6 +942,7 @@ async fn compose_down(
         Ok(s) => s,
         Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
+    stream.compose_guard = Some(guard);
 
     {
         let mut actions = state.actions.write().await;
@@ -904,6 +1014,13 @@ async fn docker_restart(
         return e;
     }
 
+    let _guard = match state.try_acquire_compose_lock("docker_restart", None).await {
+        Ok(g) => g,
+        Err(_) => {
+            return err(StatusCode::CONFLICT, state.conflict_message().await);
+        }
+    };
+
     info!(command = "docker restart", container = %payload.container, "Running command");
 
     match run_command("docker", &["restart", &payload.container]) {
@@ -946,6 +1063,13 @@ async fn docker_clean(
     if !payload.volumes && !payload.images {
         return err(StatusCode::BAD_REQUEST, "At least one of 'volumes' or 'images' must be true");
     }
+
+    let _guard = match state.try_acquire_compose_lock("docker_clean", None).await {
+        Ok(g) => g,
+        Err(_) => {
+            return err(StatusCode::CONFLICT, state.conflict_message().await);
+        }
+    };
 
     match run_docker_prune(payload.volumes, payload.images) {
         Ok(_) => {
@@ -1561,7 +1685,16 @@ async fn main() -> Result<()> {
         deployed_file: RwLock::new(None),
         deployed_file_sha256: RwLock::new(None),
         actions: RwLock::new(initial_actions),
-        http: reqwest::Client::new(),
+        // Bounded timeouts: the compose lock is held across GitHub fetches in
+        // compose_up/compose_down, so a hung GitHub call would otherwise gate
+        // every subsequent docker op behind the OS TCP timeout.
+        http: reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(10))
+            .build()
+            .expect("reqwest client builder with valid timeouts"),
+        compose_lock: Arc::new(Mutex::new(())),
+        in_flight: Arc::new(RwLock::new(None)),
     });
 
     let app = Router::new()
@@ -1834,5 +1967,77 @@ mod tests {
             success: true,
         };
         assert_eq!(both.combined(), "ok\nwarn");
+    }
+
+    // --- Compose lock tests ---
+
+    fn make_test_state() -> Arc<AppState> {
+        Arc::new(AppState {
+            bearer_token: "test-token".into(),
+            github_owner: "test".into(),
+            github_repo_name: "test".into(),
+            min_tag_age_hours: 0,
+            work_dir: PathBuf::from("/tmp/compose-manager-test"),
+            env_files: vec![],
+            deployed_tag: RwLock::new(None),
+            deployed_commit: RwLock::new(None),
+            deployed_file: RwLock::new(None),
+            deployed_file_sha256: RwLock::new(None),
+            actions: RwLock::new(vec![]),
+            http: reqwest::Client::new(),
+            compose_lock: Arc::new(Mutex::new(())),
+            in_flight: Arc::new(RwLock::new(None)),
+        })
+    }
+
+    #[tokio::test]
+    async fn compose_lock_acquire_succeeds_when_free() {
+        let state = make_test_state();
+        let result = state.try_acquire_compose_lock("compose_up", Some("v1".into())).await;
+        assert!(result.is_ok(), "lock should be acquirable when no one holds it");
+    }
+
+    #[tokio::test]
+    async fn compose_lock_rejects_concurrent_request() {
+        let state = make_test_state();
+        let _guard = state.try_acquire_compose_lock("compose_up", Some("v1".into())).await.unwrap();
+        // While the first guard is held, a second acquire must fail.
+        let result = state.try_acquire_compose_lock("compose_down", Some("v2".into())).await;
+        assert!(result.is_err(), "lock should reject when already held");
+    }
+
+    #[tokio::test]
+    async fn compose_lock_releases_on_drop() {
+        let state = make_test_state();
+        {
+            let _guard = state.try_acquire_compose_lock("compose_up", Some("v1".into())).await.unwrap();
+        } // guard dropped here
+        // After dropping, the lock should be available again.
+        let result = state.try_acquire_compose_lock("compose_down", Some("v2".into())).await;
+        assert!(result.is_ok(), "lock should be available after guard is dropped");
+    }
+
+    #[tokio::test]
+    async fn in_flight_cleared_on_drop() {
+        let state = make_test_state();
+        {
+            let _guard = state.try_acquire_compose_lock("compose_up", Some("v1".into())).await.unwrap();
+            let in_flight = state.in_flight.read().await.clone();
+            assert!(in_flight.is_some(), "in_flight should be set while lock is held");
+            assert_eq!(in_flight.unwrap().action, "compose_up");
+        }
+        // After dropping the ComposeGuard, in_flight must be cleared
+        // (ComposeGuard::Drop clears it).
+        let in_flight = state.in_flight.read().await.clone();
+        assert!(in_flight.is_none(), "in_flight should be cleared after ComposeGuard drops");
+    }
+
+    #[tokio::test]
+    async fn in_flight_reflects_current_action() {
+        let state = make_test_state();
+        let _guard = state.try_acquire_compose_lock("docker_clean", None).await.unwrap();
+        let in_flight = state.in_flight.read().await.clone().unwrap();
+        assert_eq!(in_flight.action, "docker_clean");
+        assert_eq!(in_flight.tag, None);
     }
 }
