@@ -1685,7 +1685,14 @@ async fn main() -> Result<()> {
         deployed_file: RwLock::new(None),
         deployed_file_sha256: RwLock::new(None),
         actions: RwLock::new(initial_actions),
-        http: reqwest::Client::new(),
+        // Bounded timeouts: the compose lock is held across GitHub fetches in
+        // compose_up/compose_down, so a hung GitHub call would otherwise gate
+        // every subsequent docker op behind the OS TCP timeout.
+        http: reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(10))
+            .build()
+            .expect("reqwest client builder with valid timeouts"),
         compose_lock: Arc::new(Mutex::new(())),
         in_flight: Arc::new(RwLock::new(None)),
     });
