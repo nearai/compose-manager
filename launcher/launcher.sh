@@ -58,9 +58,13 @@ write_env_var() {
     touch "$ENV_FILE"
     if grep -q "^${key}=" "$ENV_FILE" 2>/dev/null; then
         local tmp="${ENV_FILE}.tmp"
-        sed "s|^${key}=.*|${key}=${value}|" "$ENV_FILE" > "$tmp" && mv "$tmp" "$ENV_FILE"
+        # Use awk instead of sed: sed's s/// misinterprets |, \, & in the replacement
+        # string, which would corrupt values like image refs containing @sha256:...
+        awk -v k="$key" -v v="$value" \
+            'index($0, k "=") == 1 { print k "=" v; next } { print }' \
+            "$ENV_FILE" > "$tmp" && mv "$tmp" "$ENV_FILE"
     else
-        echo "${key}=${value}" >> "$ENV_FILE"
+        printf '%s=%s\n' "$key" "$value" >> "$ENV_FILE"
     fi
 }
 
@@ -116,6 +120,12 @@ fetch_remote_digest() {
     fi
 
     echo "$digest"
+}
+
+# ── Digest validation ────────────────────────────────────────────────
+
+valid_digest() {
+    [[ "$1" =~ ^sha256:[0-9a-f]{64}$ ]]
 }
 
 # ── Cosign verification ───────────────────────────────────────────────
@@ -202,11 +212,9 @@ rollback() {
     else
         log_error "CRITICAL: Rollback also failed — manual intervention required"
     fi
-    local backoff_target
-    backoff_target="$(date -u -d "+30 minutes" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
-        || date -u -v+30M +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "")"
-    write_state "backoff_until" "$backoff_target"
-    log "Entering 30-minute backoff until ${backoff_target}"
+    local backoff_epoch; backoff_epoch=$(( $(date +%s) + 1800 ))
+    write_state "backoff_until_epoch" "$backoff_epoch"
+    log "Entering 30-minute backoff (until epoch ${backoff_epoch})"
 }
 
 # ── Bootstrap ─────────────────────────────────────────────────────────
@@ -246,14 +254,13 @@ _poll_cycle() {
     log "Poll cycle #${POLL_CYCLE} (${IMAGE_REPO}:${CHANNEL})"
 
     # Backoff check
-    local backoff_until; backoff_until="$(read_state "backoff_until")"
-    if [ -n "$backoff_until" ]; then
-        local now; now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        if [[ "$now" < "$backoff_until" ]]; then
-            log "In backoff until ${backoff_until}, skipping"
+    local backoff_until_epoch; backoff_until_epoch="$(read_state "backoff_until_epoch")"
+    if [ -n "$backoff_until_epoch" ]; then
+        if [ "$(date +%s)" -lt "$backoff_until_epoch" ]; then
+            log "In backoff (until epoch ${backoff_until_epoch}), skipping"
             return 0
         else
-            write_state "backoff_until" ""
+            write_state "backoff_until_epoch" ""
             log "Backoff expired, resuming"
         fi
     fi
@@ -262,6 +269,10 @@ _poll_cycle() {
     remote_digest="$(fetch_remote_digest "$IMAGE_REPO" "$CHANNEL")"
     if [ -z "$remote_digest" ]; then
         log_error "Failed to fetch remote digest for ${IMAGE_REPO}:${CHANNEL}"
+        return 1
+    fi
+    if ! valid_digest "$remote_digest"; then
+        log_error "Remote digest has unexpected format: '${remote_digest}'"
         return 1
     fi
 
