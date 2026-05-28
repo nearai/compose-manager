@@ -156,6 +156,11 @@ async fn proxy_json(
         .http
         .request(method, &url)
         .header("Authorization", format!("Bearer {}", instance.bearer_token))
+        // Attribute the action to the dashboard in compose-manager's Slack
+        // notifications (nearai/infra#141). The dashboard uses a single shared
+        // token, so this is the finest attribution available without per-user
+        // auth.
+        .header("X-Triggered-By", "dashboard")
         .timeout(std::time::Duration::from_secs(timeout_secs.unwrap_or(30)));
 
     if let Some(body) = body {
@@ -215,6 +220,7 @@ async fn proxy_stream(
         .http
         .post(&url)
         .header("Authorization", format!("Bearer {}", instance.bearer_token))
+        .header("X-Triggered-By", "dashboard")
         .json(&body)
         .send()
         .await

@@ -216,6 +216,13 @@ struct AppState {
     min_tag_age_hours: i64,
     work_dir: PathBuf,
     env_files: Vec<String>,
+    /// Slack incoming-webhook URL for ops notifications. `None` disables
+    /// notifications entirely (best-effort feature — staging/dev stay quiet).
+    slack_webhook_url: Option<String>,
+    /// Human label identifying this CVM/host in notifications, e.g. "gpu23".
+    /// Sourced from the `INSTANCE_LABEL` env var (templated to the ansible
+    /// inventory hostname). Empty string falls back to "unknown-host".
+    instance_label: String,
     deployed_tag: RwLock<Option<String>>,
     deployed_commit: RwLock<Option<String>>,
     deployed_file: RwLock<Option<String>>,
@@ -533,6 +540,194 @@ fn verify_bearer_token_raw(headers: &HeaderMap, expected: &str) -> Result<(), (S
     Ok(())
 }
 
+// --- Action recording + actor attribution ---
+
+/// HTTP header callers use to attribute an operation to a human or automation
+/// (e.g. the dashboard sends "dashboard", ansible sends "ansible@gpu23"). When
+/// absent we fall back to "automation". The value is sanitized (single line,
+/// length-bounded) since it is echoed verbatim into Slack messages.
+const ACTOR_HEADER: &str = "x-triggered-by";
+
+fn extract_actor(headers: &HeaderMap) -> String {
+    headers
+        .get(ACTOR_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| {
+            s.chars()
+                .filter(|c| *c != '\n' && *c != '\r')
+                .take(80)
+                .collect::<String>()
+                .trim()
+                .to_string()
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "automation".to_string())
+}
+
+/// Append a deployment action to the in-memory log and persist it to disk.
+/// Returns `Err(())` if the disk write failed (the error is already logged);
+/// callers map this to a 500. Slack notification is fired separately by the
+/// caller, since streaming ops (compose up/down) only learn their outcome when
+/// the NDJSON stream terminates.
+async fn record_action(state: &Arc<AppState>, action: &DeploymentAction) -> Result<(), ()> {
+    let mut actions = state.actions.write().await;
+    actions.push(action.clone());
+    if let Err(e) = persist_actions_to_disk(&state.work_dir, &actions).await {
+        error!(error = %e, "Failed to persist action log to disk");
+        return Err(());
+    }
+    Ok(())
+}
+
+/// Best-effort Slack notifications for CVM operations (nearai/infra#141).
+///
+/// Notifications never block or fail a handler: when no webhook is configured
+/// the call is a no-op, and delivery happens on a detached task whose errors
+/// are logged and swallowed.
+mod notify {
+    use super::{AppState, DeploymentAction};
+    use std::sync::Arc;
+    use tracing::warn;
+
+    /// Carried on an `NdjsonStream` so a streaming compose op can notify Slack
+    /// with its real exit status once the stream terminates.
+    pub struct CompletionNotice {
+        pub state: Arc<AppState>,
+        pub action: DeploymentAction,
+        pub actor: String,
+    }
+
+    /// Render a `DeploymentAction` into a Slack message. `outcome` is
+    /// `Some(true/false)` when the result is known (succeeded/failed) or `None`
+    /// when not applicable.
+    pub fn format_message(
+        action: &DeploymentAction,
+        instance_label: &str,
+        actor: &str,
+        outcome: Option<bool>,
+    ) -> String {
+        let host = if instance_label.is_empty() {
+            "unknown-host"
+        } else {
+            instance_label
+        };
+        let failed = matches!(outcome, Some(false));
+        let emoji = if failed {
+            ":x:"
+        } else {
+            match action.action.as_str() {
+                "compose_up" => ":rocket:",
+                "compose_down" => ":octagonal_sign:",
+                "docker_restart" => ":arrows_counterclockwise:",
+                "docker_clean" => ":broom:",
+                a if a.starts_with("dstack_agent_") => ":satellite_antenna:",
+                a if a.starts_with("kernel_algif") => ":lock:",
+                _ => ":information_source:",
+            }
+        };
+        let detail = match action.action.as_str() {
+            "compose_up" => {
+                let title = if failed { "Deploy failed" } else { "Deployed" };
+                let mut d = format!("*{}* on `{}`", title, host);
+                if let Some(f) = &action.file {
+                    d.push_str(&format!(" — `{}`", f));
+                }
+                if let Some(t) = &action.tag {
+                    d.push_str(&format!(" → `{}`", t));
+                }
+                if !action.services.is_empty() {
+                    d.push_str(&format!(" ({})", action.services.join(", ")));
+                }
+                d
+            }
+            "compose_down" => {
+                let title = if failed { "Stop failed" } else { "Stopped" };
+                let mut d = format!("*{}* on `{}`", title, host);
+                if let Some(f) = &action.file {
+                    d.push_str(&format!(" — `{}`", f));
+                }
+                if let Some(t) = &action.tag {
+                    d.push_str(&format!(" (`{}`)", t));
+                }
+                if !action.services.is_empty() {
+                    d.push_str(&format!(" [{}]", action.services.join(", ")));
+                }
+                d
+            }
+            "docker_restart" => {
+                let c = action.container.as_deref().unwrap_or("?");
+                if failed {
+                    format!("*Restart of container* `{}` *failed* on `{}`", c, host)
+                } else {
+                    format!("*Restarted container* `{}` on `{}`", c, host)
+                }
+            }
+            "docker_clean" => {
+                let title = if failed {
+                    "Docker prune failed"
+                } else {
+                    "Docker prune complete"
+                };
+                format!("*{}* on `{}`", title, host)
+            }
+            a if a.starts_with("dstack_agent_") => {
+                let verb = a.strip_prefix("dstack_agent_").unwrap_or(a);
+                if failed {
+                    format!("*dstack-agent {} failed* on `{}`", verb, host)
+                } else {
+                    let past = match verb {
+                        "start" => "started",
+                        "stop" => "stopped",
+                        "restart" => "restarted",
+                        other => other,
+                    };
+                    format!("*dstack-agent {}* on `{}`", past, host)
+                }
+            }
+            a if a.starts_with("kernel_algif") => {
+                if failed {
+                    format!("*Kernel algif blacklist failed* (`{}`) on `{}`", a, host)
+                } else {
+                    format!("*Kernel algif blacklist applied* on `{}`", host)
+                }
+            }
+            other => {
+                let suffix = if failed { " failed" } else { "" };
+                format!("*{}{}* on `{}`", other, suffix, host)
+            }
+        };
+        format!("{} {} · by {}", emoji, detail, actor)
+    }
+
+    /// Fire a Slack notification for `action` on a detached task. No-op when no
+    /// webhook is configured.
+    pub fn spawn_action(
+        state: &Arc<AppState>,
+        action: &DeploymentAction,
+        actor: &str,
+        outcome: Option<bool>,
+    ) {
+        let webhook = match &state.slack_webhook_url {
+            Some(w) => w.clone(),
+            None => return,
+        };
+        let text = format_message(action, &state.instance_label, actor, outcome);
+        let http = state.http.clone();
+        tokio::spawn(async move {
+            send(&http, &webhook, &text).await;
+        });
+    }
+
+    async fn send(http: &reqwest::Client, webhook: &str, text: &str) {
+        let body = serde_json::json!({ "text": text });
+        match http.post(webhook).json(&body).send().await {
+            Ok(resp) if resp.status().is_success() => {}
+            Ok(resp) => warn!(status = %resp.status(), "Slack notification returned non-success status"),
+            Err(e) => warn!(error = %e, "Failed to send Slack notification"),
+        }
+    }
+}
+
 // --- NDJSON Streaming ---
 
 #[derive(Serialize)]
@@ -556,6 +751,9 @@ struct NdjsonStream {
     /// Held while a mutating docker/compose operation is in flight.
     /// Released on Drop (via ComposeGuard), allowing the next operation to proceed.
     compose_guard: Option<ComposeGuard>,
+    /// Fired with the real exit status when the stream reaches its terminal
+    /// `done` event, so compose up/down notify Slack as succeeded/failed.
+    completion: Option<notify::CompletionNotice>,
 }
 
 impl Stream for NdjsonStream {
@@ -645,6 +843,17 @@ impl Stream for NdjsonStream {
                         }
 
                         this.done = true;
+
+                        // Notify Slack with the real outcome now that the
+                        // streaming op has finished (best-effort, non-blocking).
+                        if let Some(notice) = this.completion.take() {
+                            notify::spawn_action(
+                                &notice.state,
+                                &notice.action,
+                                &notice.actor,
+                                Some(status.success()),
+                            );
+                        }
 
                         // Clean up temp env file
                         if let Some(ref path) = this.temp_env_file {
@@ -771,6 +980,7 @@ fn stream_docker_compose_phased(
         temp_env_file,
         done: false,
         compose_guard: None,
+        completion: None,
     })
 }
 
@@ -860,23 +1070,28 @@ async fn compose_up(
     };
     stream.compose_guard = Some(guard);
 
-    {
-        let mut actions = state.actions.write().await;
-        actions.push(DeploymentAction {
-            timestamp: Utc::now().to_rfc3339(),
-            action: "compose_up".into(),
-            tag: Some(payload.tag.clone()),
-            commit: Some(tag_info.commit_sha.clone()),
-            file: Some(file.clone()),
-            file_sha256: Some(file_sha256.clone()),
-            services: payload.services,
-            container: None,
-        });
-        if let Err(e) = persist_actions_to_disk(&state.work_dir, &*actions).await {
-            error!(error = %e, "Failed to persist action log to disk");
-            return err_response(StatusCode::INTERNAL_SERVER_ERROR, "Failed to persist action log");
-        }
+    let actor = extract_actor(&headers);
+    let action = DeploymentAction {
+        timestamp: Utc::now().to_rfc3339(),
+        action: "compose_up".into(),
+        tag: Some(payload.tag.clone()),
+        commit: Some(tag_info.commit_sha.clone()),
+        file: Some(file.clone()),
+        file_sha256: Some(file_sha256.clone()),
+        services: payload.services,
+        container: None,
+    };
+    if record_action(&state, &action).await.is_err() {
+        return err_response(StatusCode::INTERNAL_SERVER_ERROR, "Failed to persist action log");
     }
+    // Defer the Slack notification to stream completion so it reports the real
+    // deploy outcome (succeeded/failed) rather than just "started".
+    stream.completion = Some(notify::CompletionNotice {
+        state: state.clone(),
+        action,
+        actor,
+    });
+
     *state.deployed_tag.write().await = Some(payload.tag);
     *state.deployed_commit.write().await = Some(tag_info.commit_sha);
     *state.deployed_file.write().await = Some(file);
@@ -944,23 +1159,25 @@ async fn compose_down(
     };
     stream.compose_guard = Some(guard);
 
-    {
-        let mut actions = state.actions.write().await;
-        actions.push(DeploymentAction {
-            timestamp: Utc::now().to_rfc3339(),
-            action: "compose_down".into(),
-            tag: Some(payload.tag),
-            commit: Some(tag_info.commit_sha),
-            file: Some(file),
-            file_sha256: None,
-            services: payload.services,
-            container: None,
-        });
-        if let Err(e) = persist_actions_to_disk(&state.work_dir, &*actions).await {
-            error!(error = %e, "Failed to persist action log to disk");
-            return err_response(StatusCode::INTERNAL_SERVER_ERROR, "Failed to persist action log");
-        }
+    let actor = extract_actor(&headers);
+    let action = DeploymentAction {
+        timestamp: Utc::now().to_rfc3339(),
+        action: "compose_down".into(),
+        tag: Some(payload.tag),
+        commit: Some(tag_info.commit_sha),
+        file: Some(file),
+        file_sha256: None,
+        services: payload.services,
+        container: None,
+    };
+    if record_action(&state, &action).await.is_err() {
+        return err_response(StatusCode::INTERNAL_SERVER_ERROR, "Failed to persist action log");
     }
+    stream.completion = Some(notify::CompletionNotice {
+        state: state.clone(),
+        action,
+        actor,
+    });
 
     Response::builder()
         .status(StatusCode::OK)
@@ -1025,23 +1242,21 @@ async fn docker_restart(
 
     match run_command("docker", &["restart", &payload.container]) {
         Ok(_) => {
-            {
-                let mut actions = state.actions.write().await;
-                actions.push(DeploymentAction {
-                    timestamp: Utc::now().to_rfc3339(),
-                    action: "docker_restart".into(),
-                    tag: None,
-                    commit: None,
-                    file: None,
-                    file_sha256: None,
-                    services: vec![],
-                    container: Some(payload.container),
-                });
-                if let Err(e) = persist_actions_to_disk(&state.work_dir, &*actions).await {
-                    error!(error = %e, "Failed to persist action log to disk");
-                    return err(StatusCode::INTERNAL_SERVER_ERROR, "Failed to persist action log");
-                }
+            let actor = extract_actor(&headers);
+            let action = DeploymentAction {
+                timestamp: Utc::now().to_rfc3339(),
+                action: "docker_restart".into(),
+                tag: None,
+                commit: None,
+                file: None,
+                file_sha256: None,
+                services: vec![],
+                container: Some(payload.container),
+            };
+            if record_action(&state, &action).await.is_err() {
+                return err(StatusCode::INTERNAL_SERVER_ERROR, "Failed to persist action log");
             }
+            notify::spawn_action(&state, &action, &actor, Some(true));
             ok(None)
         }
         Err(e) => {
@@ -1073,23 +1288,21 @@ async fn docker_clean(
 
     match run_docker_prune(payload.volumes, payload.images) {
         Ok(_) => {
-            {
-                let mut actions = state.actions.write().await;
-                actions.push(DeploymentAction {
-                    timestamp: Utc::now().to_rfc3339(),
-                    action: "docker_clean".into(),
-                    tag: None,
-                    commit: None,
-                    file: None,
-                    file_sha256: None,
-                    services: vec![],
-                    container: None,
-                });
-                if let Err(e) = persist_actions_to_disk(&state.work_dir, &*actions).await {
-                    error!(error = %e, "Failed to persist action log to disk");
-                    return err(StatusCode::INTERNAL_SERVER_ERROR, "Failed to persist action log");
-                }
+            let actor = extract_actor(&headers);
+            let action = DeploymentAction {
+                timestamp: Utc::now().to_rfc3339(),
+                action: "docker_clean".into(),
+                tag: None,
+                commit: None,
+                file: None,
+                file_sha256: None,
+                services: vec![],
+                container: None,
+            };
+            if record_action(&state, &action).await.is_err() {
+                return err(StatusCode::INTERNAL_SERVER_ERROR, "Failed to persist action log");
             }
+            notify::spawn_action(&state, &action, &actor, Some(true));
             ok(None)
         }
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
@@ -1318,27 +1531,27 @@ async fn algif_blacklist_action(
 
     // Log the attempt regardless of outcome — a failed re-apply is valuable
     // forensic signal, matching the dstack-agent action-logging pattern.
+    let succeeded = matches!(&result, Ok(r) if r.success);
     let action_name = match &result {
         Ok(r) if r.success => "kernel_algif_blacklist_ok",
         Ok(_) => "kernel_algif_blacklist_script_failed",
         Err(_) => "kernel_algif_blacklist_invocation_failed",
     };
-    {
-        let mut actions = state.actions.write().await;
-        actions.push(DeploymentAction {
-            timestamp: Utc::now().to_rfc3339(),
-            action: action_name.into(),
-            tag: None,
-            commit: None,
-            file: None,
-            file_sha256: None,
-            services: vec![],
-            container: None,
-        });
-        if let Err(e) = persist_actions_to_disk(&state.work_dir, &actions).await {
-            error!(error = %e, "Failed to persist action log to disk");
-        }
-    }
+    let actor = extract_actor(&headers);
+    let action = DeploymentAction {
+        timestamp: Utc::now().to_rfc3339(),
+        action: action_name.into(),
+        tag: None,
+        commit: None,
+        file: None,
+        file_sha256: None,
+        services: vec![],
+        container: None,
+    };
+    // Persist failures are logged inside record_action; the original code did
+    // not abort the request on a persist error here, so neither do we.
+    let _ = record_action(&state, &action).await;
+    notify::spawn_action(&state, &action, &actor, Some(succeeded));
 
     let result = match result {
         Ok(r) => r,
@@ -1433,23 +1646,21 @@ async fn dstack_agent_action(
 
     // start/stop/restart: log the attempt regardless of outcome (failed restarts
     // are valuable forensic signal), then map systemctl exit to HTTP status.
-    {
-        let mut actions = state.actions.write().await;
-        actions.push(DeploymentAction {
-            timestamp: Utc::now().to_rfc3339(),
-            action: format!("dstack_agent_{}", action),
-            tag: None,
-            commit: None,
-            file: None,
-            file_sha256: None,
-            services: vec![],
-            container: None,
-        });
-        if let Err(e) = persist_actions_to_disk(&state.work_dir, &*actions).await {
-            error!(error = %e, "Failed to persist action log to disk");
-            return err(StatusCode::INTERNAL_SERVER_ERROR, "Failed to persist action log");
-        }
+    let actor = extract_actor(&headers);
+    let act = DeploymentAction {
+        timestamp: Utc::now().to_rfc3339(),
+        action: format!("dstack_agent_{}", action),
+        tag: None,
+        commit: None,
+        file: None,
+        file_sha256: None,
+        services: vec![],
+        container: None,
+    };
+    if record_action(&state, &act).await.is_err() {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, "Failed to persist action log");
     }
+    notify::spawn_action(&state, &act, &actor, Some(result.success));
 
     if !result.success {
         error!(
@@ -1635,6 +1846,17 @@ async fn main() -> Result<()> {
         .filter(|s| !s.is_empty())
         .collect();
 
+    let slack_webhook_url = std::env::var("SLACK_WEBHOOK_URL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let instance_label = std::env::var("INSTANCE_LABEL").unwrap_or_default();
+    info!(
+        slack_notifications = slack_webhook_url.is_some(),
+        instance_label = %instance_label,
+        "Slack notification config"
+    );
+
     let (github_owner, github_repo_name) = parse_github_url(&github_repo)?;
 
     // Apply CVE-2026-31431 (Copy Fail) mitigation on the CVM host kernel.
@@ -1680,6 +1902,8 @@ async fn main() -> Result<()> {
         min_tag_age_hours,
         work_dir,
         env_files,
+        slack_webhook_url,
+        instance_label,
         deployed_tag: RwLock::new(None),
         deployed_commit: RwLock::new(None),
         deployed_file: RwLock::new(None),
@@ -1979,6 +2203,8 @@ mod tests {
             min_tag_age_hours: 0,
             work_dir: PathBuf::from("/tmp/compose-manager-test"),
             env_files: vec![],
+            slack_webhook_url: None,
+            instance_label: "test-host".into(),
             deployed_tag: RwLock::new(None),
             deployed_commit: RwLock::new(None),
             deployed_file: RwLock::new(None),
@@ -2039,5 +2265,140 @@ mod tests {
         let in_flight = state.in_flight.read().await.clone().unwrap();
         assert_eq!(in_flight.action, "docker_clean");
         assert_eq!(in_flight.tag, None);
+    }
+
+    // --- Slack notification tests ---
+
+    fn sample_action(action: &str) -> DeploymentAction {
+        DeploymentAction {
+            timestamp: "2026-01-01T00:00:00+00:00".into(),
+            action: action.into(),
+            tag: None,
+            commit: None,
+            file: None,
+            file_sha256: None,
+            services: vec![],
+            container: None,
+        }
+    }
+
+    #[test]
+    fn format_deploy_success_includes_host_tag_file_services_actor() {
+        let a = DeploymentAction {
+            file: Some("glm.yaml".into()),
+            tag: Some("v0.0.165".into()),
+            services: vec!["nginx".into(), "proxy".into()],
+            ..sample_action("compose_up")
+        };
+        let msg = notify::format_message(&a, "gpu23", "ansible", Some(true));
+        assert!(msg.starts_with(":rocket:"), "got: {msg}");
+        assert!(msg.contains("Deployed"), "got: {msg}");
+        assert!(msg.contains("gpu23"));
+        assert!(msg.contains("glm.yaml"));
+        assert!(msg.contains("v0.0.165"));
+        assert!(msg.contains("nginx, proxy"));
+        assert!(msg.contains("by ansible"));
+    }
+
+    #[test]
+    fn format_deploy_failure_uses_x_and_failed_wording() {
+        let a = sample_action("compose_up");
+        let msg = notify::format_message(&a, "gpu23", "ci", Some(false));
+        assert!(msg.starts_with(":x:"), "got: {msg}");
+        assert!(msg.contains("Deploy failed"), "got: {msg}");
+        // No grammatically-broken "Deploy failed succeeded" etc.
+        assert!(!msg.contains("succeeded"));
+    }
+
+    #[test]
+    fn format_compose_down_reads_naturally() {
+        let a = DeploymentAction {
+            tag: Some("v1".into()),
+            file: Some("small-models.yaml".into()),
+            ..sample_action("compose_down")
+        };
+        let msg = notify::format_message(&a, "gpu02", "dashboard", Some(true));
+        assert!(msg.contains("Stopped"), "got: {msg}");
+        assert!(!msg.contains("Stopped succeeded"), "got: {msg}");
+        assert!(msg.contains("gpu02"));
+        assert!(msg.contains("small-models.yaml"));
+        assert!(msg.contains("by dashboard"));
+    }
+
+    #[test]
+    fn format_docker_restart_names_container() {
+        let a = DeploymentAction {
+            container: Some("vllm".into()),
+            ..sample_action("docker_restart")
+        };
+        let msg = notify::format_message(&a, "gpu11", "dashboard", Some(true));
+        assert!(msg.contains("Restarted container"), "got: {msg}");
+        assert!(msg.contains("vllm"));
+        assert!(msg.contains("gpu11"));
+    }
+
+    #[test]
+    fn format_dstack_agent_uses_past_tense_on_success() {
+        let a = sample_action("dstack_agent_stop");
+        let msg = notify::format_message(&a, "agent2", "dashboard", Some(true));
+        assert!(msg.contains("dstack-agent stopped"), "got: {msg}");
+        let a2 = sample_action("dstack_agent_restart");
+        let msg2 = notify::format_message(&a2, "agent2", "ci", Some(false));
+        assert!(msg2.starts_with(":x:"), "got: {msg2}");
+        assert!(msg2.contains("dstack-agent restart failed"), "got: {msg2}");
+    }
+
+    #[test]
+    fn format_falls_back_to_unknown_host_when_label_empty() {
+        let a = sample_action("compose_up");
+        let msg = notify::format_message(&a, "", "automation", Some(true));
+        assert!(msg.contains("unknown-host"), "got: {msg}");
+    }
+
+    #[test]
+    fn extract_actor_defaults_to_automation_when_absent() {
+        let headers = HeaderMap::new();
+        assert_eq!(extract_actor(&headers), "automation");
+    }
+
+    #[test]
+    fn extract_actor_reads_and_sanitizes_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-triggered-by", "ansible@gpu23".parse().unwrap());
+        assert_eq!(extract_actor(&headers), "ansible@gpu23");
+
+        // Header lookup is case-insensitive and an empty value falls back.
+        let mut h2 = HeaderMap::new();
+        h2.insert("X-Triggered-By", "   ".parse().unwrap());
+        assert_eq!(extract_actor(&h2), "automation");
+    }
+
+    /// Live end-to-end delivery against a real Slack incoming webhook. Ignored
+    /// by default (needs network + a webhook); run with:
+    ///   SLACK_TEST_WEBHOOK_URL=<url> cargo test slack_live_delivery -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn slack_live_delivery() {
+        let webhook = match std::env::var("SLACK_TEST_WEBHOOK_URL") {
+            Ok(w) if !w.trim().is_empty() => w,
+            _ => {
+                eprintln!("SLACK_TEST_WEBHOOK_URL not set; skipping");
+                return;
+            }
+        };
+        let action = DeploymentAction {
+            file: Some("glm.yaml".into()),
+            tag: Some("v0.0.165".into()),
+            services: vec!["nginx".into()],
+            ..sample_action("compose_up")
+        };
+        let text = notify::format_message(&action, "gpu-test", "integration-test", Some(true));
+        let resp = reqwest::Client::new()
+            .post(&webhook)
+            .json(&serde_json::json!({ "text": text }))
+            .send()
+            .await
+            .expect("request to Slack failed");
+        assert!(resp.status().is_success(), "slack returned {}", resp.status());
     }
 }
