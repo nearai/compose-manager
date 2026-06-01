@@ -232,24 +232,34 @@ bootstrap() {
     # Seed the current image digest from the running container so the first
     # poll cycle has a baseline and doesn't re-deploy an already-current image.
     #
-    # Use the registry MANIFEST digest from RepoDigests, NOT `{{.Image}}` — the
-    # latter is the local image CONFIG id, which never equals the registry
-    # manifest digest that fetch_remote_digest returns. Seeding the config id
-    # made every first boot see a "new image" and perform a spurious swap (and,
-    # with a slow compose-manager restart, a spurious rollback + 30-min backoff)
-    # even when the deployed image already was the current channel digest.
+    # We need the registry MANIFEST digest (what fetch_remote_digest returns),
+    # NOT `{{.Image}}` — that is the local image CONFIG id, which never equals
+    # the manifest digest, so seeding it makes every first boot see a "new
+    # image" and perform a spurious swap.
+    #
+    # `.RepoDigests` lives on the IMAGE, not the container, so it must come from
+    # `docker image inspect`, not `docker inspect <container>`. `.Config.Image`
+    # is the reference the container was created with: in our CVMs that is
+    # already `repo@sha256:<digest>` (deploys pin by digest), so prefer it and
+    # fall back to resolving RepoDigests when the container was started by tag.
     if [ -z "$(read_state "compose_manager_digest")" ]; then
-        local current_ref current
-        current_ref="$(docker inspect compose-manager \
-            --format '{{range .RepoDigests}}{{println .}}{{end}}' 2>/dev/null \
-            | grep "${IMAGE_REPO}@" | head -n1 || true)"
+        local config_image current_ref current
+        config_image="$(docker inspect compose-manager --format '{{.Config.Image}}' 2>/dev/null || true)"
+        case "$config_image" in
+            *@sha256:*) current_ref="$config_image" ;;
+            ?*)         current_ref="$(docker image inspect "$config_image" \
+                            --format '{{range .RepoDigests}}{{println .}}{{end}}' 2>/dev/null \
+                            | grep "${IMAGE_REPO}@" | head -n1 || true)" ;;
+            *)          current_ref="" ;;
+        esac
         current="${current_ref##*@}"
-        if [ -n "$current" ]; then
+        # current != current_ref guards against a ref with no '@' (no digest).
+        if [ -n "$current_ref" ] && [ "$current" != "$current_ref" ]; then
             write_state "compose_manager_digest" "$current"
             write_env_var "COMPOSE_MANAGER_IMAGE" "$current_ref"
             log "Seeded digest from running container: ${current_ref}"
         else
-            log "No resolvable RepoDigest for running compose-manager — will deploy on first poll"
+            log "Could not resolve a manifest digest for running compose-manager — will deploy on first poll"
         fi
     else
         log "Existing digest in state: $(read_state "compose_manager_digest")"
