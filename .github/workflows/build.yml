@@ -10,6 +10,7 @@ on:
 env:
   REGISTRY: docker.io
   IMAGE_REPOSITORY: ${{ vars.DOCKER_REGISTRY_USER }}/compose-manager
+  LAUNCHER_IMAGE_REPOSITORY: ${{ vars.DOCKER_REGISTRY_USER }}/compose-manager-launcher
   DASHBOARD_IMAGE_REPOSITORY: ${{ vars.DOCKER_REGISTRY_USER }}/compose-manager-dashboard
 
 jobs:
@@ -38,7 +39,7 @@ jobs:
             TAG=${GITHUB_REF_NAME#v}
             echo "Using '${TAG}' image tag for ${GITHUB_REF_NAME} tag"
           elif [[ "${GITHUB_REF_TYPE}" == 'branch' ]]; then
-            TAG=$(if [[ "${GITHUB_REF_NAME}" == 'master' ]]; then echo 'latest'; else echo 'dev'; fi)
+            TAG=$(if [[ "${GITHUB_REF_NAME}" == 'master' ]]; then echo 'staging'; else echo 'dev'; fi)
             echo "Using '${TAG}' image tag for ${GITHUB_REF_NAME} branch"
           else
             echo "Unsupported ref type: ${GITHUB_REF_TYPE}" >&2
@@ -93,6 +94,78 @@ jobs:
             echo "- sigstore: https://search.sigstore.dev/?hash=${{ env.IMAGE_DIGEST }}"
           } >> "$GITHUB_STEP_SUMMARY"
 
+  launcher-image:
+    name: Launcher Docker Image
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Log in to Docker registry
+        uses: docker/login-action@0567fa5ae8c9a197cb207537dc5cbb43ca3d803f
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ vars.DOCKER_REGISTRY_USER }}
+          password: ${{ secrets.DOCKER_REGISTRY_TOKEN }}
+
+      - name: Extract image tag from GitHub ref
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == 'tag' ]]; then
+            TAG=${GITHUB_REF_NAME#v}
+          elif [[ "${GITHUB_REF_TYPE}" == 'branch' ]]; then
+            TAG=$(if [[ "${GITHUB_REF_NAME}" == 'master' ]]; then echo 'staging'; else echo 'dev'; fi)
+          else
+            echo "Unsupported ref type: ${GITHUB_REF_TYPE}" >&2
+            exit 1
+          fi
+          echo "LAUNCHER_IMAGE_REFERENCE=${{ env.REGISTRY }}/${{ env.LAUNCHER_IMAGE_REPOSITORY }}:${TAG}" >> "$GITHUB_ENV"
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y skopeo jq
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push launcher image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ./launcher
+          push: true
+          tags: ${{ env.LAUNCHER_IMAGE_REFERENCE }}
+          platforms: linux/amd64
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d07f1d8e8f0afacf  # v3.8.2
+
+      - name: Sign launcher image with cosign (keyless)
+        run: |
+          cosign sign --yes "${{ env.REGISTRY }}/${{ env.LAUNCHER_IMAGE_REPOSITORY }}@${{ steps.build.outputs.digest }}"
+
+      - name: Generate artifact attestation
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.LAUNCHER_IMAGE_REPOSITORY }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Generate build summary
+        run: |
+          {
+            echo "## compose-manager-launcher docker image"
+            echo ""
+            echo "- tag: \`${{ env.LAUNCHER_IMAGE_REFERENCE }}\`"
+            echo "- digest: \`${{ steps.build.outputs.digest }}\`"
+            echo "- sigstore: https://search.sigstore.dev/?hash=${{ steps.build.outputs.digest }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   dashboard-image:
     name: Dashboard Docker Image
     permissions:
@@ -115,7 +188,7 @@ jobs:
           if [[ "${GITHUB_REF_TYPE}" == 'tag' ]]; then
             TAG=${GITHUB_REF_NAME#v}
           elif [[ "${GITHUB_REF_TYPE}" == 'branch' ]]; then
-            TAG=$(if [[ "${GITHUB_REF_NAME}" == 'master' ]]; then echo 'latest'; else echo 'dev'; fi)
+            TAG=$(if [[ "${GITHUB_REF_NAME}" == 'master' ]]; then echo 'staging'; else echo 'dev'; fi)
           else
             echo "Unsupported ref type: ${GITHUB_REF_TYPE}" >&2
             exit 1

@@ -1,0 +1,36 @@
+services:
+  compose-manager:
+    image: ${COMPOSE_MANAGER_IMAGE}
+    container_name: compose-manager
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    # pid:host + CAP_SYS_ADMIN + CAP_SYS_PTRACE let compose-manager run
+    # `nsenter -t 1 -m -u -i -n -p -- ...` into PID 1's namespaces.
+    #   - SYS_PTRACE: needed to open /proc/1/ns/* (ptrace_may_access gates
+    #     this — PID 1 has `dumpable=0` because it was launched with a full
+    #     cap set, so even root in the same user-ns needs SYS_PTRACE).
+    #   - SYS_ADMIN: needed for the setns() that follows the open.
+    pid: host
+    cap_add:
+      - SYS_ADMIN
+      - SYS_PTRACE
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /var/run/dstack.sock:/var/run/dstack.sock
+      - /dstack/.host-shared/.decrypted-env:/app/.env:ro
+      - work:/app/work
+    environment:
+      - GITHUB_REPO=${CM_GITHUB_REPO:-https://github.com/nearai/cvm-compose-files}
+      - BEARER_TOKEN=${BEARER_TOKEN}
+      - WORK_DIR=/app/work
+      - MIN_TAG_AGE_HOURS=${CM_MIN_TAG_AGE_HOURS:-2}
+      - ENV_FILES=/app/.env
+    labels:
+      com.datadoghq.ad.logs: '[{"source": "compose-manager", "service": "compose-manager"}]'
+
+volumes:
+  work:
+    # Reference the existing dstack_work volume — do not create a new one.
+    name: dstack_work
+    external: true
