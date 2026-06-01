@@ -18,7 +18,11 @@ ENV_FILE="${LAUNCHER_ENV_FILE:-/app/work/.env.launcher}"
 # Compose file path: launcher copies the bundled file here on first start.
 COMPOSE_FILE="${LAUNCHER_COMPOSE_FILE:-/app/work/compose-manager.yml}"
 HEALTH_URL="${LAUNCHER_HEALTH_URL:-http://127.0.0.1:8080/version}"
-HEALTH_TIMEOUT="${LAUNCHER_HEALTH_TIMEOUT:-60}"
+# compose-manager does TLS/cert, S3 and git work on startup, so a container
+# recreate can take well over a minute to answer /version. 60s caused a real
+# swap (or rollback) to be declared failed while the new container was still
+# coming up; default to 180s.
+HEALTH_TIMEOUT="${LAUNCHER_HEALTH_TIMEOUT:-180}"
 STATE_FILE="${LAUNCHER_STATE_FILE:-/app/work/launcher-state.json}"
 COSIGN_IDENTITY="${LAUNCHER_COSIGN_IDENTITY_REGEXP:-}"
 COSIGN_ISSUER="${LAUNCHER_COSIGN_ISSUER:-https://token.actions.githubusercontent.com}"
@@ -227,15 +231,25 @@ bootstrap() {
 
     # Seed the current image digest from the running container so the first
     # poll cycle has a baseline and doesn't re-deploy an already-current image.
+    #
+    # Use the registry MANIFEST digest from RepoDigests, NOT `{{.Image}}` — the
+    # latter is the local image CONFIG id, which never equals the registry
+    # manifest digest that fetch_remote_digest returns. Seeding the config id
+    # made every first boot see a "new image" and perform a spurious swap (and,
+    # with a slow compose-manager restart, a spurious rollback + 30-min backoff)
+    # even when the deployed image already was the current channel digest.
     if [ -z "$(read_state "compose_manager_digest")" ]; then
-        local current
-        current="$(docker inspect compose-manager --format '{{.Image}}' 2>/dev/null || echo "")"
+        local current_ref current
+        current_ref="$(docker inspect compose-manager \
+            --format '{{range .RepoDigests}}{{println .}}{{end}}' 2>/dev/null \
+            | grep "${IMAGE_REPO}@" | head -n1 || true)"
+        current="${current_ref##*@}"
         if [ -n "$current" ]; then
             write_state "compose_manager_digest" "$current"
-            write_env_var "COMPOSE_MANAGER_IMAGE" "$current"
-            log "Seeded digest from running container: ${current}"
+            write_env_var "COMPOSE_MANAGER_IMAGE" "$current_ref"
+            log "Seeded digest from running container: ${current_ref}"
         else
-            log "No running compose-manager container — will deploy on first poll"
+            log "No resolvable RepoDigest for running compose-manager — will deploy on first poll"
         fi
     else
         log "Existing digest in state: $(read_state "compose_manager_digest")"
