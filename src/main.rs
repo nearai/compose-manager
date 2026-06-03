@@ -1826,7 +1826,14 @@ fn parse_github_url(url: &str) -> Result<(String, String)> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    // ANSI off: logs go to Docker/Datadog, not a TTY — escape codes garble them.
+    tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
 
     let github_repo = std::env::var("GITHUB_REPO")
         .context("GITHUB_REPO environment variable is required")?;
