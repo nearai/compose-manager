@@ -26,7 +26,7 @@ use tokio::{
     process::Command as AsyncCommand,
     sync::{Mutex, RwLock},
 };
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 // --- Vendored dstack client (lightweight, avoids pulling in alloy) ---
 // Based on dstack-sdk 0.1.2, same pattern as tee-attestation-server
@@ -160,7 +160,7 @@ async fn persist_actions_to_disk(work_dir: &Path, actions: &[DeploymentAction]) 
     Ok(())
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 struct DeploymentAction {
     timestamp: String,
     action: String,
@@ -176,6 +176,12 @@ struct DeploymentAction {
     services: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     container: Option<String>,
+    /// For the `compose_manager_started` action: digest (repo@sha256:…) of the
+    /// image this compose-manager is itself running. Recorded at startup so the
+    /// running version is part of the action log that is hashed into the
+    /// attestation quote's report_data (see `attestation_report`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    image: Option<String>,
 }
 
 /// Tracks the currently-running mutating docker/compose operation (if any)
@@ -234,6 +240,10 @@ struct AppState {
     compose_lock: Arc<Mutex<()>>,
     /// Metadata about the currently-running operation (for 409 messages & /status).
     in_flight: Arc<RwLock<Option<InFlightOp>>>,
+    /// Digest (repo@sha256:…) of the image THIS compose-manager process runs,
+    /// resolved once at startup. Surfaced by /version and recorded as the
+    /// `compose_manager_started` action so it is bound into attestation.
+    running_image: Option<String>,
 }
 
 impl AppState {
@@ -295,24 +305,27 @@ struct StatusResponse {
     exit_code: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    /// Running compose-manager image digest (repo@sha256:…); populated by /version.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    image: Option<String>,
 }
 
 type ApiResult = (StatusCode, Json<StatusResponse>);
 
 fn ok(tag: Option<String>) -> ApiResult {
-    (StatusCode::OK, Json(StatusResponse { status: "ok".into(), tag, commit: None, file: None, file_sha256: None, output: None, exit_code: None, error: None }))
+    (StatusCode::OK, Json(StatusResponse { status: "ok".into(), tag, commit: None, file: None, file_sha256: None, output: None, exit_code: None, error: None, image: None }))
 }
 
 fn ok_output(output: String) -> ApiResult {
-    (StatusCode::OK, Json(StatusResponse { status: "ok".into(), tag: None, commit: None, file: None, file_sha256: None, output: Some(output), exit_code: None, error: None }))
+    (StatusCode::OK, Json(StatusResponse { status: "ok".into(), tag: None, commit: None, file: None, file_sha256: None, output: Some(output), exit_code: None, error: None, image: None }))
 }
 
 fn ok_systemctl(output: String, exit_code: Option<i32>) -> ApiResult {
-    (StatusCode::OK, Json(StatusResponse { status: "ok".into(), tag: None, commit: None, file: None, file_sha256: None, output: Some(output), exit_code, error: None }))
+    (StatusCode::OK, Json(StatusResponse { status: "ok".into(), tag: None, commit: None, file: None, file_sha256: None, output: Some(output), exit_code, error: None, image: None }))
 }
 
 fn err(code: StatusCode, msg: impl Into<String>) -> ApiResult {
-    (code, Json(StatusResponse { status: "error".into(), tag: None, commit: None, file: None, file_sha256: None, output: None, exit_code: None, error: Some(msg.into()) }))
+    (code, Json(StatusResponse { status: "error".into(), tag: None, commit: None, file: None, file_sha256: None, output: None, exit_code: None, error: Some(msg.into()), image: None }))
 }
 
 fn err_response(code: StatusCode, msg: impl Into<String>) -> Response {
@@ -325,6 +338,7 @@ fn err_response(code: StatusCode, msg: impl Into<String>) -> Response {
         output: None,
         exit_code: None,
         error: Some(msg.into()),
+        image: None,
     })
     .unwrap();
     Response::builder()
@@ -1074,6 +1088,7 @@ async fn compose_up(
     let action = DeploymentAction {
         timestamp: Utc::now().to_rfc3339(),
         action: "compose_up".into(),
+        image: None,
         tag: Some(payload.tag.clone()),
         commit: Some(tag_info.commit_sha.clone()),
         file: Some(file.clone()),
@@ -1163,6 +1178,7 @@ async fn compose_down(
     let action = DeploymentAction {
         timestamp: Utc::now().to_rfc3339(),
         action: "compose_down".into(),
+        image: None,
         tag: Some(payload.tag),
         commit: Some(tag_info.commit_sha),
         file: Some(file),
@@ -1246,6 +1262,7 @@ async fn docker_restart(
             let action = DeploymentAction {
                 timestamp: Utc::now().to_rfc3339(),
                 action: "docker_restart".into(),
+                image: None,
                 tag: None,
                 commit: None,
                 file: None,
@@ -1292,6 +1309,7 @@ async fn docker_clean(
             let action = DeploymentAction {
                 timestamp: Utc::now().to_rfc3339(),
                 action: "docker_clean".into(),
+                image: None,
                 tag: None,
                 commit: None,
                 file: None,
@@ -1408,7 +1426,7 @@ async fn version(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let commit = state.deployed_commit.read().await.clone();
     let file = state.deployed_file.read().await.clone();
     let file_sha256 = state.deployed_file_sha256.read().await.clone();
-    (StatusCode::OK, Json(StatusResponse { status: "ok".into(), tag, commit, file, file_sha256, output: None, exit_code: None, error: None }))
+    (StatusCode::OK, Json(StatusResponse { status: "ok".into(), tag, commit, file, file_sha256, output: None, exit_code: None, error: None, image: state.running_image.clone() }))
 }
 
 // --- Dstack guest-agent management ---
@@ -1541,6 +1559,7 @@ async fn algif_blacklist_action(
     let action = DeploymentAction {
         timestamp: Utc::now().to_rfc3339(),
         action: action_name.into(),
+        image: None,
         tag: None,
         commit: None,
         file: None,
@@ -1650,6 +1669,7 @@ async fn dstack_agent_action(
     let act = DeploymentAction {
         timestamp: Utc::now().to_rfc3339(),
         action: format!("dstack_agent_{}", action),
+        image: None,
         tag: None,
         commit: None,
         file: None,
@@ -1709,6 +1729,42 @@ fn run_command(program: &str, args: &[&str]) -> Result<String> {
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// Run `docker <args>` and return trimmed stdout, or None on failure/empty.
+async fn docker_inspect_output(args: &[&str]) -> Option<String> {
+    let out = AsyncCommand::new("docker").args(args).output().await.ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!s.is_empty()).then_some(s)
+}
+
+/// Best-effort digest of the image THIS compose-manager is running, read from
+/// its own container (`compose-manager`) via the mounted docker socket.
+///
+/// Prefers `.Config.Image`, which the launcher pins to `repo@sha256:…` (and the
+/// Ansible template likewise pins by digest); for a tag-based local run it
+/// falls back to the image's first `RepoDigests` entry. Returns None if it
+/// can't be resolved — startup still proceeds.
+async fn current_image_digest() -> Option<String> {
+    let config_image =
+        docker_inspect_output(&["inspect", "compose-manager", "--format", "{{.Config.Image}}"])
+            .await?;
+    if config_image.contains("@sha256:") {
+        return Some(config_image);
+    }
+    // Tag-based reference (local dev): resolve the image's first repo digest.
+    docker_inspect_output(&[
+        "image",
+        "inspect",
+        &config_image,
+        "--format",
+        "{{range .RepoDigests}}{{println .}}{{end}}",
+    ])
+    .await
+    .and_then(|s| s.lines().map(str::trim).find(|l| l.contains("@sha256:")).map(String::from))
 }
 
 fn run_docker_compose(work_dir: &Path, args: &[&str], file: &str, env_files: &[String], services: &[String]) -> Result<String> {
@@ -1902,6 +1958,15 @@ async fn main() -> Result<()> {
         info!(count = initial_actions.len(), "Loaded action log from disk");
     }
 
+    // Resolve the image this process is running so the running version can be
+    // attested — recorded as the `compose_manager_started` action below (hashed
+    // into the attestation quote) and surfaced by /version.
+    let running_image = current_image_digest().await;
+    match &running_image {
+        Some(img) => info!(image = %img, "Resolved running compose-manager image"),
+        None => warn!("Could not resolve running compose-manager image digest (continuing)"),
+    }
+
     let state = Arc::new(AppState {
         bearer_token,
         github_owner,
@@ -1926,7 +1991,23 @@ async fn main() -> Result<()> {
             .expect("reqwest client builder with valid timeouts"),
         compose_lock: Arc::new(Mutex::new(())),
         in_flight: Arc::new(RwLock::new(None)),
+        running_image: running_image.clone(),
     });
+
+    // Record the running image into the action log so /v1/attestation/report
+    // binds it into the TDX quote (report_data hashes the action list). Each
+    // launcher swap / reboot restarts this process and appends a fresh entry,
+    // so the latest compose_manager_started.image is the running digest.
+    // Best-effort: a disk-persist failure still leaves the entry in memory for
+    // this process, which is what attestation reads.
+    let _ = record_action(&state, &DeploymentAction {
+        timestamp: Utc::now().to_rfc3339(),
+        action: "compose_manager_started".into(),
+        container: Some("compose-manager".into()),
+        image: running_image,
+        ..Default::default()
+    })
+    .await;
 
     let app = Router::new()
         .route("/compose/up", post(compose_up))
@@ -1967,6 +2048,7 @@ mod tests {
         let actions = vec![DeploymentAction {
             timestamp: "2026-01-01T00:00:00+00:00".into(),
             action: "compose_up".into(),
+            image: None,
             tag: Some("v1.0".into()),
             commit: Some("abc123".into()),
             file: Some("docker-compose.yml".into()),
@@ -1981,6 +2063,33 @@ mod tests {
         assert_eq!(loaded[0].tag.as_deref(), Some("v1.0"));
         assert_eq!(loaded[0].services, vec!["nginx"]);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn started_action_carries_image_for_attestation() {
+        // The running-image digest must serialize into the action so it's
+        // hashed into the attestation quote's report_data, and round-trip.
+        let a = DeploymentAction {
+            timestamp: "2026-01-01T00:00:00+00:00".into(),
+            action: "compose_manager_started".into(),
+            container: Some("compose-manager".into()),
+            image: Some("nearaidev/compose-manager@sha256:abc".into()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&a).unwrap();
+        assert!(
+            json.contains("\"image\":\"nearaidev/compose-manager@sha256:abc\""),
+            "image must be serialized for attestation; got: {json}"
+        );
+        let back: DeploymentAction = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.image.as_deref(), Some("nearaidev/compose-manager@sha256:abc"));
+
+        // Omitted when absent, so existing (imageless) actions hash unchanged.
+        let none = DeploymentAction { action: "compose_up".into(), ..Default::default() };
+        assert!(
+            !serde_json::to_string(&none).unwrap().contains("image"),
+            "image must be omitted when None"
+        );
     }
 
     #[test]
@@ -2220,6 +2329,7 @@ mod tests {
             http: reqwest::Client::new(),
             compose_lock: Arc::new(Mutex::new(())),
             in_flight: Arc::new(RwLock::new(None)),
+            running_image: None,
         })
     }
 
@@ -2280,6 +2390,7 @@ mod tests {
         DeploymentAction {
             timestamp: "2026-01-01T00:00:00+00:00".into(),
             action: action.into(),
+            image: None,
             tag: None,
             commit: None,
             file: None,
