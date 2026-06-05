@@ -151,6 +151,18 @@ fn load_actions_from_disk(work_dir: &Path) -> Vec<DeploymentAction> {
     }
 }
 
+/// The (tag, commit, file, file_sha256) of the most recent `compose_up` in the
+/// action log, used to restore /version's deployed-version fields across a
+/// restart (they otherwise live only in memory). `compose_down` does not clear
+/// them, matching the in-memory behavior within a single process lifetime.
+type DeployedVersion = (Option<String>, Option<String>, Option<String>, Option<String>);
+fn last_deployed_version(actions: &[DeploymentAction]) -> DeployedVersion {
+    match actions.iter().rev().find(|a| a.action == "compose_up") {
+        Some(a) => (a.tag.clone(), a.commit.clone(), a.file.clone(), a.file_sha256.clone()),
+        None => (None, None, None, None),
+    }
+}
+
 async fn persist_actions_to_disk(work_dir: &Path, actions: &[DeploymentAction]) -> std::io::Result<()> {
     let json = serde_json::to_string(actions)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -1998,6 +2010,19 @@ async fn main() -> Result<()> {
         info!(count = initial_actions.len(), "Loaded action log from disk");
     }
 
+    // Restore the last-deployed tag/file/commit from the persisted action log.
+    // These fields live only in memory for the life of the process, so without
+    // this a container restart — most commonly a launcher hot-swap — would blank
+    // the tag/file the dashboard shows (via /version) until the next deploy, even
+    // though the same stack is still running. The most recent `compose_up` action
+    // carries them; `compose_down` doesn't clear them, mirroring the in-memory
+    // behavior during a single process lifetime.
+    let (restored_tag, restored_commit, restored_file, restored_file_sha256) =
+        last_deployed_version(&initial_actions);
+    if restored_tag.is_some() || restored_file.is_some() {
+        info!(tag = ?restored_tag, file = ?restored_file, "Restored last-deployed version from action log");
+    }
+
     // Resolve the image this process is running so the running version can be
     // attested — recorded as the `compose_manager_started` action below (hashed
     // into the attestation quote) and surfaced by /version.
@@ -2016,10 +2041,10 @@ async fn main() -> Result<()> {
         env_files,
         slack_webhook_url,
         instance_label,
-        deployed_tag: RwLock::new(None),
-        deployed_commit: RwLock::new(None),
-        deployed_file: RwLock::new(None),
-        deployed_file_sha256: RwLock::new(None),
+        deployed_tag: RwLock::new(restored_tag),
+        deployed_commit: RwLock::new(restored_commit),
+        deployed_file: RwLock::new(restored_file),
+        deployed_file_sha256: RwLock::new(restored_file_sha256),
         actions: RwLock::new(initial_actions),
         // Bounded timeouts: the compose lock is held across GitHub fetches in
         // compose_up/compose_down, so a hung GitHub call would otherwise gate
@@ -2072,6 +2097,41 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn action(name: &str, tag: Option<&str>, file: Option<&str>) -> DeploymentAction {
+        DeploymentAction {
+            action: name.into(),
+            tag: tag.map(String::from),
+            commit: tag.map(|_| "abc123".into()),
+            file: file.map(String::from),
+            file_sha256: file.map(|_| "deadbeef".into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn last_deployed_version_restores_from_newest_compose_up() {
+        // Empty log -> nothing to restore.
+        assert_eq!(last_deployed_version(&[]), (None, None, None, None));
+
+        // Picks the MOST RECENT compose_up, ignoring later non-up actions
+        // (compose_down / compose_manager_started must not blank the version).
+        let log = vec![
+            action("compose_up", Some("v1"), Some("a.yaml")),
+            action("compose_up", Some("v2"), Some("b.yaml")),
+            action("compose_down", Some("v2"), Some("b.yaml")),
+            action("compose_manager_started", None, None),
+        ];
+        let (tag, commit, file, sha) = last_deployed_version(&log);
+        assert_eq!(tag.as_deref(), Some("v2"));
+        assert_eq!(commit.as_deref(), Some("abc123"));
+        assert_eq!(file.as_deref(), Some("b.yaml"));
+        assert_eq!(sha.as_deref(), Some("deadbeef"));
+
+        // A log with no compose_up at all (only a started action) restores nothing.
+        let only_started = vec![action("compose_manager_started", None, None)];
+        assert_eq!(last_deployed_version(&only_started), (None, None, None, None));
+    }
 
     #[test]
     fn compose_project_name_matches_default_and_sanitizes() {
