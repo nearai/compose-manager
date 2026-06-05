@@ -915,6 +915,40 @@ impl Drop for NdjsonStream {
     }
 }
 
+/// Stable Compose project name for the model stacks we manage.
+///
+/// We MUST pin this explicitly. Our `up` runs with `--remove-orphans`, which
+/// deletes every container in the project that isn't in the deployed file. The
+/// model stacks live in their own project, but the app-compose that runs *us*
+/// — compose-manager, the launcher sidecar, certbot, datadog — is a separate
+/// project (`dstack`). If our deploys ever ran under `dstack`, `--remove-orphans`
+/// would evict the launcher/certbot/datadog (the launcher being gone is silent
+/// and unrecoverable without a CVM recreate).
+///
+/// Without `-p`, the project name is the working-directory basename UNLESS a
+/// `COMPOSE_PROJECT_NAME` is present in our process env or in any `--env-file`
+/// we pass (e.g. the decrypted `/app/.env`). Such a value would silently
+/// redirect every deploy — and its `--remove-orphans` — at that project. The
+/// `-p` flag overrides both, so we pass it on every compose invocation.
+///
+/// The value is derived from the working-directory basename and sanitized to
+/// Docker's project-name charset, so it matches the previous implicit default
+/// (`/app/work` -> `work`) and changes no naming on already-healthy hosts.
+fn compose_project_name(work_dir: &Path) -> String {
+    let base = work_dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("work");
+    let sanitized: String = base
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .collect();
+    // Docker requires the name to start with a letter or number.
+    let trimmed = sanitized.trim_start_matches(|c: char| !c.is_ascii_alphanumeric());
+    if trimmed.is_empty() { "work".to_string() } else { trimmed.to_string() }
+}
+
 fn build_compose_cmd(
     work_dir: &Path,
     args: &[&str],
@@ -924,7 +958,10 @@ fn build_compose_cmd(
     temp_env_file: Option<&Path>,
 ) -> AsyncCommand {
     let mut cmd = AsyncCommand::new("docker");
-    cmd.args(["compose", "-f", file]);
+    // `-p` BEFORE the subcommand pins the project, overriding any leaked
+    // COMPOSE_PROJECT_NAME so `--remove-orphans` can never reach the `dstack`
+    // app-compose project (launcher/certbot/datadog). See compose_project_name.
+    cmd.args(["compose", "-p", &compose_project_name(work_dir), "-f", file]);
     for ef in env_files {
         cmd.args(["--env-file", ef.as_str()]);
     }
@@ -1770,7 +1807,10 @@ async fn current_image_digest() -> Option<String> {
 fn run_docker_compose(work_dir: &Path, args: &[&str], file: &str, env_files: &[String], services: &[String]) -> Result<String> {
     info!(command = "docker compose", file = file, args = ?args, env_files = ?env_files, services = ?services, work_dir = %work_dir.display(), "Running command");
     let mut cmd = Command::new("docker");
-    cmd.args(["compose", "-f", file]);
+    // `-p` pins the project (see compose_project_name) so `--remove-orphans`
+    // can never inherit a leaked COMPOSE_PROJECT_NAME and evict the `dstack`
+    // app-compose project (launcher/certbot/datadog).
+    cmd.args(["compose", "-p", &compose_project_name(work_dir), "-f", file]);
     for env_file in env_files {
         cmd.args(["--env-file", env_file]);
     }
@@ -2032,6 +2072,20 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compose_project_name_matches_default_and_sanitizes() {
+        // The production path: must equal the previous implicit default so no
+        // container/network renaming occurs on already-healthy hosts.
+        assert_eq!(compose_project_name(Path::new("/app/work")), "work");
+        // Uppercase + invalid chars are lowercased / replaced with '_'.
+        assert_eq!(compose_project_name(Path::new("/srv/My Stack")), "my_stack");
+        // Leading non-alphanumerics are trimmed (Docker requires a leading
+        // letter or digit).
+        assert_eq!(compose_project_name(Path::new("/srv/-weird")), "weird");
+        // Degenerate basenames fall back to a safe default rather than "".
+        assert_eq!(compose_project_name(Path::new("/")), "work");
+    }
 
     fn temp_work_dir() -> PathBuf {
         use rand::RngCore;
