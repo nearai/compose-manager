@@ -187,30 +187,35 @@ fn load_deployed_version(work_dir: &Path) -> DeployedVersion {
     }
 }
 
-async fn persist_deployed_version(work_dir: &Path, v: &DeployedVersion) -> std::io::Result<()> {
+/// Persist the last successful deploy to `deployed.json`, synchronously, via a
+/// temp-file + atomic rename. Deliberately blocking (std::fs): the compose_up
+/// completion path calls this BEFORE emitting the terminal `done` event so the
+/// write is durable before the client is told the deploy succeeded — a detached
+/// async write could lose to an immediate restart. The file is tiny.
+fn persist_deployed_version(work_dir: &Path, v: &DeployedVersion) -> std::io::Result<()> {
     let json = serde_json::to_string(v)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     let tmp = work_dir.join("deployed.json.tmp");
-    tokio::fs::write(&tmp, &json).await?;
-    tokio::fs::rename(&tmp, deployed_version_file(work_dir)).await?;
+    std::fs::write(&tmp, &json)?;
+    std::fs::rename(&tmp, deployed_version_file(work_dir))?;
     Ok(())
 }
 
-/// Record the last successful deploy to `deployed.json` (best-effort, async).
-/// Called from the stream-completion path only when the compose_up succeeded.
-fn spawn_persist_deployed_version(state: &Arc<AppState>, action: &DeploymentAction) {
-    let state = state.clone();
-    let v = DeployedVersion {
-        tag: action.tag.clone(),
-        commit: action.commit.clone(),
-        file: action.file.clone(),
-        file_sha256: action.file_sha256.clone(),
-    };
-    tokio::spawn(async move {
-        if let Err(e) = persist_deployed_version(&state.work_dir, &v).await {
-            error!(error = %e, "Failed to persist deployed.json");
-        }
-    });
+/// Best-effort migration source for installs that predate `deployed.json`:
+/// derive a `DeployedVersion` from the most recent `compose_up` in the legacy
+/// action log. Legacy actions carry no success/failure outcome, so this is only
+/// used to seed `deployed.json` once when it's missing.
+fn deployed_version_from_actions(actions: &[DeploymentAction]) -> Option<DeployedVersion> {
+    actions
+        .iter()
+        .rev()
+        .find(|a| a.action == "compose_up")
+        .map(|a| DeployedVersion {
+            tag: a.tag.clone(),
+            commit: a.commit.clone(),
+            file: a.file.clone(),
+            file_sha256: a.file_sha256.clone(),
+        })
 }
 
 async fn persist_actions_to_disk(work_dir: &Path, actions: &[DeploymentAction]) -> std::io::Result<()> {
@@ -932,8 +937,20 @@ impl Stream for NdjsonStream {
                             // Persist the deployed version only on a SUCCESSFUL
                             // compose_up, so /version survives a restart without
                             // ever advertising a failed attempt as deployed.
+                            // Written synchronously HERE — before the `done` event
+                            // below — so it is durable before the client sees
+                            // success (a detached write could lose to an immediate
+                            // restart).
                             if status.success() && notice.action.action == "compose_up" {
-                                spawn_persist_deployed_version(&notice.state, &notice.action);
+                                let v = DeployedVersion {
+                                    tag: notice.action.tag.clone(),
+                                    commit: notice.action.commit.clone(),
+                                    file: notice.action.file.clone(),
+                                    file_sha256: notice.action.file_sha256.clone(),
+                                };
+                                if let Err(e) = persist_deployed_version(&notice.state.work_dir, &v) {
+                                    error!(error = %e, "Failed to persist deployed.json");
+                                }
                             }
                         }
 
@@ -2073,9 +2090,26 @@ async fn main() -> Result<()> {
     // though the same stack is still running. deployed.json is written only when a
     // compose_up stream completes successfully, so a failed attempt can't surface
     // here as the deployed version.
-    let restored = load_deployed_version(&work_dir);
+    let mut restored = load_deployed_version(&work_dir);
+    if restored.tag.is_none() && restored.file.is_none() {
+        // Migration: installs that predate deployed.json (upgraded in place via
+        // the launcher hot-swap) have actions.json but no deployed.json, so the
+        // first restart after this change would still blank /version. Backfill
+        // once from the most recent compose_up. Legacy actions carry no
+        // success/failure outcome, so this is best-effort — but on a host with a
+        // running stack the latest compose_up is the deployed one, and the next
+        // successful deploy overwrites it with an authoritative, success-only
+        // value.
+        if let Some(v) = deployed_version_from_actions(&initial_actions) {
+            restored = v;
+            match persist_deployed_version(&work_dir, &restored) {
+                Ok(()) => info!(tag = ?restored.tag, file = ?restored.file, "Backfilled deployed.json from action log (migration)"),
+                Err(e) => error!(error = %e, "Failed to backfill deployed.json"),
+            }
+        }
+    }
     if restored.tag.is_some() || restored.file.is_some() {
-        info!(tag = ?restored.tag, file = ?restored.file, "Restored last-deployed version from deployed.json");
+        info!(tag = ?restored.tag, file = ?restored.file, "Restored last-deployed version");
     }
 
     // Resolve the image this process is running so the running version can be
@@ -2154,6 +2188,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn deployed_version_from_actions_picks_latest_compose_up() {
+        let mut up1 = DeploymentAction::default();
+        up1.action = "compose_up".into();
+        up1.tag = Some("v1".into());
+        up1.file = Some("a.yaml".into());
+        let mut up2 = DeploymentAction::default();
+        up2.action = "compose_up".into();
+        up2.tag = Some("v2".into());
+        up2.file = Some("b.yaml".into());
+        let mut down = DeploymentAction::default();
+        down.action = "compose_down".into();
+
+        // Latest compose_up wins; a later compose_down doesn't blank it.
+        let v = deployed_version_from_actions(&[up1, up2, down]).unwrap();
+        assert_eq!(v.tag.as_deref(), Some("v2"));
+        assert_eq!(v.file.as_deref(), Some("b.yaml"));
+
+        // No compose_up -> no migration source.
+        let mut started = DeploymentAction::default();
+        started.action = "compose_manager_started".into();
+        assert!(deployed_version_from_actions(&[started]).is_none());
+        assert!(deployed_version_from_actions(&[]).is_none());
+    }
+
+    #[test]
     fn load_deployed_version_handles_missing_and_corrupt() {
         let dir = temp_work_dir();
         // No file yet -> empty (the pre-first-deploy / pre-upgrade state).
@@ -2166,8 +2225,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    #[tokio::test]
-    async fn deployed_version_round_trips_through_disk() {
+    #[test]
+    fn deployed_version_round_trips_through_disk() {
         let dir = temp_work_dir();
         let v = DeployedVersion {
             tag: Some("v0.0.211".into()),
@@ -2175,7 +2234,7 @@ mod tests {
             file: Some("GLM-5.1.yaml".into()),
             file_sha256: Some("deadbeef".into()),
         };
-        persist_deployed_version(&dir, &v).await.unwrap();
+        persist_deployed_version(&dir, &v).unwrap();
         let loaded = load_deployed_version(&dir);
         assert_eq!(loaded.tag.as_deref(), Some("v0.0.211"));
         assert_eq!(loaded.commit.as_deref(), Some("abc123"));
