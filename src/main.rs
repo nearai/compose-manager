@@ -151,16 +151,66 @@ fn load_actions_from_disk(work_dir: &Path) -> Vec<DeploymentAction> {
     }
 }
 
-/// The (tag, commit, file, file_sha256) of the most recent `compose_up` in the
-/// action log, used to restore /version's deployed-version fields across a
-/// restart (they otherwise live only in memory). `compose_down` does not clear
-/// them, matching the in-memory behavior within a single process lifetime.
-type DeployedVersion = (Option<String>, Option<String>, Option<String>, Option<String>);
-fn last_deployed_version(actions: &[DeploymentAction]) -> DeployedVersion {
-    match actions.iter().rev().find(|a| a.action == "compose_up") {
-        Some(a) => (a.tag.clone(), a.commit.clone(), a.file.clone(), a.file_sha256.clone()),
-        None => (None, None, None, None),
+/// The last *successfully* deployed tag/file/commit, persisted to `deployed.json`
+/// so /version (and the dashboard) keep showing it across a compose-manager
+/// restart — most commonly a launcher hot-swap, where the deployed fields would
+/// otherwise reset to blank until the next deploy. Written ONLY after a
+/// compose_up stream completes successfully (so a failed attempt never overwrites
+/// the last good deploy), and read once at startup.
+#[derive(Clone, Serialize, Deserialize, Default)]
+struct DeployedVersion {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tag: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    commit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file_sha256: Option<String>,
+}
+
+fn deployed_version_file(work_dir: &Path) -> PathBuf {
+    work_dir.join("deployed.json")
+}
+
+fn load_deployed_version(work_dir: &Path) -> DeployedVersion {
+    match std::fs::read_to_string(deployed_version_file(work_dir)) {
+        Ok(content) => serde_json::from_str(&content).unwrap_or_else(|e| {
+            error!(error = %e, "deployed.json is corrupt, ignoring");
+            DeployedVersion::default()
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => DeployedVersion::default(),
+        Err(e) => {
+            error!(error = %e, "Failed to read deployed.json, ignoring");
+            DeployedVersion::default()
+        }
     }
+}
+
+async fn persist_deployed_version(work_dir: &Path, v: &DeployedVersion) -> std::io::Result<()> {
+    let json = serde_json::to_string(v)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let tmp = work_dir.join("deployed.json.tmp");
+    tokio::fs::write(&tmp, &json).await?;
+    tokio::fs::rename(&tmp, deployed_version_file(work_dir)).await?;
+    Ok(())
+}
+
+/// Record the last successful deploy to `deployed.json` (best-effort, async).
+/// Called from the stream-completion path only when the compose_up succeeded.
+fn spawn_persist_deployed_version(state: &Arc<AppState>, action: &DeploymentAction) {
+    let state = state.clone();
+    let v = DeployedVersion {
+        tag: action.tag.clone(),
+        commit: action.commit.clone(),
+        file: action.file.clone(),
+        file_sha256: action.file_sha256.clone(),
+    };
+    tokio::spawn(async move {
+        if let Err(e) = persist_deployed_version(&state.work_dir, &v).await {
+            error!(error = %e, "Failed to persist deployed.json");
+        }
+    });
 }
 
 async fn persist_actions_to_disk(work_dir: &Path, actions: &[DeploymentAction]) -> std::io::Result<()> {
@@ -879,6 +929,12 @@ impl Stream for NdjsonStream {
                                 &notice.actor,
                                 Some(status.success()),
                             );
+                            // Persist the deployed version only on a SUCCESSFUL
+                            // compose_up, so /version survives a restart without
+                            // ever advertising a failed attempt as deployed.
+                            if status.success() && notice.action.action == "compose_up" {
+                                spawn_persist_deployed_version(&notice.state, &notice.action);
+                            }
                         }
 
                         // Clean up temp env file
@@ -2010,17 +2066,16 @@ async fn main() -> Result<()> {
         info!(count = initial_actions.len(), "Loaded action log from disk");
     }
 
-    // Restore the last-deployed tag/file/commit from the persisted action log.
+    // Restore the last *successful* deploy (tag/file/commit) from deployed.json.
     // These fields live only in memory for the life of the process, so without
     // this a container restart — most commonly a launcher hot-swap — would blank
     // the tag/file the dashboard shows (via /version) until the next deploy, even
-    // though the same stack is still running. The most recent `compose_up` action
-    // carries them; `compose_down` doesn't clear them, mirroring the in-memory
-    // behavior during a single process lifetime.
-    let (restored_tag, restored_commit, restored_file, restored_file_sha256) =
-        last_deployed_version(&initial_actions);
-    if restored_tag.is_some() || restored_file.is_some() {
-        info!(tag = ?restored_tag, file = ?restored_file, "Restored last-deployed version from action log");
+    // though the same stack is still running. deployed.json is written only when a
+    // compose_up stream completes successfully, so a failed attempt can't surface
+    // here as the deployed version.
+    let restored = load_deployed_version(&work_dir);
+    if restored.tag.is_some() || restored.file.is_some() {
+        info!(tag = ?restored.tag, file = ?restored.file, "Restored last-deployed version from deployed.json");
     }
 
     // Resolve the image this process is running so the running version can be
@@ -2041,10 +2096,10 @@ async fn main() -> Result<()> {
         env_files,
         slack_webhook_url,
         instance_label,
-        deployed_tag: RwLock::new(restored_tag),
-        deployed_commit: RwLock::new(restored_commit),
-        deployed_file: RwLock::new(restored_file),
-        deployed_file_sha256: RwLock::new(restored_file_sha256),
+        deployed_tag: RwLock::new(restored.tag),
+        deployed_commit: RwLock::new(restored.commit),
+        deployed_file: RwLock::new(restored.file),
+        deployed_file_sha256: RwLock::new(restored.file_sha256),
         actions: RwLock::new(initial_actions),
         // Bounded timeouts: the compose lock is held across GitHub fetches in
         // compose_up/compose_down, so a hung GitHub call would otherwise gate
@@ -2098,39 +2153,35 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
 
-    fn action(name: &str, tag: Option<&str>, file: Option<&str>) -> DeploymentAction {
-        DeploymentAction {
-            action: name.into(),
-            tag: tag.map(String::from),
-            commit: tag.map(|_| "abc123".into()),
-            file: file.map(String::from),
-            file_sha256: file.map(|_| "deadbeef".into()),
-            ..Default::default()
-        }
+    #[test]
+    fn load_deployed_version_handles_missing_and_corrupt() {
+        let dir = temp_work_dir();
+        // No file yet -> empty (the pre-first-deploy / pre-upgrade state).
+        let v = load_deployed_version(&dir);
+        assert!(v.tag.is_none() && v.file.is_none());
+        // Corrupt file -> ignored, not a panic.
+        std::fs::write(deployed_version_file(&dir), b"{not json").unwrap();
+        let v = load_deployed_version(&dir);
+        assert!(v.tag.is_none() && v.file.is_none());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
-    #[test]
-    fn last_deployed_version_restores_from_newest_compose_up() {
-        // Empty log -> nothing to restore.
-        assert_eq!(last_deployed_version(&[]), (None, None, None, None));
-
-        // Picks the MOST RECENT compose_up, ignoring later non-up actions
-        // (compose_down / compose_manager_started must not blank the version).
-        let log = vec![
-            action("compose_up", Some("v1"), Some("a.yaml")),
-            action("compose_up", Some("v2"), Some("b.yaml")),
-            action("compose_down", Some("v2"), Some("b.yaml")),
-            action("compose_manager_started", None, None),
-        ];
-        let (tag, commit, file, sha) = last_deployed_version(&log);
-        assert_eq!(tag.as_deref(), Some("v2"));
-        assert_eq!(commit.as_deref(), Some("abc123"));
-        assert_eq!(file.as_deref(), Some("b.yaml"));
-        assert_eq!(sha.as_deref(), Some("deadbeef"));
-
-        // A log with no compose_up at all (only a started action) restores nothing.
-        let only_started = vec![action("compose_manager_started", None, None)];
-        assert_eq!(last_deployed_version(&only_started), (None, None, None, None));
+    #[tokio::test]
+    async fn deployed_version_round_trips_through_disk() {
+        let dir = temp_work_dir();
+        let v = DeployedVersion {
+            tag: Some("v0.0.211".into()),
+            commit: Some("abc123".into()),
+            file: Some("GLM-5.1.yaml".into()),
+            file_sha256: Some("deadbeef".into()),
+        };
+        persist_deployed_version(&dir, &v).await.unwrap();
+        let loaded = load_deployed_version(&dir);
+        assert_eq!(loaded.tag.as_deref(), Some("v0.0.211"));
+        assert_eq!(loaded.commit.as_deref(), Some("abc123"));
+        assert_eq!(loaded.file.as_deref(), Some("GLM-5.1.yaml"));
+        assert_eq!(loaded.file_sha256.as_deref(), Some("deadbeef"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
