@@ -218,6 +218,52 @@ fn deployed_version_from_actions(actions: &[DeploymentAction]) -> Option<Deploye
         })
 }
 
+fn migration_marker_file(work_dir: &Path) -> PathBuf {
+    work_dir.join(".deployed-version-migrated")
+}
+
+/// One-shot legacy migration for `deployed.json`.
+///
+/// Installs that predate `deployed.json` (upgraded in place via the launcher
+/// hot-swap) have an `actions.json` but no `deployed.json`, so the first restart
+/// would otherwise blank /version. Backfill it once from the latest `compose_up`.
+///
+/// This MUST be one-shot. `compose_up` actions are recorded optimistically,
+/// before the stream succeeds and with no persisted outcome — so on a host
+/// running THIS code, a failed first deploy leaves such an action but no
+/// `deployed.json`. Backfilling on every `deployed.json`-absent boot would then
+/// resurrect that failed attempt as the deployed version. A marker file makes
+/// the action-log backfill happen only on the very first boot after upgrade:
+/// on a fresh install that boot precedes any `compose_up` (nothing to backfill),
+/// so a later failed deploy is never picked up.
+///
+/// Returns the backfilled version (if any) to also seed in memory. The marker is
+/// written once the migration has been handled; if the persist fails it is left
+/// unwritten so the next boot retries.
+fn migrate_legacy_deployed_version(
+    work_dir: &Path,
+    actions: &[DeploymentAction],
+) -> Option<DeployedVersion> {
+    let marker = migration_marker_file(work_dir);
+    if marker.exists() {
+        return None;
+    }
+    let result = deployed_version_from_actions(actions);
+    if let Some(ref v) = result {
+        if let Err(e) = persist_deployed_version(work_dir, v) {
+            error!(error = %e, "Failed to backfill deployed.json; will retry next boot");
+            return result; // don't write the marker — retry on next boot
+        }
+        info!(tag = ?v.tag, file = ?v.file, "Backfilled deployed.json from action log (one-shot legacy migration)");
+    }
+    // Mark migration done so a later failed compose_up (pre-outcome action, no
+    // deployed.json) is never backfilled. Best-effort.
+    if let Err(e) = std::fs::write(&marker, b"1") {
+        error!(error = %e, "Failed to write deployed-version migration marker");
+    }
+    result
+}
+
 async fn persist_actions_to_disk(work_dir: &Path, actions: &[DeploymentAction]) -> std::io::Result<()> {
     let json = serde_json::to_string(actions)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -2092,20 +2138,11 @@ async fn main() -> Result<()> {
     // here as the deployed version.
     let mut restored = load_deployed_version(&work_dir);
     if restored.tag.is_none() && restored.file.is_none() {
-        // Migration: installs that predate deployed.json (upgraded in place via
-        // the launcher hot-swap) have actions.json but no deployed.json, so the
-        // first restart after this change would still blank /version. Backfill
-        // once from the most recent compose_up. Legacy actions carry no
-        // success/failure outcome, so this is best-effort — but on a host with a
-        // running stack the latest compose_up is the deployed one, and the next
-        // successful deploy overwrites it with an authoritative, success-only
-        // value.
-        if let Some(v) = deployed_version_from_actions(&initial_actions) {
+        // One-shot legacy migration (gated by a marker) for installs that predate
+        // deployed.json. See migrate_legacy_deployed_version: this never backfills
+        // a failed compose_up created under this code.
+        if let Some(v) = migrate_legacy_deployed_version(&work_dir, &initial_actions) {
             restored = v;
-            match persist_deployed_version(&work_dir, &restored) {
-                Ok(()) => info!(tag = ?restored.tag, file = ?restored.file, "Backfilled deployed.json from action log (migration)"),
-                Err(e) => error!(error = %e, "Failed to backfill deployed.json"),
-            }
         }
     }
     if restored.tag.is_some() || restored.file.is_some() {
@@ -2210,6 +2247,47 @@ mod tests {
         started.action = "compose_manager_started".into();
         assert!(deployed_version_from_actions(&[started]).is_none());
         assert!(deployed_version_from_actions(&[]).is_none());
+    }
+
+    fn compose_up_action(tag: &str, file: &str) -> DeploymentAction {
+        let mut a = DeploymentAction::default();
+        a.action = "compose_up".into();
+        a.tag = Some(tag.into());
+        a.file = Some(file.into());
+        a
+    }
+
+    #[test]
+    fn legacy_migration_is_one_shot_and_skips_post_fix_failed_deploys() {
+        // Legacy upgrade: actions.json present, no deployed.json, no marker yet
+        // -> backfill from the latest compose_up and write both deployed.json
+        // and the marker.
+        let dir = temp_work_dir();
+        let legacy = vec![compose_up_action("v1", "a.yaml")];
+        let v = migrate_legacy_deployed_version(&dir, &legacy).unwrap();
+        assert_eq!(v.tag.as_deref(), Some("v1"));
+        assert!(deployed_version_file(&dir).exists(), "deployed.json should be written");
+        assert!(migration_marker_file(&dir).exists(), "marker should be written");
+
+        // Post-fix failed first deploy: marker now exists; even though a (failed)
+        // compose_up action is present and deployed.json is absent, migration must
+        // NOT backfill it (the success-only contract).
+        std::fs::remove_file(deployed_version_file(&dir)).unwrap();
+        let after = vec![compose_up_action("v2-failed", "b.yaml")];
+        assert!(migrate_legacy_deployed_version(&dir, &after).is_none());
+        assert!(!deployed_version_file(&dir).exists(), "must not resurrect a failed deploy");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn fresh_install_marks_migration_without_backfill() {
+        // Fresh install: first boot precedes any compose_up -> nothing to
+        // backfill, but the marker is written so a later failed deploy can't be.
+        let dir = temp_work_dir();
+        assert!(migrate_legacy_deployed_version(&dir, &[]).is_none());
+        assert!(!deployed_version_file(&dir).exists());
+        assert!(migration_marker_file(&dir).exists());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
