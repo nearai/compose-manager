@@ -151,6 +151,119 @@ fn load_actions_from_disk(work_dir: &Path) -> Vec<DeploymentAction> {
     }
 }
 
+/// The last *successfully* deployed tag/file/commit, persisted to `deployed.json`
+/// so /version (and the dashboard) keep showing it across a compose-manager
+/// restart — most commonly a launcher hot-swap, where the deployed fields would
+/// otherwise reset to blank until the next deploy. Written ONLY after a
+/// compose_up stream completes successfully (so a failed attempt never overwrites
+/// the last good deploy), and read once at startup.
+#[derive(Clone, Serialize, Deserialize, Default)]
+struct DeployedVersion {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tag: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    commit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file_sha256: Option<String>,
+}
+
+fn deployed_version_file(work_dir: &Path) -> PathBuf {
+    work_dir.join("deployed.json")
+}
+
+fn load_deployed_version(work_dir: &Path) -> DeployedVersion {
+    match std::fs::read_to_string(deployed_version_file(work_dir)) {
+        Ok(content) => serde_json::from_str(&content).unwrap_or_else(|e| {
+            error!(error = %e, "deployed.json is corrupt, ignoring");
+            DeployedVersion::default()
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => DeployedVersion::default(),
+        Err(e) => {
+            error!(error = %e, "Failed to read deployed.json, ignoring");
+            DeployedVersion::default()
+        }
+    }
+}
+
+/// Persist the last successful deploy to `deployed.json`, synchronously, via a
+/// temp-file + atomic rename. Deliberately blocking (std::fs): the compose_up
+/// completion path calls this BEFORE emitting the terminal `done` event so the
+/// write is durable before the client is told the deploy succeeded — a detached
+/// async write could lose to an immediate restart. The file is tiny.
+fn persist_deployed_version(work_dir: &Path, v: &DeployedVersion) -> std::io::Result<()> {
+    let json = serde_json::to_string(v)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let tmp = work_dir.join("deployed.json.tmp");
+    std::fs::write(&tmp, &json)?;
+    std::fs::rename(&tmp, deployed_version_file(work_dir))?;
+    Ok(())
+}
+
+/// Best-effort migration source for installs that predate `deployed.json`:
+/// derive a `DeployedVersion` from the most recent `compose_up` in the legacy
+/// action log. Legacy actions carry no success/failure outcome, so this is only
+/// used to seed `deployed.json` once when it's missing.
+fn deployed_version_from_actions(actions: &[DeploymentAction]) -> Option<DeployedVersion> {
+    actions
+        .iter()
+        .rev()
+        .find(|a| a.action == "compose_up")
+        .map(|a| DeployedVersion {
+            tag: a.tag.clone(),
+            commit: a.commit.clone(),
+            file: a.file.clone(),
+            file_sha256: a.file_sha256.clone(),
+        })
+}
+
+fn migration_marker_file(work_dir: &Path) -> PathBuf {
+    work_dir.join(".deployed-version-migrated")
+}
+
+/// One-shot legacy migration for `deployed.json`.
+///
+/// Installs that predate `deployed.json` (upgraded in place via the launcher
+/// hot-swap) have an `actions.json` but no `deployed.json`, so the first restart
+/// would otherwise blank /version. Backfill it once from the latest `compose_up`.
+///
+/// This MUST be one-shot. `compose_up` actions are recorded optimistically,
+/// before the stream succeeds and with no persisted outcome — so on a host
+/// running THIS code, a failed first deploy leaves such an action but no
+/// `deployed.json`. Backfilling on every `deployed.json`-absent boot would then
+/// resurrect that failed attempt as the deployed version. A marker file makes
+/// the action-log backfill happen only on the very first boot after upgrade:
+/// on a fresh install that boot precedes any `compose_up` (nothing to backfill),
+/// so a later failed deploy is never picked up.
+///
+/// Returns the backfilled version (if any) to also seed in memory. The marker is
+/// written once the migration has been handled; if the persist fails it is left
+/// unwritten so the next boot retries.
+fn migrate_legacy_deployed_version(
+    work_dir: &Path,
+    actions: &[DeploymentAction],
+) -> Option<DeployedVersion> {
+    let marker = migration_marker_file(work_dir);
+    if marker.exists() {
+        return None;
+    }
+    let result = deployed_version_from_actions(actions);
+    if let Some(ref v) = result {
+        if let Err(e) = persist_deployed_version(work_dir, v) {
+            error!(error = %e, "Failed to backfill deployed.json; will retry next boot");
+            return result; // don't write the marker — retry on next boot
+        }
+        info!(tag = ?v.tag, file = ?v.file, "Backfilled deployed.json from action log (one-shot legacy migration)");
+    }
+    // Mark migration done so a later failed compose_up (pre-outcome action, no
+    // deployed.json) is never backfilled. Best-effort.
+    if let Err(e) = std::fs::write(&marker, b"1") {
+        error!(error = %e, "Failed to write deployed-version migration marker");
+    }
+    result
+}
+
 async fn persist_actions_to_disk(work_dir: &Path, actions: &[DeploymentAction]) -> std::io::Result<()> {
     let json = serde_json::to_string(actions)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -867,6 +980,24 @@ impl Stream for NdjsonStream {
                                 &notice.actor,
                                 Some(status.success()),
                             );
+                            // Persist the deployed version only on a SUCCESSFUL
+                            // compose_up, so /version survives a restart without
+                            // ever advertising a failed attempt as deployed.
+                            // Written synchronously HERE — before the `done` event
+                            // below — so it is durable before the client sees
+                            // success (a detached write could lose to an immediate
+                            // restart).
+                            if status.success() && notice.action.action == "compose_up" {
+                                let v = DeployedVersion {
+                                    tag: notice.action.tag.clone(),
+                                    commit: notice.action.commit.clone(),
+                                    file: notice.action.file.clone(),
+                                    file_sha256: notice.action.file_sha256.clone(),
+                                };
+                                if let Err(e) = persist_deployed_version(&notice.state.work_dir, &v) {
+                                    error!(error = %e, "Failed to persist deployed.json");
+                                }
+                            }
                         }
 
                         // Clean up temp env file
@@ -1998,6 +2129,26 @@ async fn main() -> Result<()> {
         info!(count = initial_actions.len(), "Loaded action log from disk");
     }
 
+    // Restore the last *successful* deploy (tag/file/commit) from deployed.json.
+    // These fields live only in memory for the life of the process, so without
+    // this a container restart — most commonly a launcher hot-swap — would blank
+    // the tag/file the dashboard shows (via /version) until the next deploy, even
+    // though the same stack is still running. deployed.json is written only when a
+    // compose_up stream completes successfully, so a failed attempt can't surface
+    // here as the deployed version.
+    let mut restored = load_deployed_version(&work_dir);
+    if restored.tag.is_none() && restored.file.is_none() {
+        // One-shot legacy migration (gated by a marker) for installs that predate
+        // deployed.json. See migrate_legacy_deployed_version: this never backfills
+        // a failed compose_up created under this code.
+        if let Some(v) = migrate_legacy_deployed_version(&work_dir, &initial_actions) {
+            restored = v;
+        }
+    }
+    if restored.tag.is_some() || restored.file.is_some() {
+        info!(tag = ?restored.tag, file = ?restored.file, "Restored last-deployed version");
+    }
+
     // Resolve the image this process is running so the running version can be
     // attested — recorded as the `compose_manager_started` action below (hashed
     // into the attestation quote) and surfaced by /version.
@@ -2016,10 +2167,10 @@ async fn main() -> Result<()> {
         env_files,
         slack_webhook_url,
         instance_label,
-        deployed_tag: RwLock::new(None),
-        deployed_commit: RwLock::new(None),
-        deployed_file: RwLock::new(None),
-        deployed_file_sha256: RwLock::new(None),
+        deployed_tag: RwLock::new(restored.tag),
+        deployed_commit: RwLock::new(restored.commit),
+        deployed_file: RwLock::new(restored.file),
+        deployed_file_sha256: RwLock::new(restored.file_sha256),
         actions: RwLock::new(initial_actions),
         // Bounded timeouts: the compose lock is held across GitHub fetches in
         // compose_up/compose_down, so a hung GitHub call would otherwise gate
@@ -2072,6 +2223,103 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deployed_version_from_actions_picks_latest_compose_up() {
+        let mut up1 = DeploymentAction::default();
+        up1.action = "compose_up".into();
+        up1.tag = Some("v1".into());
+        up1.file = Some("a.yaml".into());
+        let mut up2 = DeploymentAction::default();
+        up2.action = "compose_up".into();
+        up2.tag = Some("v2".into());
+        up2.file = Some("b.yaml".into());
+        let mut down = DeploymentAction::default();
+        down.action = "compose_down".into();
+
+        // Latest compose_up wins; a later compose_down doesn't blank it.
+        let v = deployed_version_from_actions(&[up1, up2, down]).unwrap();
+        assert_eq!(v.tag.as_deref(), Some("v2"));
+        assert_eq!(v.file.as_deref(), Some("b.yaml"));
+
+        // No compose_up -> no migration source.
+        let mut started = DeploymentAction::default();
+        started.action = "compose_manager_started".into();
+        assert!(deployed_version_from_actions(&[started]).is_none());
+        assert!(deployed_version_from_actions(&[]).is_none());
+    }
+
+    fn compose_up_action(tag: &str, file: &str) -> DeploymentAction {
+        let mut a = DeploymentAction::default();
+        a.action = "compose_up".into();
+        a.tag = Some(tag.into());
+        a.file = Some(file.into());
+        a
+    }
+
+    #[test]
+    fn legacy_migration_is_one_shot_and_skips_post_fix_failed_deploys() {
+        // Legacy upgrade: actions.json present, no deployed.json, no marker yet
+        // -> backfill from the latest compose_up and write both deployed.json
+        // and the marker.
+        let dir = temp_work_dir();
+        let legacy = vec![compose_up_action("v1", "a.yaml")];
+        let v = migrate_legacy_deployed_version(&dir, &legacy).unwrap();
+        assert_eq!(v.tag.as_deref(), Some("v1"));
+        assert!(deployed_version_file(&dir).exists(), "deployed.json should be written");
+        assert!(migration_marker_file(&dir).exists(), "marker should be written");
+
+        // Post-fix failed first deploy: marker now exists; even though a (failed)
+        // compose_up action is present and deployed.json is absent, migration must
+        // NOT backfill it (the success-only contract).
+        std::fs::remove_file(deployed_version_file(&dir)).unwrap();
+        let after = vec![compose_up_action("v2-failed", "b.yaml")];
+        assert!(migrate_legacy_deployed_version(&dir, &after).is_none());
+        assert!(!deployed_version_file(&dir).exists(), "must not resurrect a failed deploy");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn fresh_install_marks_migration_without_backfill() {
+        // Fresh install: first boot precedes any compose_up -> nothing to
+        // backfill, but the marker is written so a later failed deploy can't be.
+        let dir = temp_work_dir();
+        assert!(migrate_legacy_deployed_version(&dir, &[]).is_none());
+        assert!(!deployed_version_file(&dir).exists());
+        assert!(migration_marker_file(&dir).exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_deployed_version_handles_missing_and_corrupt() {
+        let dir = temp_work_dir();
+        // No file yet -> empty (the pre-first-deploy / pre-upgrade state).
+        let v = load_deployed_version(&dir);
+        assert!(v.tag.is_none() && v.file.is_none());
+        // Corrupt file -> ignored, not a panic.
+        std::fs::write(deployed_version_file(&dir), b"{not json").unwrap();
+        let v = load_deployed_version(&dir);
+        assert!(v.tag.is_none() && v.file.is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn deployed_version_round_trips_through_disk() {
+        let dir = temp_work_dir();
+        let v = DeployedVersion {
+            tag: Some("v0.0.211".into()),
+            commit: Some("abc123".into()),
+            file: Some("GLM-5.1.yaml".into()),
+            file_sha256: Some("deadbeef".into()),
+        };
+        persist_deployed_version(&dir, &v).unwrap();
+        let loaded = load_deployed_version(&dir);
+        assert_eq!(loaded.tag.as_deref(), Some("v0.0.211"));
+        assert_eq!(loaded.commit.as_deref(), Some("abc123"));
+        assert_eq!(loaded.file.as_deref(), Some("GLM-5.1.yaml"));
+        assert_eq!(loaded.file_sha256.as_deref(), Some("deadbeef"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn compose_project_name_matches_default_and_sanitizes() {
