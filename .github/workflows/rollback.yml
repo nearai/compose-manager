@@ -1,0 +1,210 @@
+name: Rollback Production Images
+
+permissions:
+  contents: write
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_tag:
+        description: "Target prod tag to roll back to (e.g. prod-20260101-abc1234). Leave empty to auto-resolve from compose-manager."
+        required: false
+        type: string
+        default: ""
+      confirm:
+        description: "Type ROLLBACK to confirm production rollback"
+        required: true
+        type: string
+
+concurrency:
+  group: prod-image-mutation
+  cancel-in-progress: false
+
+env:
+  REGISTRY: docker.io
+  IMAGE_REPOSITORY: ${{ vars.DOCKER_REGISTRY_USER }}/compose-manager
+  LAUNCHER_IMAGE_REPOSITORY: ${{ vars.DOCKER_REGISTRY_USER }}/compose-manager-launcher
+
+jobs:
+  rollback-prod:
+    name: Roll back :prod
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Check confirmation
+        env:
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          if [ "$CONFIRM" != "ROLLBACK" ]; then
+            echo "::error::Confirmation failed. Set confirm to ROLLBACK."
+            exit 1
+          fi
+
+      - name: Log in to Docker registry
+        uses: docker/login-action@0567fa5ae8c9a197cb207537dc5cbb43ca3d803f
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ vars.DOCKER_REGISTRY_USER }}
+          password: ${{ secrets.DOCKER_REGISTRY_TOKEN }}
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y skopeo jq
+
+      - name: Resolve rollback target
+        id: resolve
+        env:
+          TARGET_TAG_INPUT: ${{ inputs.target_tag }}
+        run: |
+          set -euo pipefail
+          CM_IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}"
+          LAUNCHER_IMAGE="${{ env.REGISTRY }}/${{ env.LAUNCHER_IMAGE_REPOSITORY }}"
+          TARGET_TAG="$TARGET_TAG_INPUT"
+
+          CM_CURRENT_DIGEST=$(skopeo inspect "docker://${CM_IMAGE}:prod" 2>/dev/null | jq -r '.Digest' || true)
+          LAUNCHER_CURRENT_DIGEST=$(skopeo inspect "docker://${LAUNCHER_IMAGE}:prod" 2>/dev/null | jq -r '.Digest' || true)
+          if [ -z "$CM_CURRENT_DIGEST" ] || [ "$CM_CURRENT_DIGEST" = "null" ]; then
+            echo "::error::Failed to inspect current compose-manager :prod digest."
+            exit 1
+          fi
+          if [ -z "$LAUNCHER_CURRENT_DIGEST" ] || [ "$LAUNCHER_CURRENT_DIGEST" = "null" ]; then
+            echo "::error::Failed to inspect current compose-manager-launcher :prod digest."
+            exit 1
+          fi
+
+          if [ -z "$TARGET_TAG" ]; then
+            TAGS_JSON=""
+            PAGE_URL="https://hub.docker.com/v2/namespaces/${{ vars.DOCKER_REGISTRY_USER }}/repositories/compose-manager/tags?page_size=100"
+            PAGE_COUNT=0
+            while [ -n "$PAGE_URL" ] && [ "$PAGE_URL" != "null" ] && [ "$PAGE_COUNT" -lt 50 ]; do
+              RESP=$(curl -fsS --max-time 30 --retry 2 --retry-delay 2 "$PAGE_URL")
+              TAGS_JSON="${TAGS_JSON}$(echo "$RESP" | jq -c '.results[]')"$'\n'
+              PAGE_URL=$(echo "$RESP" | jq -r '.next')
+              PAGE_COUNT=$((PAGE_COUNT + 1))
+            done
+            TARGET_TAG=$(echo "$TAGS_JSON" | jq -rs --arg cur "$CM_CURRENT_DIGEST" '
+              [.[] | select(.name | test("^prod-[0-9]{8}-[0-9a-f]{7}$")) | {name, digest, last_updated}]
+              | sort_by(.last_updated // .name) | reverse
+              | map(select(.digest != $cur)) | .[0].name // empty
+            ')
+            if [ -z "$TARGET_TAG" ]; then
+              echo "::error::No previous compose-manager prod-* tag found whose digest differs from current :prod."
+              exit 1
+            fi
+          fi
+
+          if ! echo "$TARGET_TAG" | grep -Eq '^prod-[0-9]{8}-[0-9a-f]{7}$'; then
+            echo "::error::target_tag '${TARGET_TAG}' does not match prod-YYYYMMDD-<shortsha>"
+            exit 1
+          fi
+
+          CM_TARGET_DIGEST=$(skopeo inspect "docker://${CM_IMAGE}:${TARGET_TAG}" 2>/dev/null | jq -r '.Digest' || true)
+          LAUNCHER_TARGET_DIGEST=$(skopeo inspect "docker://${LAUNCHER_IMAGE}:${TARGET_TAG}" 2>/dev/null | jq -r '.Digest' || true)
+          if [ -z "$CM_TARGET_DIGEST" ] || [ "$CM_TARGET_DIGEST" = "null" ]; then
+            echo "::error::compose-manager tag ${TARGET_TAG} not found"
+            exit 1
+          fi
+          if [ -z "$LAUNCHER_TARGET_DIGEST" ] || [ "$LAUNCHER_TARGET_DIGEST" = "null" ]; then
+            echo "::error::compose-manager-launcher tag ${TARGET_TAG} not found"
+            exit 1
+          fi
+          if [ "$CM_TARGET_DIGEST" = "$CM_CURRENT_DIGEST" ] && [ "$LAUNCHER_TARGET_DIGEST" = "$LAUNCHER_CURRENT_DIGEST" ]; then
+            echo "::error::Target tag ${TARGET_TAG} already matches current :prod for both images."
+            exit 1
+          fi
+
+          AUDIT_TAG="prod-rollback-$(date -u +%Y%m%d-%H%M%S)-from-${TARGET_TAG#prod-}"
+          echo "cm_image=${CM_IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "launcher_image=${LAUNCHER_IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "target_tag=${TARGET_TAG}" >> "$GITHUB_OUTPUT"
+          echo "cm_target_digest=${CM_TARGET_DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "launcher_target_digest=${LAUNCHER_TARGET_DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "cm_previous_digest=${CM_CURRENT_DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "launcher_previous_digest=${LAUNCHER_CURRENT_DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "audit_tag=${AUDIT_TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Re-tag production aliases
+        run: |
+          set -euo pipefail
+
+          retag_image() {
+            local image="$1"
+            local digest="$2"
+            skopeo copy "docker://${image}@${digest}" "docker://${image}:prod"
+            skopeo copy "docker://${image}@${digest}" "docker://${image}:latest"
+            skopeo copy "docker://${image}@${digest}" "docker://${image}:${{ steps.resolve.outputs.audit_tag }}"
+          }
+
+          retag_image "${{ steps.resolve.outputs.cm_image }}" "${{ steps.resolve.outputs.cm_target_digest }}"
+          retag_image "${{ steps.resolve.outputs.launcher_image }}" "${{ steps.resolve.outputs.launcher_target_digest }}"
+
+      - name: Confirm rollback tags resolve to the target digests
+        run: |
+          set -euo pipefail
+
+          confirm_image() {
+            local image="$1"
+            local digest="$2"
+            for tag in prod latest "${{ steps.resolve.outputs.audit_tag }}"; do
+              resolved_digest=$(skopeo inspect "docker://${image}:${tag}" | jq -r '.Digest')
+              if [ "$resolved_digest" != "$digest" ]; then
+                echo "::error::${image}:${tag} resolved to ${resolved_digest}, expected ${digest}"
+                exit 1
+              fi
+            done
+          }
+
+          confirm_image "${{ steps.resolve.outputs.cm_image }}" "${{ steps.resolve.outputs.cm_target_digest }}"
+          confirm_image "${{ steps.resolve.outputs.launcher_image }}" "${{ steps.resolve.outputs.launcher_target_digest }}"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.resolve.outputs.audit_tag }}"
+          NOTES=$(cat <<EOF
+          ## Production Rollback
+
+          ### compose-manager
+          - **Image**: \`${{ steps.resolve.outputs.cm_image }}:prod\`
+          - **Compatibility alias**: \`${{ steps.resolve.outputs.cm_image }}:latest\`
+          - **Rolled back to**: \`${{ steps.resolve.outputs.cm_image }}:${{ steps.resolve.outputs.target_tag }}\`
+          - **Audit tag**: \`${{ steps.resolve.outputs.cm_image }}:${TAG}\`
+          - **New digest**: \`${{ steps.resolve.outputs.cm_target_digest }}\`
+          - **Previous digest**: \`${{ steps.resolve.outputs.cm_previous_digest }}\`
+          - **Sigstore**: https://search.sigstore.dev/?hash=${{ steps.resolve.outputs.cm_target_digest }}
+
+          ### compose-manager-launcher
+          - **Image**: \`${{ steps.resolve.outputs.launcher_image }}:prod\`
+          - **Compatibility alias**: \`${{ steps.resolve.outputs.launcher_image }}:latest\`
+          - **Rolled back to**: \`${{ steps.resolve.outputs.launcher_image }}:${{ steps.resolve.outputs.target_tag }}\`
+          - **Audit tag**: \`${{ steps.resolve.outputs.launcher_image }}:${TAG}\`
+          - **New digest**: \`${{ steps.resolve.outputs.launcher_target_digest }}\`
+          - **Previous digest**: \`${{ steps.resolve.outputs.launcher_previous_digest }}\`
+          - **Sigstore**: https://search.sigstore.dev/?hash=${{ steps.resolve.outputs.launcher_target_digest }}
+          EOF
+          )
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --title "Production Rollback ${TAG}" --notes "$NOTES"
+          else
+            gh release create "$TAG" --title "Production Rollback ${TAG}" --notes "$NOTES"
+          fi
+
+      - name: Summary
+        run: |
+          {
+            echo "## Rollback: :prod -> ${{ steps.resolve.outputs.target_tag }}"
+            echo ""
+            echo "### compose-manager"
+            echo "- target digest: \`${{ steps.resolve.outputs.cm_target_digest }}\`"
+            echo "- previous digest: \`${{ steps.resolve.outputs.cm_previous_digest }}\`"
+            echo ""
+            echo "### compose-manager-launcher"
+            echo "- target digest: \`${{ steps.resolve.outputs.launcher_target_digest }}\`"
+            echo "- previous digest: \`${{ steps.resolve.outputs.launcher_previous_digest }}\`"
+            echo ""
+            echo "- audit tag: \`${{ steps.resolve.outputs.audit_tag }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
