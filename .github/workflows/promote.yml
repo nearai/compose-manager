@@ -88,10 +88,17 @@ jobs:
             echo "${env_prefix}_IMAGE=${image}" >> "$GITHUB_ENV"
             echo "${env_prefix}_DIGEST=${digest}" >> "$GITHUB_ENV"
             echo "${env_prefix}_SHORT_SHA=${short_sha}" >> "$GITHUB_ENV"
+            printf -v "${env_prefix}_IMAGE" '%s' "$image"
+            printf -v "${env_prefix}_DIGEST" '%s' "$digest"
+            printf -v "${env_prefix}_SHORT_SHA" '%s' "$short_sha"
           }
 
           resolve_image "CM" "${{ env.IMAGE_REPOSITORY }}"
           resolve_image "LAUNCHER" "${{ env.LAUNCHER_IMAGE_REPOSITORY }}"
+
+          if [ "$CM_SHORT_SHA" != "$LAUNCHER_SHORT_SHA" ]; then
+            echo "::warning::compose-manager and launcher resolved different source suffixes (${CM_SHORT_SHA} vs ${LAUNCHER_SHORT_SHA}); using compose-manager suffix for the shared production tag."
+          fi
 
       - name: Verify staging images were built and signed by build.yml on master
         run: |
@@ -115,7 +122,7 @@ jobs:
           skopeo copy "docker://${CM_IMAGE}@${CM_DIGEST}" "docker://${CM_IMAGE}:${CM_PROD_STAMPED_TAG}"
           skopeo copy "docker://${CM_IMAGE}@${CM_DIGEST}" "docker://${CM_IMAGE}:latest"
 
-          LAUNCHER_PROD_STAMPED_TAG="prod-${STAMP}-${LAUNCHER_SHORT_SHA}"
+          LAUNCHER_PROD_STAMPED_TAG="${CM_PROD_STAMPED_TAG}"
           skopeo copy "docker://${LAUNCHER_IMAGE}@${LAUNCHER_DIGEST}" "docker://${LAUNCHER_IMAGE}:prod"
           skopeo copy "docker://${LAUNCHER_IMAGE}@${LAUNCHER_DIGEST}" "docker://${LAUNCHER_IMAGE}:${LAUNCHER_PROD_STAMPED_TAG}"
           skopeo copy "docker://${LAUNCHER_IMAGE}@${LAUNCHER_DIGEST}" "docker://${LAUNCHER_IMAGE}:latest"
