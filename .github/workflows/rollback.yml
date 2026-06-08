@@ -52,6 +52,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y skopeo jq
 
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6  # v4.1.2
+
       - name: Resolve rollback target
         id: resolve
         env:
@@ -123,6 +126,20 @@ jobs:
           echo "cm_previous_digest=${CM_CURRENT_DIGEST}" >> "$GITHUB_OUTPUT"
           echo "launcher_previous_digest=${LAUNCHER_CURRENT_DIGEST}" >> "$GITHUB_OUTPUT"
           echo "audit_tag=${AUDIT_TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify rollback targets were built and signed by build.yml on master
+        run: |
+          set -euo pipefail
+          for pair in \
+            "${{ steps.resolve.outputs.cm_image }}@${{ steps.resolve.outputs.cm_target_digest }}" \
+            "${{ steps.resolve.outputs.launcher_image }}@${{ steps.resolve.outputs.launcher_target_digest }}"; do
+            cosign verify \
+              --certificate-identity-regexp '^https://github\.com/nearai/compose-manager/\.github/workflows/build\.yml@refs/heads/master$' \
+              --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+              --certificate-github-workflow-repository 'nearai/compose-manager' \
+              --certificate-github-workflow-ref 'refs/heads/master' \
+              "$pair"
+          done
 
       - name: Re-tag production aliases
         run: |
