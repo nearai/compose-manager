@@ -10,10 +10,16 @@ FROM debian:bookworm-slim@sha256:78d2f66e0fec9e5a39fb2c72ea5e052b548df75602b5215
 #    snapshot the base image was built from (20251020T000000Z, per the base's
 #    /etc/apt/sources.list.d/debian.sources). Installing from the live archive
 #    otherwise drifts across build days even though the base digest is pinned.
-#  - --no-install-recommends so unpinned extras are not pulled in (notably
-#    docker-buildx-plugin, recommended by docker-ce-cli but unused here);
-#    docker-ce-cli / docker-compose-plugin are version-pinned (download.docker.com
-#    is not on snapshot.d.o).
+#  - --no-install-recommends so unpinned extras are not pulled in; the docker
+#    packages we DO need are version-pinned instead (download.docker.com is not
+#    on snapshot.d.o): docker-ce-cli, docker-compose-plugin, docker-buildx-plugin.
+#    buildx is REQUIRED, not optional: compose files build images from
+#    `dockerfile_inline`, which is a BuildKit-only feature. Without the buildx
+#    plugin `docker compose build` silently falls back to the legacy builder,
+#    which can't synthesize an inline Dockerfile and instead looks for a literal
+#    ./Dockerfile, failing every inline-build deploy. buildx used to arrive
+#    implicitly as a docker-ce-cli *recommends*; --no-install-recommends dropped
+#    it, so it must be pinned explicitly here.
 #  - apt/dpkg/ldconfig write wall-clock timestamps and a non-deterministic
 #    ldconfig aux-cache into /var/log and /var/cache. rewrite-timestamp only
 #    normalizes tar mtimes, not file *contents*, so these break byte-for-byte
@@ -31,7 +37,8 @@ RUN sed -i \
     apt-get -o Acquire::Check-Valid-Until=false update && \
     apt-get install -y --no-install-recommends \
         docker-ce-cli=5:29.5.3-1~debian.12~bookworm \
-        docker-compose-plugin=5.1.4-1~debian.12~bookworm && \
+        docker-compose-plugin=5.1.4-1~debian.12~bookworm \
+        docker-buildx-plugin=0.34.1-1~debian.12~bookworm && \
     apt-get purge -y curl gnupg && apt-get autoremove -y && \
     rm -rf /var/lib/apt/lists/* \
            /var/log/apt/* /var/log/dpkg.log /var/log/alternatives.log \
