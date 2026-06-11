@@ -273,9 +273,9 @@ async fn persist_actions_to_disk(work_dir: &Path, actions: &[DeploymentAction]) 
 }
 
 fn canonicalize_actions(actions: &[DeploymentAction]) -> String {
-    let mut value = serde_json::to_value(actions).unwrap();
+    let mut value = serde_json::to_value(actions).expect("DeploymentAction serialization is infallible");
     sort_json_keys(&mut value);
-    serde_json::to_string(&value).unwrap()
+    serde_json::to_string(&value).expect("DeploymentAction serialization is infallible")
 }
 
 fn sort_json_keys(value: &mut serde_json::Value) {
@@ -2447,11 +2447,29 @@ mod tests {
         }];
         let canonical = canonicalize_actions(&actions);
         let hash = hex::encode(sha2::Sha256::digest(canonical.as_bytes()));
-        // Reproducible in Python:
-        // hashlib.sha256(json.dumps([{"action":"compose_up","tag":"v1","timestamp":"2026-01-01T00:00:00+00:00"}], sort_keys=True, separators=(",",":")).encode()).hexdigest()
+        // Python: hashlib.sha256(json.dumps([{"action":"compose_up","tag":"v1","timestamp":"2026-01-01T00:00:00+00:00"}], sort_keys=True, separators=(",",":"), ensure_ascii=False).encode()).hexdigest()
         assert_eq!(
             hash,
             "381eb48dc299dafbbcd49c1a009998240f641865f35e435d2f07385c6e6b2a23"
+        );
+    }
+
+    #[test]
+    fn canonicalize_non_ascii_matches_python() {
+        // serde_json emits raw UTF-8 for non-ASCII; Python must use
+        // ensure_ascii=False to match.
+        let actions = vec![DeploymentAction {
+            timestamp: "2026-01-01T00:00:00+00:00".into(),
+            action: "compose_up".into(),
+            tag: Some("café".into()),
+            ..Default::default()
+        }];
+        let canonical = canonicalize_actions(&actions);
+        let hash = hex::encode(sha2::Sha256::digest(canonical.as_bytes()));
+        // Python: hashlib.sha256(json.dumps([{"action":"compose_up","tag":"café","timestamp":"2026-01-01T00:00:00+00:00"}], sort_keys=True, separators=(",",":"), ensure_ascii=False).encode()).hexdigest()
+        assert_eq!(
+            hash,
+            "1025bd6b9239039058d7fec821e96c83ef1db9331a5b04ec9db8767b3180722a"
         );
     }
 
