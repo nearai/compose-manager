@@ -272,6 +272,18 @@ async fn persist_actions_to_disk(work_dir: &Path, actions: &[DeploymentAction]) 
     Ok(())
 }
 
+/// Canonicalize actions to a deterministic JSON string for SHA-256 hashing.
+///
+/// Rules (must match Python: `json.dumps(actions, sort_keys=True,
+/// separators=(",",":"), ensure_ascii=False)`):
+/// - JSON array of objects, compact (no whitespace)
+/// - Object keys sorted alphabetically
+/// - Null-valued and empty-array keys omitted
+/// - UTF-8 encode, then SHA-256
+///
+/// Contract: all DeploymentAction values are strings. Adding numeric fields
+/// (especially floats) would break cross-language hash reproducibility due to
+/// divergent number formatting between Rust, Python, and JS.
 fn canonicalize_actions(actions: &[DeploymentAction]) -> String {
     let mut value = serde_json::to_value(actions).expect("DeploymentAction serialization is infallible");
     sort_json_keys(&mut value);
