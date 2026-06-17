@@ -40,9 +40,11 @@ select { appearance: none; background-image: url("data:image/svg+xml,%3Csvg xmln
 .instance-item .dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; background: var(--text2); }
 .instance-item .dot.online { background: var(--success); }
 .instance-item .dot.offline { background: var(--danger); }
+.instance-item .dot.busy { background: var(--warn); }
 .instance-item .inst-info { flex: 1; min-width: 0; }
 .instance-item .name { font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .instance-item .ip { font-size: 11px; color: var(--text2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.instance-item .op { font-size: 11px; color: var(--warn); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .instance-item .inst-meta { text-align: right; flex-shrink: 0; }
 .instance-item .tag { font-size: 11px; color: var(--text2); }
 .instance-item .file { font-size: 10px; color: var(--text2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 90px; }
@@ -84,6 +86,10 @@ select { appearance: none; background-image: url("data:image/svg+xml,%3Csvg xmln
 .containers-table tr:last-child td { border-bottom: none; }
 .status-up { color: var(--success); }
 .status-down { color: var(--danger); }
+.status-warn { color: var(--warn); }
+.status-danger { color: var(--danger); }
+.operation-status { margin-bottom: 10px; font-size: 13px; color: var(--text2); }
+.operation-status.busy { color: var(--warn); font-weight: 600; }
 
 /* Terminal */
 .terminal { background: var(--terminal-bg); font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace; font-size: 12px; line-height: 1.5; padding: 10px; max-height: 300px; overflow-y: auto; white-space: pre-wrap; word-break: break-all; }
@@ -192,6 +198,7 @@ select { appearance: none; background-image: url("data:image/svg+xml,%3Csvg xmln
             <div style="margin-bottom:10px;font-size:13px">
               Deployed tag: <strong id="deployedTag">-</strong> &middot; File: <strong id="deployedFile">-</strong>
             </div>
+            <div class="operation-status" id="operationStatus">No operation in progress</div>
             <div id="containersSection">
               <table class="containers-table">
                 <thead><tr><th>Container</th><th>Image</th><th>Status</th><th></th></tr></thead>
@@ -236,7 +243,7 @@ select { appearance: none; background-image: url("data:image/svg+xml,%3Csvg xmln
           <div class="actions-bar">
             <label class="checkbox-label"><input type="checkbox" id="cleanVolumes"> Prune volumes</label>
             <label class="checkbox-label"><input type="checkbox" id="cleanImages" checked> Prune images</label>
-            <button class="btn-danger btn-sm" onclick="dockerClean()">Clean</button>
+            <button class="btn-danger btn-sm" id="cleanBtn" onclick="dockerClean()">Clean</button>
           </div>
         </div>
       </div>
@@ -257,6 +264,8 @@ let autoRefreshTimer = null;
 let deployingInstances = new Set();
 let terminalSize = 0;
 const MAX_TERMINAL_BYTES = 200000;
+const STATUS_IDLE_MS = 30000;
+const STATUS_BUSY_MS = 5000;
 
 // --- Init ---
 document.addEventListener('DOMContentLoaded', () => {
@@ -355,10 +364,11 @@ function renderSidebar() {
   }
   el.innerHTML = instances.map(i => `
     <div class="instance-item ${i.id === selectedId ? 'active' : ''}" onclick="selectInstance('${i.id}')">
-      <div class="dot ${i._status || ''}" id="dot-${i.id}"></div>
+      <div class="dot ${i._inFlight ? 'busy' : (i._status || '')}" id="dot-${i.id}"></div>
       <div class="inst-info">
         <div class="name">${esc(i.name)}</div>
         <div class="ip">${esc(extractHost(i.url))}</div>
+        <div class="op" id="op-${i.id}" style="display:${operationSummary(i) ? '' : 'none'}">${esc(operationSummary(i))}</div>
       </div>
       <div class="inst-meta">
         <div class="tag" id="tag-${i.id}">${i._deployedTag || ''}</div>
@@ -441,15 +451,15 @@ async function removeInstance(id) {
 
 // --- Status polling ---
 function startStatusPolling() {
-  Object.values(statusTimers).forEach(clearInterval);
+  Object.values(statusTimers).forEach(clearTimeout);
   statusTimers = {};
   for (const inst of instances) {
-    checkInstanceStatus(inst.id);
-    statusTimers[inst.id] = setInterval(() => checkInstanceStatus(inst.id), 30000);
+    checkInstanceStatus(inst.id, true);
   }
 }
 
-async function checkInstanceStatus(id) {
+async function checkInstanceStatus(id, reschedule = false) {
+  let nextDelay = STATUS_IDLE_MS;
   try {
     const data = await apiJson('GET', `/api/instances/${id}/version`);
     const inst = instances.find(i => i.id === id);
@@ -458,22 +468,133 @@ async function checkInstanceStatus(id) {
       inst._deployedTag = data.tag || '-';
       inst._deployedFile = data.file || '';
     }
-    const dot = document.getElementById(`dot-${id}`);
-    if (dot) { dot.className = 'dot online'; }
     const tag = document.getElementById(`tag-${id}`);
     if (tag) { tag.textContent = data.tag || ''; }
     const file = document.getElementById(`file-${id}`);
     if (file) { file.textContent = data.file || ''; file.title = data.file || ''; }
+
+    await refreshOperationState(id);
+    if (inst && inst._inFlight) nextDelay = STATUS_BUSY_MS;
+    updateInstanceOperation(id);
   } catch {
     const inst = instances.find(i => i.id === id);
-    if (inst) { inst._status = 'offline'; inst._deployedTag = ''; inst._deployedFile = ''; }
+    if (inst) { inst._status = 'offline'; inst._deployedTag = ''; inst._deployedFile = ''; inst._inFlight = null; }
     const dot = document.getElementById(`dot-${id}`);
     if (dot) { dot.className = 'dot offline'; }
     const tag = document.getElementById(`tag-${id}`);
     if (tag) { tag.textContent = ''; }
     const file = document.getElementById(`file-${id}`);
     if (file) { file.textContent = ''; file.title = ''; }
+    updateInstanceOperation(id);
+  } finally {
+    if (reschedule && instances.some(i => i.id === id)) {
+      clearTimeout(statusTimers[id]);
+      statusTimers[id] = setTimeout(() => checkInstanceStatus(id, true), nextDelay);
+    }
   }
+}
+
+async function refreshOperationState(id) {
+  const inst = instances.find(i => i.id === id);
+  if (!inst) return null;
+  try {
+    const op = await apiJson('GET', `/api/instances/${id}/status`);
+    inst._inFlight = op.in_flight || null;
+  } catch {
+    inst._inFlight = null;
+  }
+  updateInstanceOperation(id);
+  return inst._inFlight;
+}
+
+function updateInstanceOperation(id) {
+  const inst = instances.find(i => i.id === id);
+  if (!inst) return;
+  const busy = !!inst._inFlight;
+  const dot = document.getElementById(`dot-${id}`);
+  if (dot) {
+    dot.className = `dot ${busy ? 'busy' : (inst._status || '')}`;
+  }
+  const op = document.getElementById(`op-${id}`);
+  if (op) {
+    op.textContent = operationSummary(inst);
+    op.style.display = busy ? '' : 'none';
+  }
+  if (selectedId === id) {
+    updateOperationStatus();
+    updateDeployButtons();
+  }
+}
+
+function operationSummary(inst) {
+  if (!inst || !inst._inFlight) return '';
+  return `${operationLabel(inst._inFlight.action)} ${elapsedText(inst._inFlight.started_at)}`;
+}
+
+function operationDescription(op) {
+  if (!op) return 'No operation in progress';
+  const parts = [operationLabel(op.action)];
+  if (op.file) parts.push(op.file);
+  if (op.container) parts.push(op.container);
+  if (op.services && op.services.length) parts.push(`(${op.services.join(', ')})`);
+  parts.push(`for ${elapsedText(op.started_at)}`);
+  return parts.join(' ');
+}
+
+function operationLabel(action) {
+  const labels = {
+    compose_up: 'Starting',
+    compose_down: 'Stopping',
+    docker_restart: 'Restarting',
+    docker_clean: 'Cleaning',
+  };
+  return labels[action] || 'Working';
+}
+
+function elapsedText(startedAt) {
+  const started = Date.parse(startedAt);
+  if (!Number.isFinite(started)) return '';
+  const seconds = Math.max(0, Math.floor((Date.now() - started) / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  const rem = minutes % 60;
+  return rem ? `${hours}h ${rem}m` : `${hours}h`;
+}
+
+function selectedInstanceBusy() {
+  const inst = instances.find(i => i.id === selectedId);
+  return !!selectedId && (deployingInstances.has(selectedId) || !!inst?._inFlight);
+}
+
+function setLocalOperation(id, action, extra = {}) {
+  const inst = instances.find(i => i.id === id);
+  if (!inst) return;
+  inst._inFlight = {
+    action,
+    started_at: new Date().toISOString(),
+    ...extra,
+  };
+  updateInstanceOperation(id);
+  clearTimeout(statusTimers[id]);
+  statusTimers[id] = setTimeout(() => checkInstanceStatus(id, true), STATUS_BUSY_MS);
+}
+
+function clearLocalOperation(id) {
+  const inst = instances.find(i => i.id === id);
+  if (!inst) return;
+  inst._inFlight = null;
+  updateInstanceOperation(id);
+}
+
+function updateOperationStatus() {
+  const el = document.getElementById('operationStatus');
+  if (!el || !selectedId) return;
+  const inst = instances.find(i => i.id === selectedId);
+  const busy = !!inst?._inFlight;
+  el.textContent = busy ? operationDescription(inst._inFlight) : 'No operation in progress';
+  el.className = `operation-status ${busy ? 'busy' : ''}`;
 }
 
 // --- GitHub ---
@@ -549,7 +670,7 @@ async function deploy() {
   if (!tag || !file) { toast('Select tag and file', 'error'); return; }
 
   const targetId = selectedId;
-  if (deployingInstances.has(targetId)) {
+  if (selectedInstanceBusy()) {
     toast('Operation already in progress on this instance', 'error');
     return;
   }
@@ -562,6 +683,7 @@ async function deploy() {
   };
 
   deployingInstances.add(targetId);
+  setLocalOperation(targetId, 'compose_up', { tag, file, services: body.services });
   updateDeployButtons();
   clearTerminal();
   appendTerminal(`> Deploying ${tag} / ${file}...\n`, 'stdout');
@@ -574,7 +696,7 @@ async function deploy() {
     if (selectedId === targetId) appendTerminal(`Error: ${e.message}\n`, 'error');
   }
   deployingInstances.delete(targetId);
-  if (selectedId === targetId) updateDeployButtons();
+  clearLocalOperation(targetId);
   refreshStatus();
 }
 
@@ -584,7 +706,7 @@ async function composeDown() {
   if (!tag) { toast('Select a tag', 'error'); return; }
 
   const targetId = selectedId;
-  if (deployingInstances.has(targetId)) {
+  if (selectedInstanceBusy()) {
     toast('Operation already in progress on this instance', 'error');
     return;
   }
@@ -598,6 +720,7 @@ async function composeDown() {
   };
 
   deployingInstances.add(targetId);
+  setLocalOperation(targetId, 'compose_down', { tag, file: body.file, services: body.services });
   updateDeployButtons();
   clearTerminal();
   appendTerminal(`> Compose down...\n`, 'stdout');
@@ -610,7 +733,7 @@ async function composeDown() {
     if (selectedId === targetId) appendTerminal(`Error: ${e.message}\n`, 'error');
   }
   deployingInstances.delete(targetId);
-  if (selectedId === targetId) updateDeployButtons();
+  clearLocalOperation(targetId);
   refreshStatus();
 }
 
@@ -625,9 +748,11 @@ function handleStreamEvent(ev) {
 }
 
 function updateDeployButtons() {
-  const busy = selectedId && deployingInstances.has(selectedId);
+  const busy = selectedInstanceBusy();
   document.getElementById('deployBtn').disabled = busy;
   document.getElementById('downBtn').disabled = busy;
+  const cleanBtn = document.getElementById('cleanBtn');
+  if (cleanBtn) cleanBtn.disabled = busy;
 }
 
 // --- Status ---
@@ -637,9 +762,13 @@ async function refreshStatus() {
     const ver = await apiJson('GET', `/api/instances/${selectedId}/version`);
     document.getElementById('deployedTag').textContent = ver.tag || '-';
     document.getElementById('deployedFile').textContent = ver.file || '-';
+    await refreshOperationState(selectedId);
   } catch(e) {
     document.getElementById('deployedTag').textContent = 'offline';
     document.getElementById('deployedFile').textContent = '-';
+    const inst = instances.find(i => i.id === selectedId);
+    if (inst) inst._inFlight = null;
+    updateOperationStatus();
   }
 
   try {
@@ -655,12 +784,14 @@ async function refreshStatus() {
       return;
     }
     tbody.innerHTML = containers.map(c => {
-      const up = (c.Status || c.State || '').toLowerCase().includes('up');
+      const status = c.Status || c.State || '';
+      const busy = selectedInstanceBusy();
+      const name = c.Names || c.Name || '';
       return `<tr>
-        <td>${esc(c.Names || c.Name || '')}</td>
+        <td>${esc(name)}</td>
         <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis">${esc(c.Image || '')}</td>
-        <td class="${up ? 'status-up' : 'status-down'}">${esc(c.Status || c.State || '')}</td>
-        <td><button class="btn-ghost btn-sm" onclick="restartContainer('${esc(c.Names || c.Name || '')}')">Restart</button></td>
+        <td class="${containerStatusClass(status)}">${esc(status)}</td>
+        <td><button class="btn-ghost btn-sm" ${busy ? 'disabled' : ''} onclick="restartContainer('${esc(name)}')">Restart</button></td>
       </tr>`;
     }).join('');
   } catch(e) {
@@ -668,13 +799,25 @@ async function refreshStatus() {
   }
 }
 
+function containerStatusClass(status) {
+  const s = (status || '').toLowerCase();
+  if (s.includes('unhealthy') || s.includes('restarting') || s.includes('dead')) return 'status-danger';
+  if (s.includes('health: starting') || s.includes('starting') || s.includes('created')) return 'status-warn';
+  if (s.includes('up')) return 'status-up';
+  return 'status-down';
+}
+
 async function restartContainer(name) {
+  if (selectedInstanceBusy()) { toast('Operation already in progress on this instance', 'error'); return; }
   if (!confirm(`Restart "${name}"?`)) return;
+  const targetId = selectedId;
+  setLocalOperation(targetId, 'docker_restart', { container: name });
   try {
-    await apiJson('POST', `/api/instances/${selectedId}/docker/restart`, { container: name });
+    await apiJson('POST', `/api/instances/${targetId}/docker/restart`, { container: name });
     toast(`Restarted ${name}`, 'success');
-    refreshStatus();
   } catch(e) { toast(e.message, 'error'); }
+  clearLocalOperation(targetId);
+  refreshStatus();
 }
 
 // --- Logs ---
@@ -704,14 +847,19 @@ function toggleAutoRefresh() {
 
 // --- Docker clean ---
 async function dockerClean() {
+  if (selectedInstanceBusy()) { toast('Operation already in progress on this instance', 'error'); return; }
   const volumes = document.getElementById('cleanVolumes').checked;
   const images = document.getElementById('cleanImages').checked;
   if (!volumes && !images) { toast('Select at least one option', 'error'); return; }
   if (!confirm('Run docker prune? This cannot be undone.')) return;
+  const targetId = selectedId;
+  setLocalOperation(targetId, 'docker_clean');
   try {
-    await apiJson('POST', `/api/instances/${selectedId}/docker/clean`, { volumes, images });
+    await apiJson('POST', `/api/instances/${targetId}/docker/clean`, { volumes, images });
     toast('Docker cleanup complete', 'success');
   } catch(e) { toast(e.message, 'error'); }
+  clearLocalOperation(targetId);
+  refreshStatus();
 }
 
 // --- Terminal ---

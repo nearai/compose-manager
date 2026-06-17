@@ -52,6 +52,28 @@ Returns the currently deployed tag.
 {"status": "ok", "tag": "v1.0.0"}
 ```
 
+### GET /status
+Returns the currently running mutating Docker/Compose operation, if any.
+
+**Idle response:**
+```json
+{"status": "ok", "in_flight": null}
+```
+
+**Busy response:**
+```json
+{
+  "status": "ok",
+  "in_flight": {
+    "action": "compose_down",
+    "started_at": "2026-06-17T14:32:00.123456+00:00",
+    "tag": "v1.0.0",
+    "file": "docker-compose.prod.yml",
+    "services": ["api"]
+  }
+}
+```
+
 ### POST /dstack-agent/:action
 Manage the `dstack-guest-agent.service` running on the CVM host. Supported actions: `start`, `stop`, `restart`, `status`.
 
