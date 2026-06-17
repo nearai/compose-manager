@@ -234,6 +234,7 @@ select { appearance: none; background-image: url("data:image/svg+xml,%3Csvg xmln
         <div class="card-header">Docker Cleanup</div>
         <div class="card-body">
           <div class="actions-bar">
+            <label class="checkbox-label"><input type="checkbox" id="cleanContainers" checked> Remove stopped containers</label>
             <label class="checkbox-label"><input type="checkbox" id="cleanVolumes"> Prune volumes</label>
             <label class="checkbox-label"><input type="checkbox" id="cleanImages" checked> Prune images</label>
             <button class="btn-danger btn-sm" onclick="dockerClean()">Clean</button>
@@ -704,12 +705,13 @@ function toggleAutoRefresh() {
 
 // --- Docker clean ---
 async function dockerClean() {
+  const containers = document.getElementById('cleanContainers').checked;
   const volumes = document.getElementById('cleanVolumes').checked;
   const images = document.getElementById('cleanImages').checked;
-  if (!volumes && !images) { toast('Select at least one option', 'error'); return; }
+  if (!containers && !volumes && !images) { toast('Select at least one option', 'error'); return; }
   if (!confirm('Run docker prune? This cannot be undone.')) return;
   try {
-    await apiJson('POST', `/api/instances/${selectedId}/docker/clean`, { volumes, images });
+    await apiJson('POST', `/api/instances/${selectedId}/docker/clean`, { containers, volumes, images });
     toast('Docker cleanup complete', 'success');
   } catch(e) { toast(e.message, 'error'); }
 }
