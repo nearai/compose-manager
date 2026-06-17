@@ -265,12 +265,55 @@ fn migrate_legacy_deployed_version(
 }
 
 async fn persist_actions_to_disk(work_dir: &Path, actions: &[DeploymentAction]) -> std::io::Result<()> {
-    let json = serde_json::to_string(actions)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let json = canonicalize_actions(actions);
     let tmp = work_dir.join("actions.json.tmp");
     tokio::fs::write(&tmp, &json).await?;
     tokio::fs::rename(&tmp, actions_file(work_dir)).await?;
     Ok(())
+}
+
+/// Canonicalize actions to a deterministic JSON string for SHA-256 hashing.
+///
+/// Rules (must match Python: `json.dumps(actions, sort_keys=True,
+/// separators=(",",":"), ensure_ascii=False)`):
+/// - JSON array of objects, compact (no whitespace)
+/// - Object keys sorted alphabetically
+/// - Null-valued and empty-array keys omitted
+/// - UTF-8 encode, then SHA-256
+///
+/// Contract: all DeploymentAction values are strings. Adding numeric fields
+/// (especially floats) would break cross-language hash reproducibility due to
+/// divergent number formatting between Rust, Python, and JS.
+fn canonicalize_actions(actions: &[DeploymentAction]) -> String {
+    let mut value = serde_json::to_value(actions).expect("DeploymentAction serialization is infallible");
+    sort_json_keys(&mut value);
+    serde_json::to_string(&value).expect("DeploymentAction serialization is infallible")
+}
+
+fn sort_json_keys(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut entries: Vec<(String, serde_json::Value)> = map
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            for entry in entries.iter_mut() {
+                sort_json_keys(&mut entry.1);
+            }
+            let mut sorted = serde_json::Map::new();
+            for (k, v) in entries {
+                sorted.insert(k, v);
+            }
+            *map = sorted;
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                sort_json_keys(v);
+            }
+        }
+        _ => {}
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize, Default)]
@@ -857,6 +900,38 @@ mod notify {
 
 // --- NDJSON Streaming ---
 
+/// Parameters needed to rebuild the `compose up` command for a single retry.
+struct EndpointRetry {
+    work_dir: PathBuf,
+    up_args: Vec<String>,
+    file: String,
+    env_files: Vec<String>,
+    services: Vec<String>,
+}
+
+impl EndpointRetry {
+    fn build_cmd(&self) -> AsyncCommand {
+        let args_ref: Vec<&str> = self.up_args.iter().map(|s| s.as_str()).collect();
+        build_compose_cmd(&self.work_dir, &args_ref, &self.file, &self.env_files, &self.services, None)
+    }
+}
+
+/// Parse `(network, container)` pairs from buffered stderr lines.
+/// Matches Docker's "endpoint with name X already exists in network Y".
+fn parse_endpoint_errors(lines: &VecDeque<String>) -> Vec<(String, String)> {
+    let needle = "endpoint with name ";
+    let sep = " already exists in network ";
+    lines.iter().filter_map(|line| {
+        let start = line.find(needle)? + needle.len();
+        let rest = &line[start..];
+        let mid = rest.find(sep)?;
+        let container = rest[..mid].trim().to_string();
+        let network = rest[mid + sep.len()..].trim().to_string();
+        if container.is_empty() || network.is_empty() { return None; }
+        Some((network, container))
+    }).collect()
+}
+
 #[derive(Serialize)]
 struct NdjsonEvent {
     event: String,
@@ -881,6 +956,12 @@ struct NdjsonStream {
     /// Fired with the real exit status when the stream reaches its terminal
     /// `done` event, so compose up/down notify Slack as succeeded/failed.
     completion: Option<notify::CompletionNotice>,
+    /// Rolling buffer of the last 30 stderr lines, used to detect Docker
+    /// endpoint-conflict errors so we can inject a recovery + retry.
+    stderr_tail: VecDeque<String>,
+    /// If set, a failed phase will check stderr_tail for stale-endpoint errors.
+    /// On match: disconnect the endpoint(s) and retry `up` once.
+    endpoint_retry: Option<EndpointRetry>,
 }
 
 impl Stream for NdjsonStream {
@@ -897,6 +978,11 @@ impl Stream for NdjsonStream {
         if let Some(ref mut stderr) = this.stderr {
             match Pin::new(stderr).poll_next_line(cx) {
                 Poll::Ready(Ok(Some(line))) => {
+                    // Rolling buffer for endpoint-error detection on phase failure.
+                    this.stderr_tail.push_back(line.clone());
+                    if this.stderr_tail.len() > 30 {
+                        this.stderr_tail.pop_front();
+                    }
                     let event = NdjsonEvent {
                         event: "stderr".into(),
                         data: Some(line),
@@ -964,6 +1050,50 @@ impl Stream for NdjsonStream {
                                             let _ = std::fs::remove_file(path);
                                         }
                                         return Poll::Ready(Some(Err(e)));
+                                    }
+                                }
+                            }
+                        }
+
+                        // On failure, check whether stale Docker network endpoints
+                        // caused it. If so, disconnect them and retry `up` once.
+                        if !status.success() {
+                            if let Some(retry) = this.endpoint_retry.take() {
+                                let errors = parse_endpoint_errors(&this.stderr_tail);
+                                if !errors.is_empty() {
+                                    info!(endpoints = ?errors, "Stale network endpoints detected; disconnecting and retrying compose up");
+                                    this.stderr_tail.clear();
+                                    let mut recovery: Vec<AsyncCommand> = errors.into_iter().map(|(network, container)| {
+                                        let mut cmd = AsyncCommand::new("docker");
+                                        cmd.args(["network", "disconnect", "--force", &network, &container]);
+                                        cmd.stdout(std::process::Stdio::piped());
+                                        cmd.stderr(std::process::Stdio::piped());
+                                        cmd
+                                    }).collect();
+                                    recovery.push(retry.build_cmd());
+                                    for cmd in recovery.into_iter().rev() {
+                                        this.pending_commands.push_front(cmd);
+                                    }
+                                    if let Some(mut next_cmd) = this.pending_commands.pop_front() {
+                                        match next_cmd.spawn() {
+                                            Ok(mut child) => {
+                                                this.stdout = child.stdout.take().map(|s| BufReader::new(s).lines());
+                                                this.stderr = child.stderr.take().map(|s| BufReader::new(s).lines());
+                                                this.wait_fut = Some(Box::pin(async move {
+                                                    let mut child = child;
+                                                    child.wait().await
+                                                }));
+                                                cx.waker().wake_by_ref();
+                                                return Poll::Pending;
+                                            }
+                                            Err(e) => {
+                                                this.done = true;
+                                                if let Some(ref path) = this.temp_env_file {
+                                                    let _ = std::fs::remove_file(path);
+                                                }
+                                                return Poll::Ready(Some(Err(e)));
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -1163,6 +1293,8 @@ fn stream_docker_compose_phased(
         done: false,
         compose_guard: None,
         completion: None,
+        stderr_tail: VecDeque::new(),
+        endpoint_retry: None,
     })
 }
 
@@ -1251,6 +1383,13 @@ async fn compose_up(
         Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
     stream.compose_guard = Some(guard);
+    stream.endpoint_retry = Some(EndpointRetry {
+        work_dir: state.work_dir.clone(),
+        up_args: up_args.iter().map(|s| s.to_string()).collect(),
+        file: file.clone(),
+        env_files: state.env_files.clone(),
+        services: payload.services.clone(),
+    });
 
     let actor = extract_actor(&headers);
     let action = DeploymentAction {
@@ -1552,7 +1691,7 @@ async fn attestation_report(
 
     let actions = state.actions.read().await.clone();
 
-    let actions_json = serde_json::to_string(&actions).unwrap();
+    let actions_json = canonicalize_actions(&actions);
     let actions_hash: [u8; 32] = sha2::Sha256::digest(actions_json.as_bytes()).into();
     let actions_hash_hex = hex::encode(actions_hash);
 
@@ -2369,8 +2508,6 @@ mod tests {
 
     #[test]
     fn started_action_carries_image_for_attestation() {
-        // The running-image digest must serialize into the action so it's
-        // hashed into the attestation quote's report_data, and round-trip.
         let a = DeploymentAction {
             timestamp: "2026-01-01T00:00:00+00:00".into(),
             action: "compose_manager_started".into(),
@@ -2378,19 +2515,69 @@ mod tests {
             image: Some("nearaidev/compose-manager@sha256:abc".into()),
             ..Default::default()
         };
-        let json = serde_json::to_string(&a).unwrap();
+        let json = canonicalize_actions(&[a.clone()]);
         assert!(
             json.contains("\"image\":\"nearaidev/compose-manager@sha256:abc\""),
             "image must be serialized for attestation; got: {json}"
         );
-        let back: DeploymentAction = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.image.as_deref(), Some("nearaidev/compose-manager@sha256:abc"));
+        let back: Vec<DeploymentAction> = serde_json::from_str(&json).unwrap();
+        assert_eq!(back[0].image.as_deref(), Some("nearaidev/compose-manager@sha256:abc"));
 
-        // Omitted when absent, so existing (imageless) actions hash unchanged.
         let none = DeploymentAction { action: "compose_up".into(), ..Default::default() };
         assert!(
-            !serde_json::to_string(&none).unwrap().contains("image"),
+            !canonicalize_actions(&[none]).contains("image"),
             "image must be omitted when None"
+        );
+    }
+
+    #[test]
+    fn canonicalize_alphabetical_key_order() {
+        let a = DeploymentAction {
+            timestamp: "2026-01-01T00:00:00+00:00".into(),
+            action: "compose_up".into(),
+            tag: Some("v1".into()),
+            ..Default::default()
+        };
+        let json = canonicalize_actions(&[a]);
+        assert_eq!(
+            json,
+            r#"[{"action":"compose_up","tag":"v1","timestamp":"2026-01-01T00:00:00+00:00"}]"#
+        );
+    }
+
+    #[test]
+    fn canonicalize_hash_reproducible_in_python() {
+        let actions = vec![DeploymentAction {
+            timestamp: "2026-01-01T00:00:00+00:00".into(),
+            action: "compose_up".into(),
+            tag: Some("v1".into()),
+            ..Default::default()
+        }];
+        let canonical = canonicalize_actions(&actions);
+        let hash = hex::encode(sha2::Sha256::digest(canonical.as_bytes()));
+        // Python: hashlib.sha256(json.dumps([{"action":"compose_up","tag":"v1","timestamp":"2026-01-01T00:00:00+00:00"}], sort_keys=True, separators=(",",":"), ensure_ascii=False).encode()).hexdigest()
+        assert_eq!(
+            hash,
+            "381eb48dc299dafbbcd49c1a009998240f641865f35e435d2f07385c6e6b2a23"
+        );
+    }
+
+    #[test]
+    fn canonicalize_non_ascii_matches_python() {
+        // serde_json emits raw UTF-8 for non-ASCII; Python must use
+        // ensure_ascii=False to match.
+        let actions = vec![DeploymentAction {
+            timestamp: "2026-01-01T00:00:00+00:00".into(),
+            action: "compose_up".into(),
+            tag: Some("café".into()),
+            ..Default::default()
+        }];
+        let canonical = canonicalize_actions(&actions);
+        let hash = hex::encode(sha2::Sha256::digest(canonical.as_bytes()));
+        // Python: hashlib.sha256(json.dumps([{"action":"compose_up","tag":"café","timestamp":"2026-01-01T00:00:00+00:00"}], sort_keys=True, separators=(",",":"), ensure_ascii=False).encode()).hexdigest()
+        assert_eq!(
+            hash,
+            "1025bd6b9239039058d7fec821e96c83ef1db9331a5b04ec9db8767b3180722a"
         );
     }
 
