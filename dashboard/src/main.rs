@@ -460,6 +460,17 @@ async fn proxy_version(
     proxy_json(&state, &id, reqwest::Method::GET, "version", None, Some(5)).await
 }
 
+async fn proxy_status(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(e) = verify_bearer_token(&headers, &state.dashboard_token) {
+        return e;
+    }
+    proxy_json(&state, &id, reqwest::Method::GET, "status", None, Some(5)).await
+}
+
 // --- GitHub API ---
 
 async fn github_tags(
@@ -663,6 +674,7 @@ async fn main() -> Result<()> {
             post(proxy_docker_clean),
         )
         .route("/api/instances/:id/version", get(proxy_version))
+        .route("/api/instances/:id/status", get(proxy_status))
         .route("/api/github/tags", get(github_tags))
         .route("/api/github/files", get(github_files))
         .with_state(state);
