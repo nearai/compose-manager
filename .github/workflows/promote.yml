@@ -125,9 +125,11 @@ jobs:
           skopeo copy "docker://${CM_IMAGE}@${CM_DIGEST}" "docker://${CM_IMAGE}:latest"
 
           LAUNCHER_PROD_STAMPED_TAG="${CM_PROD_STAMPED_TAG}"
-          skopeo copy "docker://${LAUNCHER_IMAGE}@${LAUNCHER_DIGEST}" "docker://${LAUNCHER_IMAGE}:prod"
-          skopeo copy "docker://${LAUNCHER_IMAGE}@${LAUNCHER_DIGEST}" "docker://${LAUNCHER_IMAGE}:${LAUNCHER_PROD_STAMPED_TAG}"
-          skopeo copy "docker://${LAUNCHER_IMAGE}@${LAUNCHER_DIGEST}" "docker://${LAUNCHER_IMAGE}:latest"
+          # --all copies the full OCI manifest index (not just the current platform),
+          # so :prod resolves to the same multi-arch index digest as :staging.
+          skopeo copy --all "docker://${LAUNCHER_IMAGE}@${LAUNCHER_DIGEST}" "docker://${LAUNCHER_IMAGE}:prod"
+          skopeo copy --all "docker://${LAUNCHER_IMAGE}@${LAUNCHER_DIGEST}" "docker://${LAUNCHER_IMAGE}:${LAUNCHER_PROD_STAMPED_TAG}"
+          skopeo copy --all "docker://${LAUNCHER_IMAGE}@${LAUNCHER_DIGEST}" "docker://${LAUNCHER_IMAGE}:latest"
 
           echo "CM_PROD_STAMPED_TAG=${CM_PROD_STAMPED_TAG}" >> "$GITHUB_ENV"
           echo "CM_PROD_STAMPED_REF=${CM_IMAGE}:${CM_PROD_STAMPED_TAG}" >> "$GITHUB_ENV"
