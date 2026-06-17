@@ -907,12 +907,16 @@ struct EndpointRetry {
     file: String,
     env_files: Vec<String>,
     services: Vec<String>,
+    /// Path to the per-request temp env file (the same file the original `up`
+    /// used), so the retry carries identical env vars. The stream owns cleanup;
+    /// this is a read-only reference to the same path.
+    temp_env_file: Option<PathBuf>,
 }
 
 impl EndpointRetry {
     fn build_cmd(&self) -> AsyncCommand {
         let args_ref: Vec<&str> = self.up_args.iter().map(|s| s.as_str()).collect();
-        build_compose_cmd(&self.work_dir, &args_ref, &self.file, &self.env_files, &self.services, None)
+        build_compose_cmd(&self.work_dir, &args_ref, &self.file, &self.env_files, &self.services, self.temp_env_file.as_deref())
     }
 }
 
@@ -1365,6 +1369,9 @@ async fn compose_up(
     } else {
         None
     };
+    // Clone the path before it's moved into the stream, so the retry can pass
+    // the same --env-file to the retried `up` (the stream owns cleanup).
+    let temp_env_file_for_retry = temp_env_file.clone();
 
     let mut up_args = vec!["up", "-d", "--remove-orphans"];
     if payload.force_recreate {
@@ -1389,6 +1396,7 @@ async fn compose_up(
         file: file.clone(),
         env_files: state.env_files.clone(),
         services: payload.services.clone(),
+        temp_env_file: temp_env_file_for_retry,
     });
 
     let actor = extract_actor(&headers);
