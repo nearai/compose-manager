@@ -536,6 +536,8 @@ struct CleanRequest {
     volumes: bool,
     #[serde(default)]
     images: bool,
+    #[serde(default)]
+    containers: bool,
 }
 
 #[derive(Deserialize, Default)]
@@ -1067,9 +1069,20 @@ impl Stream for NdjsonStream {
                                 if !errors.is_empty() {
                                     info!(endpoints = ?errors, "Stale network endpoints detected; disconnecting and retrying compose up");
                                     this.stderr_tail.clear();
+                                    // Recovery: for each stale endpoint, remove the container
+                                    // (which also disconnects it) and then force-disconnect the
+                                    // network endpoint. Both steps are wrapped in a shell
+                                    // one-liner that always exits 0: if the container was
+                                    // already removed (true ghost endpoint), `docker rm -f`
+                                    // exits non-zero, which would abort the pipeline before
+                                    // the retry. The `2>/dev/null; true` ensures the recovery
+                                    // step always succeeds so compose up is always retried.
                                     let mut recovery: Vec<AsyncCommand> = errors.into_iter().map(|(network, container)| {
-                                        let mut cmd = AsyncCommand::new("docker");
-                                        cmd.args(["network", "disconnect", "--force", &network, &container]);
+                                        let shell = format!(
+                                            "docker rm -f {container} 2>/dev/null; docker network disconnect --force {network} {container} 2>/dev/null; true"
+                                        );
+                                        let mut cmd = AsyncCommand::new("sh");
+                                        cmd.args(["-c", &shell]);
                                         cmd.stdout(std::process::Stdio::piped());
                                         cmd.stderr(std::process::Stdio::piped());
                                         cmd
@@ -1607,8 +1620,8 @@ async fn docker_clean(
         return e;
     }
 
-    if !payload.volumes && !payload.images {
-        return err(StatusCode::BAD_REQUEST, "At least one of 'volumes' or 'images' must be true");
+    if !payload.volumes && !payload.images && !payload.containers {
+        return err(StatusCode::BAD_REQUEST, "At least one of 'volumes', 'images', or 'containers' must be true");
     }
 
     let _guard = match state.try_acquire_compose_lock("docker_clean", None).await {
@@ -1618,7 +1631,7 @@ async fn docker_clean(
         }
     };
 
-    match run_docker_prune(payload.volumes, payload.images) {
+    match run_docker_prune(payload.volumes, payload.images, payload.containers) {
         Ok(_) => {
             let actor = extract_actor(&headers);
             let action = DeploymentAction {
@@ -2167,8 +2180,15 @@ async fn run_host_systemctl(action: &str, unit: &str) -> Result<SystemctlOutput>
     })
 }
 
-fn run_docker_prune(volumes: bool, images: bool) -> Result<String> {
+fn run_docker_prune(volumes: bool, images: bool, containers: bool) -> Result<String> {
     let mut output_text = String::new();
+
+    if containers {
+        info!(command = "docker container prune", "Running command");
+        let result = run_command("docker", &["container", "prune", "-f"])?;
+        info!(command = "docker container prune", "Command completed successfully");
+        output_text.push_str(&result);
+    }
 
     if volumes {
         info!(command = "docker volume prune", "Running command");
