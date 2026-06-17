@@ -66,7 +66,7 @@ Returns the currently running mutating Docker/Compose operation, if any.
   "status": "ok",
   "in_flight": {
     "action": "compose_down",
-    "started_at": "2026-06-17T14:32:00Z",
+    "started_at": "2026-06-17T14:32:00.123456+00:00",
     "tag": "v1.0.0",
     "file": "docker-compose.prod.yml",
     "services": ["api"]

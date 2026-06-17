@@ -368,7 +368,7 @@ function renderSidebar() {
       <div class="inst-info">
         <div class="name">${esc(i.name)}</div>
         <div class="ip">${esc(extractHost(i.url))}</div>
-        <div class="op" id="op-${i.id}">${esc(operationSummary(i))}</div>
+        <div class="op" id="op-${i.id}" style="display:${operationSummary(i) ? '' : 'none'}">${esc(operationSummary(i))}</div>
       </div>
       <div class="inst-meta">
         <div class="tag" id="tag-${i.id}">${i._deployedTag || ''}</div>
@@ -468,8 +468,6 @@ async function checkInstanceStatus(id, reschedule = false) {
       inst._deployedTag = data.tag || '-';
       inst._deployedFile = data.file || '';
     }
-    const dot = document.getElementById(`dot-${id}`);
-    if (dot) { dot.className = 'dot online'; }
     const tag = document.getElementById(`tag-${id}`);
     if (tag) { tag.textContent = data.tag || ''; }
     const file = document.getElementById(`file-${id}`);

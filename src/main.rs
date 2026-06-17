@@ -17,7 +17,7 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     process::Command,
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex},
     task::{Context as TaskContext, Poll},
     time::Duration,
 };
@@ -365,13 +365,12 @@ struct ComposeLockBusy;
 /// goes out of scope — early returns, handler completion, or NdjsonStream drop.
 struct ComposeGuard {
     _inner: tokio::sync::OwnedMutexGuard<()>,
-    in_flight: Arc<RwLock<Option<InFlightOp>>>,
+    in_flight: Arc<StdMutex<Option<InFlightOp>>>,
 }
 
 impl Drop for ComposeGuard {
     fn drop(&mut self) {
-        // Best-effort: use try_write to avoid blocking in a drop context.
-        if let Ok(mut guard) = self.in_flight.try_write() {
+        if let Ok(mut guard) = self.in_flight.lock() {
             *guard = None;
         }
         info!(action = "compose_op", "Released compose lock");
@@ -402,7 +401,7 @@ struct AppState {
     /// Uses `try_lock` semantics — concurrent requests receive HTTP 409.
     compose_lock: Arc<Mutex<()>>,
     /// Metadata about the currently-running operation (for 409 messages & /status).
-    in_flight: Arc<RwLock<Option<InFlightOp>>>,
+    in_flight: Arc<StdMutex<Option<InFlightOp>>>,
     /// Digest (repo@sha256:…) of the image THIS compose-manager process runs,
     /// resolved once at startup. Surfaced by /version and recorded as the
     /// `compose_manager_started` action so it is bound into attestation.
@@ -423,7 +422,7 @@ impl AppState {
     ) -> Result<ComposeGuard, ComposeLockBusy> {
         match self.compose_lock.clone().try_lock_owned() {
             Ok(guard) => {
-                *self.in_flight.write().await = Some(InFlightOp {
+                *self.in_flight.lock().expect("in_flight mutex poisoned") = Some(InFlightOp {
                     action: action.to_string(),
                     started_at: Utc::now().to_rfc3339(),
                     tag: tag.clone(),
@@ -438,7 +437,7 @@ impl AppState {
                 })
             }
             Err(_) => {
-                let in_flight = self.in_flight.read().await.clone();
+                let in_flight = self.in_flight.lock().ok().and_then(|guard| guard.clone());
                 error!(action = action, in_flight = ?in_flight, "Compose lock busy — rejecting request");
                 Err(ComposeLockBusy)
             }
@@ -447,7 +446,7 @@ impl AppState {
 
     /// Build a 409 Conflict error message describing the currently in-flight operation.
     async fn conflict_message(&self) -> String {
-        let in_flight = self.in_flight.read().await.clone();
+        let in_flight = self.in_flight.lock().ok().and_then(|guard| guard.clone());
         format!(
             "another docker operation is already in progress: {}",
             in_flight.map(|op| op.action).unwrap_or_else(|| "unknown".into())
@@ -1606,7 +1605,7 @@ async fn status(
         return err_response(code, msg);
     }
 
-    let in_flight = state.in_flight.read().await.clone();
+    let in_flight = state.in_flight.lock().ok().and_then(|guard| guard.clone());
     Response::builder()
         .status(StatusCode::OK)
         .header("Content-Type", "application/json")
@@ -2408,7 +2407,7 @@ async fn main() -> Result<()> {
             .build()
             .expect("reqwest client builder with valid timeouts"),
         compose_lock: Arc::new(Mutex::new(())),
-        in_flight: Arc::new(RwLock::new(None)),
+        in_flight: Arc::new(StdMutex::new(None)),
         running_image: running_image.clone(),
     });
 
@@ -2906,7 +2905,7 @@ mod tests {
             actions: RwLock::new(vec![]),
             http: reqwest::Client::new(),
             compose_lock: Arc::new(Mutex::new(())),
-            in_flight: Arc::new(RwLock::new(None)),
+            in_flight: Arc::new(StdMutex::new(None)),
             running_image: None,
         })
     }
@@ -2979,13 +2978,13 @@ mod tests {
                 vec!["svc".into()],
                 None,
             ).await.unwrap();
-            let in_flight = state.in_flight.read().await.clone();
+            let in_flight = state.in_flight.lock().unwrap().clone();
             assert!(in_flight.is_some(), "in_flight should be set while lock is held");
             assert_eq!(in_flight.unwrap().action, "compose_up");
         }
         // After dropping the ComposeGuard, in_flight must be cleared
         // (ComposeGuard::Drop clears it).
-        let in_flight = state.in_flight.read().await.clone();
+        let in_flight = state.in_flight.lock().unwrap().clone();
         assert!(in_flight.is_none(), "in_flight should be cleared after ComposeGuard drops");
     }
 
@@ -2993,7 +2992,7 @@ mod tests {
     async fn in_flight_reflects_current_action() {
         let state = make_test_state();
         let _guard = state.try_acquire_compose_lock("docker_clean", None, None, vec![], None).await.unwrap();
-        let in_flight = state.in_flight.read().await.clone().unwrap();
+        let in_flight = state.in_flight.lock().unwrap().clone().unwrap();
         assert_eq!(in_flight.action, "docker_clean");
         assert_eq!(in_flight.tag, None);
     }
@@ -3008,7 +3007,7 @@ mod tests {
             vec![],
             Some("vllm-test".into()),
         ).await.unwrap();
-        let in_flight = state.in_flight.read().await.clone().unwrap();
+        let in_flight = state.in_flight.lock().unwrap().clone().unwrap();
         assert_eq!(in_flight.action, "docker_restart");
         assert_eq!(in_flight.container.as_deref(), Some("vllm-test"));
     }
