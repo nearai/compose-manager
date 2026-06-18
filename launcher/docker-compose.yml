@@ -24,7 +24,7 @@ services:
       - GITHUB_REPO=${CM_GITHUB_REPO:-https://github.com/nearai/cvm-compose-files}
       - BEARER_TOKEN=${BEARER_TOKEN}
       - WORK_DIR=/app/work
-      - MIN_TAG_AGE_HOURS=${CM_MIN_TAG_AGE_HOURS:-2}
+      - MIN_TAG_AGE_HOURS=${CM_MIN_TAG_AGE_HOURS:-0}
       - ENV_FILES=/app/.env
     labels:
       com.datadoghq.ad.logs: '[{"source": "compose-manager", "service": "compose-manager"}]'

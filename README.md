@@ -110,7 +110,8 @@ Checkout a specific git tag.
 {"tag": "v1.0.0"}
 ```
 
-**Validation:** The tag's commit must be at least `MIN_TAG_AGE_HOURS` old (default: 48 hours).
+**Validation:** When `MIN_TAG_AGE_HOURS` is greater than `0`, the tag's commit
+must be at least that many hours old. Set it to `0` to allow newly created tags.
 
 ## Configuration
 
@@ -119,7 +120,12 @@ Checkout a specific git tag.
 | `GITHUB_REPO` | Yes | - | GitHub repository URL (e.g., `https://github.com/owner/repo`) |
 | `BEARER_TOKEN` | Yes | - | Bearer token for authenticating requests |
 | `WORK_DIR` | No | `/app/work` | Directory for downloaded compose files |
-| `MIN_TAG_AGE_HOURS` | No | `48` | Minimum tag age in hours before checkout is allowed |
+| `MIN_TAG_AGE_HOURS` | No | `48` | Minimum tag age in hours before checkout is allowed; `0` disables the check |
+
+The bundled launcher deployment sets `MIN_TAG_AGE_HOURS` from
+`CM_MIN_TAG_AGE_HOURS` and defaults it to `0`, so launcher-managed
+compose-manager instances do not impose an age gate unless explicitly
+configured.
 
 ## Usage
 
