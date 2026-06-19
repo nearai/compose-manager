@@ -1394,7 +1394,13 @@ async fn compose_up(
     if let Err(e) = tokio::fs::create_dir_all(&state.work_dir).await {
         return err_response(StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create work dir: {}", e));
     }
-    if let Err(e) = tokio::fs::write(state.work_dir.join(&file), &content).await {
+    let target_path = state.work_dir.join(&file);
+    if let Some(parent) = target_path.parent() {
+        if let Err(e) = tokio::fs::create_dir_all(parent).await {
+            return err_response(StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create file parent dir: {}", e));
+        }
+    }
+    if let Err(e) = tokio::fs::write(&target_path, &content).await {
         return err_response(StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to write file: {}", e));
     }
 
