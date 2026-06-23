@@ -825,7 +825,8 @@ async function loadLogs() {
   if (!selectedId) return;
   const tail = parseInt(document.getElementById('logsTail').value) || 100;
   const services = document.getElementById('logsServices').value.split(',').map(s => s.trim()).filter(Boolean);
-  const file = document.getElementById('fileSelect').value || undefined;
+  const inst = instances.find(i => i.id === selectedId);
+  const file = inst?._deployedFile || undefined;
   const el = document.getElementById('logsOutput');
   el.textContent = 'Loading...';
   try {
