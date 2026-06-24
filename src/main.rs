@@ -535,8 +535,10 @@ struct ComposeRequest {
     force_recreate: bool,
     /// Optional per-call Compose project override. When omitted, the project is
     /// the working-directory basename default (unchanged behavior). When set, it
-    /// is sanitized and validated (reserved names `work`/`dstack` rejected) so
-    /// the control plane can scope each model under its own project.
+    /// must already be canonical (lowercase `[a-z0-9_-]`, no leading
+    /// non-alphanumerics) and is validated (reserved `work`/`dstack` and
+    /// non-canonical names rejected) so the control plane can scope each model
+    /// under its own project. See `resolve_compose_project`.
     #[serde(default)]
     project: Option<String>,
 }
@@ -1288,6 +1290,17 @@ fn sanitize_project_name(input: &str) -> Option<String> {
 /// launcher, certbot, datadog); letting an override land on either would point
 /// our `--remove-orphans` at containers we must never evict.
 ///
+/// We ALSO reject a provided name that is not already in canonical (sanitized)
+/// form, rather than silently rewriting it. The sanitization is lossy — every
+/// out-of-charset byte maps to `_` — so `GLM-5.1` and `GLM-5_1` would both
+/// collapse to `glm-5_1`. Since `up` runs with `--remove-orphans`, two distinct
+/// caller names collapsing onto one project would let a deploy of one model
+/// evict another model's containers, defeating the isolation this override
+/// exists for. Requiring callers to pass an already-canonical name makes that
+/// collapse impossible. (The implicit working-dir default still sanitizes
+/// silently via `compose_project_name`; only the explicit override is held to
+/// canonical form.)
+///
 /// When `project` is `None`, behavior is EXACTLY as before: the
 /// working-directory basename default from `compose_project_name`.
 fn resolve_compose_project(project: Option<&str>, work_dir: &Path) -> Result<String, String> {
@@ -1298,6 +1311,16 @@ fn resolve_compose_project(project: Option<&str>, work_dir: &Path) -> Result<Str
             let name = sanitize_project_name(raw).ok_or_else(|| {
                 format!("invalid compose project name {:?}: empty after sanitization", raw)
             })?;
+            if name != raw {
+                return Err(format!(
+                    "compose project name {:?} is not canonical (must already be lowercase \
+                     and contain only [a-z0-9_-] with no leading non-alphanumerics); \
+                     canonical form would be {:?}. Rejected rather than rewritten, since \
+                     lossy rewriting could collapse two distinct names onto one project \
+                     and let --remove-orphans evict another model.",
+                    raw, name
+                ));
+            }
             if RESERVED.contains(&name.as_str()) {
                 return Err(format!(
                     "compose project name {:?} is reserved and cannot be overridden",
@@ -2668,32 +2691,41 @@ mod tests {
     }
 
     #[test]
-    fn resolve_compose_project_uses_and_sanitizes_override() {
-        // A valid override is used in place of the basename default, and the
-        // same sanitization (lowercase + invalid->'_' + trim leading) applies.
-        // `.` is not in Docker's project charset, so it becomes '_'.
+    fn resolve_compose_project_accepts_canonical_override() {
+        // A valid, already-canonical override is used verbatim in place of the
+        // basename default.
         assert_eq!(
-            resolve_compose_project(Some("GLM-5.1"), Path::new("/app/work")).unwrap(),
+            resolve_compose_project(Some("glm-5_1"), Path::new("/app/work")).unwrap(),
             "glm-5_1"
         );
         assert_eq!(
-            resolve_compose_project(Some("My Model"), Path::new("/app/work")).unwrap(),
+            resolve_compose_project(Some("my_model"), Path::new("/app/work")).unwrap(),
             "my_model"
         );
         assert_eq!(
-            resolve_compose_project(Some("-leading"), Path::new("/app/work")).unwrap(),
-            "leading"
+            resolve_compose_project(Some("model123"), Path::new("/app/work")).unwrap(),
+            "model123"
         );
+    }
+
+    #[test]
+    fn resolve_compose_project_rejects_non_canonical_override() {
+        // Non-canonical names are rejected (not silently rewritten), so two
+        // distinct caller names can never collapse onto one project and let
+        // `--remove-orphans` evict another model.
+        assert!(resolve_compose_project(Some("GLM-5.1"), Path::new("/app/work")).is_err()); // uppercase + '.'
+        assert!(resolve_compose_project(Some("My Model"), Path::new("/app/work")).is_err()); // space + uppercase
+        assert!(resolve_compose_project(Some("-leading"), Path::new("/app/work")).is_err()); // leading non-alnum
+        assert!(resolve_compose_project(Some("glm-5_1"), Path::new("/app/work")).is_ok()); // canonical -> accepted
     }
 
     #[test]
     fn resolve_compose_project_rejects_reserved_and_empty() {
         // Reserved names would let `--remove-orphans` reach the infra/app-compose
-        // project, so they are rejected even when supplied with odd casing/chars.
+        // project, so they are rejected. (Supplied in canonical form; odd-cased
+        // variants like "WORK" are already rejected as non-canonical.)
         assert!(resolve_compose_project(Some("work"), Path::new("/app/work")).is_err());
         assert!(resolve_compose_project(Some("dstack"), Path::new("/app/work")).is_err());
-        assert!(resolve_compose_project(Some("WORK"), Path::new("/app/work")).is_err());
-        assert!(resolve_compose_project(Some("DStack"), Path::new("/app/work")).is_err());
         // Empty / all-invalid names have nothing valid left after sanitization.
         assert!(resolve_compose_project(Some(""), Path::new("/app/work")).is_err());
         assert!(resolve_compose_project(Some("///"), Path::new("/app/work")).is_err());
