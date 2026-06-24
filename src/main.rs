@@ -2164,14 +2164,48 @@ const CACHE_VOLUME_MARKERS: &[&str] = &[
 /// only exists in these.
 const HF_VOLUME_MARKERS: &[&str] = &["huggingface_cache", "hugginface_cache"];
 
-/// Run `docker <args>` async and return trimmed stdout, or None on
-/// failure/non-zero exit. Mirrors `docker_inspect_output` but keeps empty
-/// stdout (callers distinguish "ran, no output" from "failed to run").
+/// Whether a string matches docker's volume-name grammar
+/// (`[a-zA-Z0-9][a-zA-Z0-9_.-]*`). Used to refuse interpolating an unexpected
+/// name (leading `/`, spaces, `:`) into a `-v <name>:/v:ro` mount spec, where
+/// it could be reinterpreted as a bind-mount path. Defense-in-depth: docker
+/// already enforces this on creation, but we never trust the input verbatim.
+fn is_valid_docker_volume_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphanumeric() => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-')
+}
+
+/// Subprocess timeout for the read-only host-observability helpers. A hung
+/// docker daemon or a wedged nvidia-smi (common with broken GPU drivers) must
+/// not pin a request handler forever — bound it like the systemctl/algif paths
+/// already do.
+const HOST_OBSERVE_CMD_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Run a program async and return stdout on a zero exit, or None on
+/// failure/non-zero exit/timeout. Timeout-bounded (HOST_OBSERVE_CMD_TIMEOUT).
+async fn run_bounded(program: &str, args: &[&str]) -> Option<String> {
+    let fut = AsyncCommand::new(program).args(args).output();
+    match tokio::time::timeout(HOST_OBSERVE_CMD_TIMEOUT, fut).await {
+        Ok(Ok(out)) => out
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).to_string()),
+        Ok(Err(_)) => None,
+        Err(_) => {
+            warn!(program = program, args = ?args, timeout_secs = HOST_OBSERVE_CMD_TIMEOUT.as_secs(), "host-observe command timed out");
+            None
+        }
+    }
+}
+
+/// Run `docker <args>` async and return stdout, or None on failure/non-zero
+/// exit/timeout. Mirrors `docker_inspect_output` but keeps empty stdout
+/// (callers distinguish "ran, no output" from "failed to run").
 async fn docker_stdout(args: &[&str]) -> Option<String> {
-    let out = AsyncCommand::new("docker").args(args).output().await.ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).to_string())
+    run_bounded("docker", args).await
 }
 
 /// Parse the GPU device indices a single container reserves, from its
@@ -2265,23 +2299,13 @@ async fn query_nvidia_smi() -> Option<HashMap<u32, (u64, u64, u32)>> {
 }
 
 async fn docker_smi_direct() -> Option<String> {
-    let out = AsyncCommand::new("nvidia-smi")
-        .args(NVIDIA_SMI_ARGS)
-        .output()
-        .await
-        .ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).to_string())
+    run_bounded("nvidia-smi", NVIDIA_SMI_ARGS).await
 }
 
 async fn nvidia_smi_via_nsenter() -> Option<String> {
     let mut args = vec!["-t", "1", "-m", "-u", "-i", "-n", "-p", "--", "nvidia-smi"];
     args.extend_from_slice(NVIDIA_SMI_ARGS);
-    let out = AsyncCommand::new("nsenter").args(&args).output().await.ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).to_string())
+    run_bounded("nsenter", &args).await
 }
 
 /// GET /host/gpu — per-GPU allocation (docker-derived, authoritative) plus
@@ -2298,12 +2322,44 @@ async fn host_gpu(
     // gpu_index -> [container names]. BTreeMap keeps the output index-ordered.
     let mut claims: std::collections::BTreeMap<u32, Vec<String>> = std::collections::BTreeMap::new();
 
-    let names = docker_stdout(&["ps", "--format", "{{.Names}}"]).await.unwrap_or_default();
-    for name in names.lines().map(str::trim).filter(|n| !n.is_empty()) {
-        if let Some(json) = docker_stdout(&["inspect", name]).await {
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&json) {
-                for idx in gpu_indices_from_inspect(&val) {
-                    claims.entry(idx).or_default().push(name.to_string());
+    // docker ps failing (daemon down, permission denied) would silently make
+    // every GPU look unclaimed — dangerous for a scheduler reading this as the
+    // authoritative claim source. Log it loudly so it isn't mistaken for "free".
+    let names: Vec<String> = match docker_stdout(&["ps", "--format", "{{.Names}}"]).await {
+        Some(out) => out
+            .lines()
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .map(String::from)
+            .collect(),
+        None => {
+            warn!("docker ps failed — GPU claim data is unreliable (all GPUs will appear unclaimed)");
+            Vec::new()
+        }
+    };
+
+    // Batch: inspect all running containers in a single `docker inspect` call
+    // to avoid N sequential subprocess invocations. The result is a JSON array
+    // whose elements carry `.Name` ("/container") so we can attribute claims.
+    if !names.is_empty() {
+        let mut args: Vec<&str> = vec!["inspect"];
+        args.extend(names.iter().map(String::as_str));
+        if let Some(json) = docker_stdout(&args).await {
+            if let Ok(serde_json::Value::Array(items)) =
+                serde_json::from_str::<serde_json::Value>(&json)
+            {
+                for item in &items {
+                    let name = item
+                        .get("Name")
+                        .and_then(|v| v.as_str())
+                        .map(|n| n.trim_start_matches('/').to_string())
+                        .unwrap_or_default();
+                    if name.is_empty() {
+                        continue;
+                    }
+                    for idx in gpu_indices_from_inspect(item) {
+                        claims.entry(idx).or_default().push(name.clone());
+                    }
                 }
             }
         }
@@ -2314,14 +2370,10 @@ async fn host_gpu(
 
     // Union of indices seen via docker claims and via nvidia-smi, so a free GPU
     // (claimed_by empty) still appears, and a claimed GPU shows even if smi is
-    // unavailable.
-    let mut all_indices: Vec<u32> = claims.keys().copied().collect();
-    for idx in smi.keys() {
-        if !all_indices.contains(idx) {
-            all_indices.push(*idx);
-        }
-    }
-    all_indices.sort_unstable();
+    // unavailable. BTreeSet dedups and keeps them index-ordered.
+    let mut index_set: std::collections::BTreeSet<u32> = claims.keys().copied().collect();
+    index_set.extend(smi.keys().copied());
+    let all_indices: Vec<u32> = index_set.into_iter().collect();
 
     let gpus: Vec<GpuInfo> = all_indices
         .into_iter()
@@ -2426,6 +2478,14 @@ async fn host_cache(
         .map(str::trim)
         .filter(|n| !n.is_empty())
         .filter(|n| CACHE_VOLUME_MARKERS.iter().any(|m| n.contains(m)))
+        // Refuse names that don't match docker's grammar — they'd later be
+        // interpolated into a `-v <name>:/v:ro` mount spec.
+        .filter(|n| {
+            is_valid_docker_volume_name(n) || {
+                warn!(volume = %n, "skipping cache volume with unexpected name");
+                false
+            }
+        })
         .map(String::from)
         .collect();
 
@@ -2444,8 +2504,10 @@ async fn host_cache(
         .collect();
 
     // Enumerate model weights (`models--*`) in the HF cache volume(s) via a
-    // throwaway read-only container. Each `ls` is best-effort.
-    let mut weights: Vec<String> = Vec::new();
+    // throwaway read-only container. Each `ls` is best-effort. BTreeSet dedups
+    // across volumes and keeps the output sorted. Names are already validated
+    // against docker's grammar above, so the mount spec is safe to build.
+    let mut weight_set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for name in cache_names
         .iter()
         .filter(|n| HF_VOLUME_MARKERS.iter().any(|m| n.contains(m)))
@@ -2455,13 +2517,13 @@ async fn host_cache(
             docker_stdout(&["run", "--rm", "-v", &mount, "alpine", "ls", "/v/hub"]).await
         {
             for entry in out.lines().map(str::trim) {
-                if entry.starts_with("models--") && !weights.contains(&entry.to_string()) {
-                    weights.push(entry.to_string());
+                if entry.starts_with("models--") {
+                    weight_set.insert(entry.to_string());
                 }
             }
         }
     }
-    weights.sort();
+    let weights: Vec<String> = weight_set.into_iter().collect();
 
     json_ok(serde_json::json!(HostCacheResponse { volumes, weights }))
 }
@@ -3541,6 +3603,19 @@ mod tests {
         assert_eq!(parse_human_size("1.5GB"), Some(1_500_000_000));
         assert_eq!(parse_human_size("12.3kB"), Some(12_300));
         assert_eq!(parse_human_size("garbage"), None);
+    }
+
+    #[test]
+    fn docker_volume_name_grammar() {
+        assert!(is_valid_docker_volume_name("huggingface_cache"));
+        assert!(is_valid_docker_volume_name("vllm-cache.1"));
+        assert!(is_valid_docker_volume_name("a"));
+        // Must start alphanumeric; no path/spaces/colons.
+        assert!(!is_valid_docker_volume_name("_leading"));
+        assert!(!is_valid_docker_volume_name("/etc/passwd"));
+        assert!(!is_valid_docker_volume_name("has space"));
+        assert!(!is_valid_docker_volume_name("name:with:colon"));
+        assert!(!is_valid_docker_volume_name(""));
     }
 
     #[test]
