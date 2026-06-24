@@ -533,6 +533,12 @@ struct ComposeRequest {
     env: HashMap<String, String>,
     #[serde(default)]
     force_recreate: bool,
+    /// Optional per-call Compose project override. When omitted, the project is
+    /// the working-directory basename default (unchanged behavior). When set, it
+    /// is sanitized and validated (reserved names `work`/`dstack` rejected) so
+    /// the control plane can scope each model under its own project.
+    #[serde(default)]
+    project: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -546,6 +552,9 @@ struct ComposeDownRequest {
     services: Vec<String>,
     #[serde(default)]
     env: HashMap<String, String>,
+    /// Optional per-call Compose project override; see `ComposeRequest::project`.
+    #[serde(default)]
+    project: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -923,6 +932,9 @@ mod notify {
 /// Parameters needed to rebuild the `compose up` command for a single retry.
 struct EndpointRetry {
     work_dir: PathBuf,
+    /// Resolved Compose project name (same one the original `up` used), so the
+    /// retry runs under the identical project rather than re-deriving it.
+    project: String,
     up_args: Vec<String>,
     file: String,
     env_files: Vec<String>,
@@ -936,7 +948,7 @@ struct EndpointRetry {
 impl EndpointRetry {
     fn build_cmd(&self) -> AsyncCommand {
         let args_ref: Vec<&str> = self.up_args.iter().map(|s| s.as_str()).collect();
-        build_compose_cmd(&self.work_dir, &args_ref, &self.file, &self.env_files, &self.services, self.temp_env_file.as_deref())
+        build_compose_cmd(&self.work_dir, &self.project, &args_ref, &self.file, &self.env_files, &self.services, self.temp_env_file.as_deref())
     }
 }
 
@@ -1235,18 +1247,71 @@ fn compose_project_name(work_dir: &Path) -> String {
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("work");
-    let sanitized: String = base
+    match sanitize_project_name(base) {
+        Some(name) => name,
+        None => "work".to_string(),
+    }
+}
+
+/// Sanitize an arbitrary string to Docker's Compose project-name charset:
+/// lowercased, non-`[a-z0-9_-]` chars replaced with `_`, and leading
+/// non-alphanumerics trimmed (Docker requires the name to start with a letter
+/// or digit). Returns `None` if nothing valid remains (e.g. empty input or a
+/// name made entirely of invalid leading characters), so callers can decide on
+/// a fallback or rejection. This is the single source of truth for both the
+/// implicit working-directory default and any caller-provided override.
+fn sanitize_project_name(input: &str) -> Option<String> {
+    let sanitized: String = input
         .to_lowercase()
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
         .collect();
-    // Docker requires the name to start with a letter or number.
     let trimmed = sanitized.trim_start_matches(|c: char| !c.is_ascii_alphanumeric());
-    if trimmed.is_empty() { "work".to_string() } else { trimmed.to_string() }
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Resolve the Compose project name for an `up`/`down` request.
+///
+/// When the caller provides an explicit `project`, it is sanitized via
+/// `sanitize_project_name` and used in place of the working-directory default,
+/// letting the control plane scope each model under its own Compose project so
+/// a scoped recreate/`--remove-orphans` of one model can't orphan another.
+///
+/// We REJECT (returning `Err`) a provided name that, after sanitization, is
+/// empty/all-invalid, or that collides with a reserved name (`work` or
+/// `dstack`). `work` is the implicit default for `/app/work`, and `dstack` is
+/// the app-compose project that runs the infra sidecars (compose-manager, the
+/// launcher, certbot, datadog); letting an override land on either would point
+/// our `--remove-orphans` at containers we must never evict.
+///
+/// When `project` is `None`, behavior is EXACTLY as before: the
+/// working-directory basename default from `compose_project_name`.
+fn resolve_compose_project(project: Option<&str>, work_dir: &Path) -> Result<String, String> {
+    const RESERVED: [&str; 2] = ["work", "dstack"];
+    match project {
+        None => Ok(compose_project_name(work_dir)),
+        Some(raw) => {
+            let name = sanitize_project_name(raw).ok_or_else(|| {
+                format!("invalid compose project name {:?}: empty after sanitization", raw)
+            })?;
+            if RESERVED.contains(&name.as_str()) {
+                return Err(format!(
+                    "compose project name {:?} is reserved and cannot be overridden",
+                    name
+                ));
+            }
+            Ok(name)
+        }
+    }
 }
 
 fn build_compose_cmd(
     work_dir: &Path,
+    project: &str,
     args: &[&str],
     file: &str,
     env_files: &[String],
@@ -1256,8 +1321,11 @@ fn build_compose_cmd(
     let mut cmd = AsyncCommand::new("docker");
     // `-p` BEFORE the subcommand pins the project, overriding any leaked
     // COMPOSE_PROJECT_NAME so `--remove-orphans` can never reach the `dstack`
-    // app-compose project (launcher/certbot/datadog). See compose_project_name.
-    cmd.args(["compose", "-p", &compose_project_name(work_dir), "-f", file]);
+    // app-compose project (launcher/certbot/datadog). The project is resolved
+    // by the caller (default = working-directory basename via
+    // compose_project_name; optional override validated by
+    // resolve_compose_project). See compose_project_name.
+    cmd.args(["compose", "-p", project, "-f", file]);
     for ef in env_files {
         cmd.args(["--env-file", ef.as_str()]);
     }
@@ -1276,6 +1344,7 @@ fn build_compose_cmd(
 
 fn stream_docker_compose_phased(
     work_dir: &Path,
+    project: &str,
     phases: &[&[&str]],
     file: &str,
     env_files: &[String],
@@ -1288,6 +1357,7 @@ fn stream_docker_compose_phased(
 
     info!(
         command = "docker compose",
+        project = project,
         file = file,
         phases = ?phases,
         env_files = ?all_env_files,
@@ -1297,7 +1367,7 @@ fn stream_docker_compose_phased(
     );
 
     let mut commands: VecDeque<AsyncCommand> = phases.iter()
-        .map(|args| build_compose_cmd(work_dir, args, file, env_files, services, temp_env_file.as_deref()))
+        .map(|args| build_compose_cmd(work_dir, project, args, file, env_files, services, temp_env_file.as_deref()))
         .collect();
 
     let mut first_cmd = commands.pop_front()
@@ -1335,13 +1405,14 @@ fn stream_docker_compose_phased(
 
 fn stream_docker_compose(
     work_dir: &Path,
+    project: &str,
     args: &[&str],
     file: &str,
     env_files: &[String],
     services: &[String],
     temp_env_file: Option<PathBuf>,
 ) -> Result<NdjsonStream> {
-    stream_docker_compose_phased(work_dir, &[args], file, env_files, services, temp_env_file)
+    stream_docker_compose_phased(work_dir, project, &[args], file, env_files, services, temp_env_file)
 }
 
 // --- Handlers ---
@@ -1383,6 +1454,14 @@ async fn compose_up(
         }
     }
 
+    // Resolve the Compose project: default (working-dir basename) when omitted,
+    // otherwise a sanitized + validated override (rejects reserved names so
+    // `--remove-orphans` can't reach the `dstack`/`work` projects).
+    let project = match resolve_compose_project(payload.project.as_deref(), &state.work_dir) {
+        Ok(p) => p,
+        Err(msg) => return err_response(StatusCode::BAD_REQUEST, msg),
+    };
+
     // Fetch compose file from GitHub and write to work directory
     let content = match fetch_github_file(&state, &payload.tag, &file).await {
         Ok(c) => c,
@@ -1423,6 +1502,7 @@ async fn compose_up(
 
     let mut stream = match stream_docker_compose_phased(
         &state.work_dir,
+        &project,
         &[&["pull", "--ignore-buildable"], &["build"], &up_args],
         &file,
         &state.env_files,
@@ -1435,6 +1515,7 @@ async fn compose_up(
     stream.compose_guard = Some(guard);
     stream.endpoint_retry = Some(EndpointRetry {
         work_dir: state.work_dir.clone(),
+        project: project.clone(),
         up_args: up_args.iter().map(|s| s.to_string()).collect(),
         file: file.clone(),
         env_files: state.env_files.clone(),
@@ -1512,6 +1593,13 @@ async fn compose_down(
         }
     }
 
+    // Resolve the Compose project: default when omitted, else a validated
+    // override (see resolve_compose_project / compose_up).
+    let project = match resolve_compose_project(payload.project.as_deref(), &state.work_dir) {
+        Ok(p) => p,
+        Err(msg) => return err_response(StatusCode::BAD_REQUEST, msg),
+    };
+
     let mut args = vec!["down"];
     if payload.volumes {
         args.push("-v");
@@ -1528,6 +1616,7 @@ async fn compose_down(
 
     let mut stream = match stream_docker_compose(
         &state.work_dir,
+        &project,
         &args,
         &file,
         &state.env_files,
@@ -2566,6 +2655,55 @@ mod tests {
         assert_eq!(compose_project_name(Path::new("/srv/-weird")), "weird");
         // Degenerate basenames fall back to a safe default rather than "".
         assert_eq!(compose_project_name(Path::new("/")), "work");
+    }
+
+    #[test]
+    fn resolve_compose_project_defaults_when_omitted() {
+        // No override -> exactly the working-directory basename default, so
+        // omitting `project` reproduces today's behavior byte-for-byte.
+        assert_eq!(
+            resolve_compose_project(None, Path::new("/app/work")).unwrap(),
+            "work"
+        );
+    }
+
+    #[test]
+    fn resolve_compose_project_uses_and_sanitizes_override() {
+        // A valid override is used in place of the basename default, and the
+        // same sanitization (lowercase + invalid->'_' + trim leading) applies.
+        // `.` is not in Docker's project charset, so it becomes '_'.
+        assert_eq!(
+            resolve_compose_project(Some("GLM-5.1"), Path::new("/app/work")).unwrap(),
+            "glm-5_1"
+        );
+        assert_eq!(
+            resolve_compose_project(Some("My Model"), Path::new("/app/work")).unwrap(),
+            "my_model"
+        );
+        assert_eq!(
+            resolve_compose_project(Some("-leading"), Path::new("/app/work")).unwrap(),
+            "leading"
+        );
+    }
+
+    #[test]
+    fn resolve_compose_project_rejects_reserved_and_empty() {
+        // Reserved names would let `--remove-orphans` reach the infra/app-compose
+        // project, so they are rejected even when supplied with odd casing/chars.
+        assert!(resolve_compose_project(Some("work"), Path::new("/app/work")).is_err());
+        assert!(resolve_compose_project(Some("dstack"), Path::new("/app/work")).is_err());
+        assert!(resolve_compose_project(Some("WORK"), Path::new("/app/work")).is_err());
+        assert!(resolve_compose_project(Some("DStack"), Path::new("/app/work")).is_err());
+        // Empty / all-invalid names have nothing valid left after sanitization.
+        assert!(resolve_compose_project(Some(""), Path::new("/app/work")).is_err());
+        assert!(resolve_compose_project(Some("///"), Path::new("/app/work")).is_err());
+    }
+
+    #[test]
+    fn sanitize_project_name_returns_none_for_empty() {
+        assert_eq!(sanitize_project_name(""), None);
+        assert_eq!(sanitize_project_name("***"), None);
+        assert_eq!(sanitize_project_name("Valid-1"), Some("valid-1".to_string()));
     }
 
     fn temp_work_dir() -> PathBuf {
