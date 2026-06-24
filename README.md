@@ -20,6 +20,28 @@ Start containers with `docker compose up -d`.
 {"file": "docker-compose.prod.yml"}
 ```
 
+**`dry_run` (plan-only):** set `"dry_run": true` to PLAN a change without applying
+it. compose-manager simulates ONLY the `up` phase with docker compose's global
+`--dry-run`, so automation can see the per-service config-hash recreate verdict
+(which `file_sha256` cannot predict) before SIGTERMing a model mid-warmup. It is
+genuinely read-only: no action is recorded, no deployed state is written, and
+nothing is pulled/built/spawned. All scoping fields (`tag`, `file`, `project`,
+`services`, `env`, `force_recreate`) are honored so the plan reflects the EXACT
+command a real apply with the same body would run.
+
+The streamed NDJSON carries the RAW dry-run output lines (the documented
+contract) plus a terminal additive `plan` event with a best-effort parsed
+verdict:
+```json
+{"event":"plan","success":true,"exit_code":0,
+ "plan":{"create":["glm-vllm-1"],"recreate":[],"remove":["orphan-1"],"unchanged":["glm-nginx-1"]}}
+```
+The parsed `plan` is ADVISORY and Compose-version-sensitive (it keys on
+Compose's progress-writer status verbs); it is pinned to the
+`docker-compose-plugin` version in the attested image
+(`5.1.4-1~debian.12~bookworm`; see Dockerfile). Read the raw lines, not `plan`,
+when you need a guarantee.
+
 ### POST /compose/down
 Stop containers with `docker compose down`.
 

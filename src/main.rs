@@ -648,6 +648,16 @@ struct ComposeRequest {
     /// under its own project. See `resolve_compose_project`.
     #[serde(default)]
     project: Option<String>,
+    /// PLAN-only mode. When true, simulate the `up` with docker compose's global
+    /// `--dry-run` and report what WOULD recreate, WITHOUT applying anything.
+    /// Genuinely read-only: no action recorded, no deployed_* / deployed.json
+    /// write, nothing pulled/built/spawned. Lets automation see the per-service
+    /// config-hash recreate verdict (which file_sha256 cannot predict) before
+    /// SIGTERMing a model mid-warmup. Honors all scoping fields (tag/file/
+    /// project/services/env/force_recreate) so the plan reflects the EXACT
+    /// command a real apply with the same body would run. See `compose_up`.
+    #[serde(default)]
+    dry_run: bool,
 }
 
 #[derive(Deserialize)]
@@ -1090,7 +1100,9 @@ struct EndpointRetry {
 impl EndpointRetry {
     fn build_cmd(&self) -> AsyncCommand {
         let args_ref: Vec<&str> = self.up_args.iter().map(|s| s.as_str()).collect();
-        build_compose_cmd(&self.work_dir, &self.project, &args_ref, &self.file, &self.env_files, &self.services, self.temp_env_file.as_deref())
+        // A retry is always a REAL apply (the endpoint-conflict recovery only
+        // fires on a non-dry-run up), so dry_run=false.
+        build_compose_cmd(&self.work_dir, &self.project, &args_ref, &self.file, &self.env_files, &self.services, self.temp_env_file.as_deref(), false)
     }
 }
 
@@ -1108,6 +1120,79 @@ fn parse_endpoint_errors(lines: &VecDeque<String>) -> Vec<(String, String)> {
         if container.is_empty() || network.is_empty() { return None; }
         Some((network, container))
     }).collect()
+}
+
+/// ADVISORY parsed verdict of a `docker compose --dry-run up`. The RAW dry-run
+/// output lines (streamed as ordinary `stdout`/`stderr` events) are the
+/// DOCUMENTED contract; this parse is a best-effort convenience overlay.
+///
+/// VERSION-SENSITIVE: it keys on Compose's progress-writer status verbs
+/// (`Creating`/`Recreate`/`Removing`/`Running`…), whose exact wording can shift
+/// between Compose releases. It is pinned to the docker-compose-plugin version
+/// shipped in the attested image (5.1.4-1~debian.12~bookworm; see Dockerfile).
+/// Automation that needs a guarantee must read the raw lines, not this field.
+#[derive(Serialize, Default, PartialEq, Debug)]
+struct DryRunPlan {
+    create: Vec<String>,
+    recreate: Vec<String>,
+    remove: Vec<String>,
+    unchanged: Vec<String>,
+}
+
+/// Parse a `docker compose --dry-run up` transcript into an advisory plan.
+///
+/// Compose's progress writer emits one resource line per container of the form
+/// `[DRY-RUN MODE - ] <resource-name>  <Verb>` (it goes to stderr; the leading
+/// `DRY-RUN MODE -` prefix and surrounding whitespace vary). We bucket by the
+/// trailing verb: `Creating`/`Created` -> create (new container);
+/// `Recreate`/`Recreated` -> recreate (config-hash changed);
+/// `Removing`/`Removed` -> remove (e.g. `--remove-orphans`);
+/// `Running`/`Started`/`Skipped` -> unchanged (already up to date).
+///
+/// A resource is recorded once, by the STRONGEST verb seen for it (recreate >
+/// create > remove > unchanged), so paired progress lines (Creating then
+/// Created) don't double-count.
+fn parse_dry_run_plan(lines: &[String]) -> DryRunPlan {
+    use std::collections::BTreeMap;
+    // 3 = recreate, 2 = create, 1 = remove, 0 = unchanged. Highest wins.
+    let mut rank: BTreeMap<String, u8> = BTreeMap::new();
+    for raw in lines {
+        // Strip the dry-run prefix if present, then split off the trailing verb.
+        let line = raw
+            .split_once("DRY-RUN MODE -")
+            .map(|(_, rest)| rest)
+            .unwrap_or(raw)
+            .trim();
+        if line.is_empty() {
+            continue;
+        }
+        let (name, verb) = match line.rsplit_once(char::is_whitespace) {
+            Some((n, v)) => (n.trim(), v.trim()),
+            None => continue,
+        };
+        if name.is_empty() {
+            continue;
+        }
+        let weight = match verb {
+            "Recreate" | "Recreated" => 3u8,
+            "Creating" | "Created" => 2,
+            "Removing" | "Removed" => 1,
+            "Running" | "Started" | "Skipped" => 0,
+            _ => continue,
+        };
+        let entry = rank.entry(name.to_string()).or_insert(0);
+        *entry = (*entry).max(weight);
+    }
+    let mut plan = DryRunPlan::default();
+    for (name, weight) in rank {
+        match weight {
+            3 => plan.recreate.push(name),
+            2 => plan.create.push(name),
+            1 => plan.remove.push(name),
+            _ => plan.unchanged.push(name),
+        }
+    }
+    plan
 }
 
 #[derive(Serialize)]
@@ -1140,6 +1225,15 @@ struct NdjsonStream {
     /// If set, a failed phase will check stderr_tail for stale-endpoint errors.
     /// On match: disconnect the endpoint(s) and retry `up` once.
     endpoint_retry: Option<EndpointRetry>,
+    /// When `Some`, this stream is a `--dry-run` plan: every stdout+stderr line
+    /// is also accumulated here so a terminal additive `plan` event can carry an
+    /// advisory parsed verdict (the RAW lines remain the contract). `None` for
+    /// every real (mutating) stream, which is then byte-identical to before.
+    dry_run_lines: Option<Vec<String>>,
+    /// A pre-rendered terminal NDJSON line (`done`) buffered so an additive
+    /// terminal event (e.g. the dry-run `plan`) can be emitted on the poll
+    /// BEFORE `done`. Emitted on the next poll, after which the stream finishes.
+    pending_terminal: Option<String>,
 }
 
 impl Stream for NdjsonStream {
@@ -1152,6 +1246,14 @@ impl Stream for NdjsonStream {
             return Poll::Ready(None);
         }
 
+        // A buffered terminal line (e.g. `done`, deferred so an additive
+        // terminal event like the dry-run `plan` could be emitted first). Once
+        // this flushes the stream is finished.
+        if let Some(line) = this.pending_terminal.take() {
+            this.done = true;
+            return Poll::Ready(Some(Ok(line)));
+        }
+
         // Poll stderr first
         if let Some(ref mut stderr) = this.stderr {
             match Pin::new(stderr).poll_next_line(cx) {
@@ -1160,6 +1262,11 @@ impl Stream for NdjsonStream {
                     this.stderr_tail.push_back(line.clone());
                     if this.stderr_tail.len() > 30 {
                         this.stderr_tail.pop_front();
+                    }
+                    // Compose's dry-run progress goes to stderr; collect for the
+                    // advisory plan parse on a dry-run stream.
+                    if let Some(buf) = this.dry_run_lines.as_mut() {
+                        buf.push(line.clone());
                     }
                     let event = NdjsonEvent {
                         event: "stderr".into(),
@@ -1183,6 +1290,11 @@ impl Stream for NdjsonStream {
         if let Some(ref mut stdout) = this.stdout {
             match Pin::new(stdout).poll_next_line(cx) {
                 Poll::Ready(Ok(Some(line))) => {
+                    // Some Compose builds also surface dry-run plan lines on
+                    // stdout; collect those too for the advisory plan parse.
+                    if let Some(buf) = this.dry_run_lines.as_mut() {
+                        buf.push(line.clone());
+                    }
                     let event = NdjsonEvent {
                         event: "stdout".into(),
                         data: Some(line),
@@ -1288,7 +1400,12 @@ impl Stream for NdjsonStream {
                             }
                         }
 
-                        this.done = true;
+                        // NOTE: `done` is NOT necessarily set here. When this is a
+                        // dry-run stream we emit an additive `plan` event now and
+                        // buffer the `done` line in `pending_terminal`, flushing it
+                        // (and setting `done`) on the next poll. For every other
+                        // (real) stream the behavior is unchanged: `done` is set
+                        // and emitted immediately below.
 
                         // Notify Slack with the real outcome now that the
                         // streaming op has finished (best-effort, non-blocking).
@@ -1354,15 +1471,35 @@ impl Stream for NdjsonStream {
                             let _ = std::fs::remove_file(path);
                         }
 
-                        let event = NdjsonEvent {
+                        // Render the terminal `done` line up front.
+                        let done_event = NdjsonEvent {
                             event: "done".into(),
                             data: None,
                             success: Some(status.success()),
                             exit_code: status.code(),
                         };
-                        let mut json = serde_json::to_string(&event).unwrap();
-                        json.push('\n');
-                        return Poll::Ready(Some(Ok(json)));
+                        let mut done_json = serde_json::to_string(&done_event).unwrap();
+                        done_json.push('\n');
+
+                        // Dry-run: emit the advisory `plan` first, defer `done`.
+                        if let Some(lines) = this.dry_run_lines.take() {
+                            let plan = parse_dry_run_plan(&lines);
+                            let plan_line = serde_json::json!({
+                                "event": "plan",
+                                "success": status.success(),
+                                "exit_code": status.code(),
+                                "plan": plan,
+                            });
+                            let mut plan_json = serde_json::to_string(&plan_line).unwrap();
+                            plan_json.push('\n');
+                            // Buffer `done` for the next poll; this stream stays
+                            // not-done so the top-of-poll flush can emit it.
+                            this.pending_terminal = Some(done_json);
+                            return Poll::Ready(Some(Ok(plan_json)));
+                        }
+
+                        this.done = true;
+                        return Poll::Ready(Some(Ok(done_json)));
                     }
                     Poll::Ready(Err(e)) => {
                         this.done = true;
@@ -1502,6 +1639,7 @@ fn resolve_compose_project(project: Option<&str>, work_dir: &Path) -> Result<Str
     }
 }
 
+#[allow(clippy::too_many_arguments)] // cohesive compose-invocation builder
 fn build_compose_cmd(
     work_dir: &Path,
     project: &str,
@@ -1510,6 +1648,7 @@ fn build_compose_cmd(
     env_files: &[String],
     services: &[String],
     temp_env_file: Option<&Path>,
+    dry_run: bool,
 ) -> AsyncCommand {
     let mut cmd = AsyncCommand::new("docker");
     // `-p` BEFORE the subcommand pins the project, overriding any leaked
@@ -1518,7 +1657,16 @@ fn build_compose_cmd(
     // by the caller (default = working-directory basename via
     // compose_project_name; optional override validated by
     // resolve_compose_project). See compose_project_name.
-    cmd.args(["compose", "-p", project, "-f", file]);
+    //
+    // `--dry-run` is docker compose's GLOBAL flag and MUST sit right after the
+    // `compose` word (before the subcommand). It makes the whole invocation
+    // simulate only — Compose computes the per-service resolved config-hash and
+    // prints what WOULD create/recreate/remove without touching any container.
+    cmd.arg("compose");
+    if dry_run {
+        cmd.arg("--dry-run");
+    }
+    cmd.args(["-p", project, "-f", file]);
     for ef in env_files {
         cmd.args(["--env-file", ef.as_str()]);
     }
@@ -1535,6 +1683,7 @@ fn build_compose_cmd(
     cmd
 }
 
+#[allow(clippy::too_many_arguments)] // cohesive compose-invocation builder
 fn stream_docker_compose_phased(
     work_dir: &Path,
     project: &str,
@@ -1543,6 +1692,7 @@ fn stream_docker_compose_phased(
     env_files: &[String],
     services: &[String],
     temp_env_file: Option<PathBuf>,
+    dry_run: bool,
 ) -> Result<NdjsonStream> {
     let all_env_files: Vec<&str> = env_files.iter().map(|s| s.as_str())
         .chain(temp_env_file.as_ref().map(|p| p.to_str().unwrap()))
@@ -1560,7 +1710,7 @@ fn stream_docker_compose_phased(
     );
 
     let mut commands: VecDeque<AsyncCommand> = phases.iter()
-        .map(|args| build_compose_cmd(work_dir, project, args, file, env_files, services, temp_env_file.as_deref()))
+        .map(|args| build_compose_cmd(work_dir, project, args, file, env_files, services, temp_env_file.as_deref(), dry_run))
         .collect();
 
     let mut first_cmd = commands.pop_front()
@@ -1593,6 +1743,8 @@ fn stream_docker_compose_phased(
         completion: None,
         stderr_tail: VecDeque::new(),
         endpoint_retry: None,
+        dry_run_lines: if dry_run { Some(Vec::new()) } else { None },
+        pending_terminal: None,
     })
 }
 
@@ -1605,7 +1757,9 @@ fn stream_docker_compose(
     services: &[String],
     temp_env_file: Option<PathBuf>,
 ) -> Result<NdjsonStream> {
-    stream_docker_compose_phased(work_dir, project, &[args], file, env_files, services, temp_env_file)
+    // compose_down is always a real apply (never dry-run); dry_run is an `up`
+    // affordance only.
+    stream_docker_compose_phased(work_dir, project, &[args], file, env_files, services, temp_env_file, false)
 }
 
 // --- Handlers ---
@@ -1693,6 +1847,37 @@ async fn compose_up(
         up_args.push("--force-recreate");
     }
 
+    // PLAN-only (dry_run): genuinely read-only. We simulate ONLY the `up` phase
+    // with docker compose's global `--dry-run` (the recreate verdict comes from
+    // up's per-service config-hash; the pull/build dry-run output is noise per
+    // the audit), and STOP. We do NOT record an action, NOT write deployed_* or
+    // deployed.json, and attach NO completion (no Slack, no deployed rotation)
+    // and NO endpoint_retry (recovery only makes sense for a real apply).
+    // Nothing mutates, spawns, pulls, builds, or writes the action log. All
+    // scoping fields (tag/file/project/services/env/force_recreate) are honored
+    // so the plan reflects the EXACT command a real apply with this body runs.
+    if payload.dry_run {
+        let mut stream = match stream_docker_compose_phased(
+            &state.work_dir,
+            &project,
+            &[&up_args],
+            &file,
+            &state.env_files,
+            &payload.services,
+            temp_env_file,
+            true, // --dry-run
+        ) {
+            Ok(s) => s,
+            Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        };
+        stream.compose_guard = Some(guard);
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/x-ndjson")
+            .body(Body::from_stream(stream))
+            .unwrap();
+    }
+
     let mut stream = match stream_docker_compose_phased(
         &state.work_dir,
         &project,
@@ -1701,6 +1886,7 @@ async fn compose_up(
         &state.env_files,
         &payload.services,
         temp_env_file,
+        false,
     ) {
         Ok(s) => s,
         Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
@@ -3878,6 +4064,103 @@ mod tests {
         };
         let json = serde_json::to_string(&empty).unwrap();
         assert_eq!(json, r#"{"status":"ok","tag":"v1"}"#);
+    }
+
+    // --- dry_run (Commit B) ---
+
+    fn cmd_args(cmd: &AsyncCommand) -> Vec<String> {
+        cmd.as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn dry_run_flag_sits_right_after_compose() {
+        // --dry-run is a GLOBAL flag and MUST precede the subcommand (`up`).
+        let cmd = build_compose_cmd(
+            Path::new("/tmp"),
+            "glm",
+            &["up", "-d", "--remove-orphans"],
+            "f.yml",
+            &[],
+            &[],
+            None,
+            true,
+        );
+        let args = cmd_args(&cmd);
+        assert_eq!(args[0], "compose");
+        assert_eq!(args[1], "--dry-run", "global flag must immediately follow `compose`");
+        assert_eq!(args[2], "-p");
+        // The subcommand still comes after -p/-f.
+        assert!(args.iter().position(|a| a == "up").unwrap() > args.iter().position(|a| a == "--dry-run").unwrap());
+    }
+
+    #[test]
+    fn non_dry_run_command_has_no_dry_run_flag() {
+        let cmd = build_compose_cmd(
+            Path::new("/tmp"),
+            "glm",
+            &["up", "-d"],
+            "f.yml",
+            &[],
+            &[],
+            None,
+            false,
+        );
+        let args = cmd_args(&cmd);
+        assert!(!args.iter().any(|a| a == "--dry-run"), "real apply must never carry --dry-run");
+        assert_eq!(args[0], "compose");
+        assert_eq!(args[1], "-p");
+    }
+
+    #[test]
+    fn parse_dry_run_plan_buckets_each_verb() {
+        // Compose's progress writer style, including the DRY-RUN MODE prefix.
+        let lines = vec![
+            "DRY-RUN MODE -  glm-vllm-1  Creating".to_string(),
+            "DRY-RUN MODE -  glm-proxy-1  Recreate".to_string(),
+            "DRY-RUN MODE -  glm-old-1  Removing".to_string(),
+            "DRY-RUN MODE -  glm-nginx-1  Running".to_string(),
+        ];
+        let plan = parse_dry_run_plan(&lines);
+        assert_eq!(plan.create, vec!["glm-vllm-1"]);
+        assert_eq!(plan.recreate, vec!["glm-proxy-1"]);
+        assert_eq!(plan.remove, vec!["glm-old-1"]);
+        assert_eq!(plan.unchanged, vec!["glm-nginx-1"]);
+    }
+
+    #[test]
+    fn parse_dry_run_plan_remove_orphans_and_strongest_verb_wins() {
+        // The `remove` case from `--remove-orphans` with an EMPTY services[]:
+        // an orphan container shows a Removing line; an unchanged one shows
+        // Running. Paired progress lines (Creating then Created) must not
+        // double-count — the strongest verb for a name wins.
+        let lines = vec![
+            "orphan-1  Removing".to_string(),
+            "orphan-1  Removed".to_string(),
+            "svc-1  Creating".to_string(),
+            "svc-1  Created".to_string(),
+            "svc-2  Running".to_string(),
+            // A later Recreate for svc-2 must upgrade it past unchanged.
+            "svc-2  Recreate".to_string(),
+            "noise that is not a status line".to_string(),
+            "".to_string(),
+        ];
+        let plan = parse_dry_run_plan(&lines);
+        assert_eq!(plan.remove, vec!["orphan-1"]);
+        assert_eq!(plan.create, vec!["svc-1"]);
+        assert_eq!(plan.recreate, vec!["svc-2"]);
+        assert!(plan.unchanged.is_empty(), "svc-2 upgraded to recreate, not left unchanged");
+    }
+
+    #[test]
+    fn dry_run_plan_serializes_with_all_four_buckets() {
+        // The advisory plan always serializes all four arrays (empty when none),
+        // so the contract shape is stable for the reconciler.
+        let plan = DryRunPlan::default();
+        let json = serde_json::to_string(&plan).unwrap();
+        assert_eq!(json, r#"{"create":[],"recreate":[],"remove":[],"unchanged":[]}"#);
     }
 
     #[test]
