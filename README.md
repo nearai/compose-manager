@@ -74,6 +74,37 @@ Returns the currently running mutating Docker/Compose operation, if any.
 }
 ```
 
+### GET /host/gpu
+Read-only per-GPU allocation map for this host, for the control plane to plan GPU usage. Never mutates state and never takes the compose lock.
+
+The authoritative source is Docker: for each running container, the handler reads the NVIDIA GPU reservation (`HostConfig.DeviceRequests[*].DeviceIDs` and the `NVIDIA_VISIBLE_DEVICES` env) and maps each numeric GPU index to the containers claiming it. Non-numeric device IDs (UUIDs) and `all` are ignored since they can't be mapped to a GPU index.
+
+Per-GPU `memory_total_mb` / `memory_used_mb` / `utilization_pct` are a best-effort overlay from `nvidia-smi --query-gpu=index,memory.total,memory.used,utilization.gpu --format=csv,noheader,nounits` (tried directly first, then via `nsenter` into PID 1). If `nvidia-smi` is unreachable both ways, those fields are simply omitted — the endpoint still returns the Docker-derived allocation and never 500s.
+
+**Response:**
+```json
+{"gpus": [
+  {"index": 0, "memory_total_mb": 81920, "memory_used_mb": 41234, "utilization_pct": 92, "claimed_by": ["vllm"]},
+  {"index": 1, "claimed_by": []}
+]}
+```
+
+### GET /host/cache
+Read-only state of model-weight and kernel caches on this host, for deciding what weights/caches to pre-stage. Never mutates state.
+
+Enumerates Docker volumes whose names contain a cache marker (`huggingface_cache`, `hugginface_cache` (known fleet typo), `vllm_cache`, `compile_cache`, `kernel_cache`, `deep_gemm`). Per-volume `size_bytes` is a best-effort parse of `docker system df -v` (omitted if unparseable). `weights` lists the `models--*` entries under `hub/` in the HuggingFace cache volume(s), read via a throwaway `docker run --rm -v <vol>:/v:ro alpine ls /v/hub`. Every step degrades gracefully — a missing volume or unparseable size just drops that field/entry.
+
+**Response:**
+```json
+{
+  "volumes": [
+    {"name": "huggingface_cache", "size_bytes": 120000000000},
+    {"name": "vllm_cache"}
+  ],
+  "weights": ["models--Qwen--Qwen2.5-7B", "models--meta-llama--Llama-3.1-8B"]
+}
+```
+
 ### POST /dstack-agent/:action
 Manage the `dstack-guest-agent.service` running on the CVM host. Supported actions: `start`, `stop`, `restart`, `status`.
 

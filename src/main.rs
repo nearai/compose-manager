@@ -522,6 +522,16 @@ fn err_response(code: StatusCode, msg: impl Into<String>) -> Response {
         .unwrap()
 }
 
+/// 200 OK with an arbitrary JSON body. Used by the read-only host-observability
+/// endpoints whose shapes don't fit `StatusResponse`.
+fn json_ok(value: serde_json::Value) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "application/json")
+        .body(Body::from(value.to_string()))
+        .unwrap()
+}
+
 #[derive(Deserialize)]
 struct ComposeRequest {
     tag: String,
@@ -2212,6 +2222,424 @@ async fn dstack_agent_action(
     ok_systemctl(combined, result.exit_code)
 }
 
+// --- Host observability (read-only) ---
+//
+// Two GET endpoints that let the control plane build a GPU allocation map and
+// decide what model weights / kernel caches to pre-stage. Both are strictly
+// read-only: they shell out to `docker` (and best-effort `nvidia-smi`) but
+// never mutate state, never touch a deploy, and never take the compose lock.
+// They MUST NOT 500 just because an optional data source (nvidia-smi, a cache
+// volume) is missing — optional fields are simply omitted instead.
+
+#[derive(Serialize)]
+struct GpuInfo {
+    index: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    memory_total_mb: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    memory_used_mb: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    utilization_pct: Option<u32>,
+    /// Container names that reserve this GPU (derived from docker, the
+    /// authoritative source). Empty = the GPU is free / unclaimed.
+    claimed_by: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct CacheVolume {
+    name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size_bytes: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct HostCacheResponse {
+    volumes: Vec<CacheVolume>,
+    /// `models--org--repo` entries found under `hub/` in the HF cache volume(s).
+    weights: Vec<String>,
+}
+
+/// Substrings that mark a docker volume as a model-weight / kernel cache. The
+/// HuggingFace typo (`hugginface_cache`) genuinely exists in the fleet next to
+/// the correct spelling, so both must match.
+const CACHE_VOLUME_MARKERS: &[&str] = &[
+    "huggingface_cache",
+    "hugginface_cache",
+    "vllm_cache",
+    "compile_cache",
+    "kernel_cache",
+    "deep_gemm",
+];
+
+/// Substrings identifying the HuggingFace cache volume(s) we enumerate weights
+/// from. A subset of CACHE_VOLUME_MARKERS — the HF hub layout (`hub/models--*`)
+/// only exists in these.
+const HF_VOLUME_MARKERS: &[&str] = &["huggingface_cache", "hugginface_cache"];
+
+/// Whether a string matches docker's volume-name grammar
+/// (`[a-zA-Z0-9][a-zA-Z0-9_.-]*`). Used to refuse interpolating an unexpected
+/// name (leading `/`, spaces, `:`) into a `-v <name>:/v:ro` mount spec, where
+/// it could be reinterpreted as a bind-mount path. Defense-in-depth: docker
+/// already enforces this on creation, but we never trust the input verbatim.
+fn is_valid_docker_volume_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphanumeric() => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-')
+}
+
+/// Subprocess timeout for the read-only host-observability helpers. A hung
+/// docker daemon or a wedged nvidia-smi (common with broken GPU drivers) must
+/// not pin a request handler forever — bound it like the systemctl/algif paths
+/// already do.
+const HOST_OBSERVE_CMD_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Run a program async and return stdout on a zero exit, or None on
+/// failure/non-zero exit/timeout. Timeout-bounded (HOST_OBSERVE_CMD_TIMEOUT).
+async fn run_bounded(program: &str, args: &[&str]) -> Option<String> {
+    let fut = AsyncCommand::new(program).args(args).output();
+    match tokio::time::timeout(HOST_OBSERVE_CMD_TIMEOUT, fut).await {
+        Ok(Ok(out)) => out
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).to_string()),
+        Ok(Err(_)) => None,
+        Err(_) => {
+            warn!(program = program, args = ?args, timeout_secs = HOST_OBSERVE_CMD_TIMEOUT.as_secs(), "host-observe command timed out");
+            None
+        }
+    }
+}
+
+/// Run `docker <args>` async and return stdout, or None on failure/non-zero
+/// exit/timeout. Mirrors `docker_inspect_output` but keeps empty stdout
+/// (callers distinguish "ran, no output" from "failed to run").
+async fn docker_stdout(args: &[&str]) -> Option<String> {
+    run_bounded("docker", args).await
+}
+
+/// Parse the GPU device indices a single container reserves, from its
+/// `docker inspect` JSON. Reads both `HostConfig.DeviceRequests[*].DeviceIDs`
+/// (the `--gpus`/`device_requests` form) and the `NVIDIA_VISIBLE_DEVICES` env
+/// var. Returns the numeric indices found; "all"/"void"/"none" and non-numeric
+/// UUID device IDs are ignored (we can only map numeric indices to nvidia-smi).
+fn gpu_indices_from_inspect(inspect: &serde_json::Value) -> Vec<u32> {
+    let mut indices = Vec::new();
+    let mut push = |s: &str| {
+        for tok in s.split(',') {
+            if let Ok(n) = tok.trim().parse::<u32>() {
+                if !indices.contains(&n) {
+                    indices.push(n);
+                }
+            }
+        }
+    };
+
+    // `docker inspect` returns a top-level array; take the first element.
+    let container = inspect.get(0).unwrap_or(inspect);
+
+    if let Some(reqs) = container
+        .pointer("/HostConfig/DeviceRequests")
+        .and_then(|v| v.as_array())
+    {
+        for req in reqs {
+            if let Some(ids) = req.get("DeviceIDs").and_then(|v| v.as_array()) {
+                for id in ids.iter().filter_map(|v| v.as_str()) {
+                    push(id);
+                }
+            }
+        }
+    }
+
+    if let Some(envs) = container.pointer("/Config/Env").and_then(|v| v.as_array()) {
+        for e in envs.iter().filter_map(|v| v.as_str()) {
+            if let Some(val) = e.strip_prefix("NVIDIA_VISIBLE_DEVICES=") {
+                push(val);
+            }
+        }
+    }
+
+    indices
+}
+
+/// Parse `nvidia-smi --query-gpu=index,memory.total,memory.used,utilization.gpu
+/// --format=csv,noheader,nounits` output into (index -> (total_mb, used_mb,
+/// util_pct)). Lines that don't parse are skipped (best-effort).
+fn parse_nvidia_smi(out: &str) -> HashMap<u32, (u64, u64, u32)> {
+    let mut map = HashMap::new();
+    for line in out.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let cols: Vec<&str> = line.split(',').map(str::trim).collect();
+        if cols.len() != 4 {
+            continue;
+        }
+        if let (Ok(idx), Ok(total), Ok(used), Ok(util)) = (
+            cols[0].parse::<u32>(),
+            cols[1].parse::<u64>(),
+            cols[2].parse::<u64>(),
+            cols[3].parse::<u32>(),
+        ) {
+            map.insert(idx, (total, used, util));
+        }
+    }
+    map
+}
+
+const NVIDIA_SMI_ARGS: &[&str] = &[
+    "--query-gpu=index,memory.total,memory.used,utilization.gpu",
+    "--format=csv,noheader,nounits",
+];
+
+/// Best-effort nvidia-smi query. Tries the binary directly first; if that
+/// fails (not on PATH inside the container), falls back to entering PID 1's
+/// namespaces via the same nsenter pattern the host-systemctl path uses.
+/// Returns None when nvidia-smi is unreachable either way — callers then omit
+/// the memory/util fields rather than failing.
+async fn query_nvidia_smi() -> Option<HashMap<u32, (u64, u64, u32)>> {
+    if let Some(out) = docker_smi_direct().await {
+        return Some(parse_nvidia_smi(&out));
+    }
+    if let Some(out) = nvidia_smi_via_nsenter().await {
+        return Some(parse_nvidia_smi(&out));
+    }
+    None
+}
+
+async fn docker_smi_direct() -> Option<String> {
+    run_bounded("nvidia-smi", NVIDIA_SMI_ARGS).await
+}
+
+async fn nvidia_smi_via_nsenter() -> Option<String> {
+    let mut args = vec!["-t", "1", "-m", "-u", "-i", "-n", "-p", "--", "nvidia-smi"];
+    args.extend_from_slice(NVIDIA_SMI_ARGS);
+    run_bounded("nsenter", &args).await
+}
+
+/// GET /host/gpu — per-GPU allocation (docker-derived, authoritative) plus
+/// best-effort nvidia-smi utilization. Never 500s on a missing nvidia-smi.
+async fn host_gpu(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err((code, msg)) = verify_bearer_token_raw(&headers, &state.bearer_token) {
+        return err_response(code, msg);
+    }
+
+    // Authoritative source: which container reserves which GPU index.
+    // gpu_index -> [container names]. BTreeMap keeps the output index-ordered.
+    let mut claims: std::collections::BTreeMap<u32, Vec<String>> = std::collections::BTreeMap::new();
+
+    // docker ps failing (daemon down, permission denied) would silently make
+    // every GPU look unclaimed — dangerous for a scheduler reading this as the
+    // authoritative claim source. Log it loudly so it isn't mistaken for "free".
+    let names: Vec<String> = match docker_stdout(&["ps", "--format", "{{.Names}}"]).await {
+        Some(out) => out
+            .lines()
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .map(String::from)
+            .collect(),
+        None => {
+            warn!("docker ps failed — GPU claim data is unreliable (all GPUs will appear unclaimed)");
+            Vec::new()
+        }
+    };
+
+    // Batch: inspect all running containers in a single `docker inspect` call
+    // to avoid N sequential subprocess invocations. The result is a JSON array
+    // whose elements carry `.Name` ("/container") so we can attribute claims.
+    if !names.is_empty() {
+        let mut args: Vec<&str> = vec!["inspect"];
+        args.extend(names.iter().map(String::as_str));
+        if let Some(json) = docker_stdout(&args).await {
+            if let Ok(serde_json::Value::Array(items)) =
+                serde_json::from_str::<serde_json::Value>(&json)
+            {
+                for item in &items {
+                    let name = item
+                        .get("Name")
+                        .and_then(|v| v.as_str())
+                        .map(|n| n.trim_start_matches('/').to_string())
+                        .unwrap_or_default();
+                    if name.is_empty() {
+                        continue;
+                    }
+                    for idx in gpu_indices_from_inspect(item) {
+                        claims.entry(idx).or_default().push(name.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    // Best-effort utilization/memory; degrade gracefully if nvidia-smi is gone.
+    let smi = query_nvidia_smi().await.unwrap_or_default();
+
+    // Union of indices seen via docker claims and via nvidia-smi, so a free GPU
+    // (claimed_by empty) still appears, and a claimed GPU shows even if smi is
+    // unavailable. BTreeSet dedups and keeps them index-ordered.
+    let mut index_set: std::collections::BTreeSet<u32> = claims.keys().copied().collect();
+    index_set.extend(smi.keys().copied());
+    let all_indices: Vec<u32> = index_set.into_iter().collect();
+
+    let gpus: Vec<GpuInfo> = all_indices
+        .into_iter()
+        .map(|index| {
+            let (memory_total_mb, memory_used_mb, utilization_pct) = match smi.get(&index) {
+                Some((t, u, util)) => (Some(*t), Some(*u), Some(*util)),
+                None => (None, None, None),
+            };
+            GpuInfo {
+                index,
+                memory_total_mb,
+                memory_used_mb,
+                utilization_pct,
+                claimed_by: claims.get(&index).cloned().unwrap_or_default(),
+            }
+        })
+        .collect();
+
+    json_ok(serde_json::json!({ "gpus": gpus }))
+}
+
+/// Parse `docker system df -v` (volumes section) into volume-name -> size in
+/// bytes. The output has a "Local Volumes space usage:" header, then a table
+/// whose first column is the volume name and whose last column is a human size
+/// (e.g. "12.3GB"). We key off first/last column rather than header offsets
+/// because the header label "VOLUME NAME" is two whitespace tokens but one data
+/// column, so positional header matching misaligns. Unparseable sizes yield no
+/// entry (size omitted downstream).
+fn parse_volume_sizes(df_output: &str) -> HashMap<String, u64> {
+    let mut sizes = HashMap::new();
+    let mut in_volumes = false;
+    let mut seen_header = false;
+    for line in df_output.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("Local Volumes space usage") {
+            in_volumes = true;
+            seen_header = false;
+            continue;
+        }
+        if !in_volumes {
+            continue;
+        }
+        // A blank line or a new "<X> space usage:" header ends the section.
+        if trimmed.is_empty() || trimmed.ends_with("space usage:") {
+            in_volumes = false;
+            continue;
+        }
+        if !seen_header {
+            // Skip the column-header row (the VOLUME NAME / LINKS / SIZE labels).
+            seen_header = true;
+            continue;
+        }
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if let (Some(name), Some(size_str)) = (cols.first(), cols.last()) {
+            if let Some(bytes) = parse_human_size(size_str) {
+                sizes.insert((*name).to_string(), bytes);
+            }
+        }
+    }
+    sizes
+}
+
+/// Parse a docker human-readable size ("12.3GB", "512MB", "0B", "1.5kB") to
+/// bytes. Returns None if unparseable. Uses decimal (1000) units, matching
+/// docker's `units.HumanSize`.
+fn parse_human_size(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let split = s.find(|c: char| c.is_ascii_alphabetic()).unwrap_or(s.len());
+    let (num, unit) = s.split_at(split);
+    let value: f64 = num.trim().parse().ok()?;
+    let mult: f64 = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1.0,
+        "kb" => 1e3,
+        "mb" => 1e6,
+        "gb" => 1e9,
+        "tb" => 1e12,
+        "pb" => 1e15,
+        _ => return None,
+    };
+    Some((value * mult) as u64)
+}
+
+/// GET /host/cache — cache volumes (with best-effort sizes) and the model
+/// weights present in the HF cache. Strictly read-only; never errors the host.
+async fn host_cache(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err((code, msg)) = verify_bearer_token_raw(&headers, &state.bearer_token) {
+        return err_response(code, msg);
+    }
+
+    // All volume names, then filter to the cache-marker subset.
+    let all_names = docker_stdout(&["volume", "ls", "--format", "{{.Name}}"])
+        .await
+        .unwrap_or_default();
+    let cache_names: Vec<String> = all_names
+        .lines()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .filter(|n| CACHE_VOLUME_MARKERS.iter().any(|m| n.contains(m)))
+        // Refuse names that don't match docker's grammar — they'd later be
+        // interpolated into a `-v <name>:/v:ro` mount spec.
+        .filter(|n| {
+            is_valid_docker_volume_name(n) || {
+                warn!(volume = %n, "skipping cache volume with unexpected name");
+                false
+            }
+        })
+        .map(String::from)
+        .collect();
+
+    // Best-effort per-volume sizes from `docker system df -v`.
+    let sizes = match docker_stdout(&["system", "df", "-v"]).await {
+        Some(out) => parse_volume_sizes(&out),
+        None => HashMap::new(),
+    };
+
+    let volumes: Vec<CacheVolume> = cache_names
+        .iter()
+        .map(|name| CacheVolume {
+            name: name.clone(),
+            size_bytes: sizes.get(name).copied(),
+        })
+        .collect();
+
+    // Enumerate model weights (`models--*`) in the HF cache volume(s) via a
+    // throwaway read-only container. Each `ls` is best-effort. BTreeSet dedups
+    // across volumes and keeps the output sorted. Names are already validated
+    // against docker's grammar above, so the mount spec is safe to build.
+    let mut weight_set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for name in cache_names
+        .iter()
+        .filter(|n| HF_VOLUME_MARKERS.iter().any(|m| n.contains(m)))
+    {
+        let mount = format!("{}:/v:ro", name);
+        if let Some(out) =
+            docker_stdout(&["run", "--rm", "-v", &mount, "alpine", "ls", "/v/hub"]).await
+        {
+            for entry in out.lines().map(str::trim) {
+                if entry.starts_with("models--") {
+                    weight_set.insert(entry.to_string());
+                }
+            }
+        }
+    }
+    let weights: Vec<String> = weight_set.into_iter().collect();
+
+    json_ok(serde_json::json!(HostCacheResponse { volumes, weights }))
+}
+
 // --- Shell Commands ---
 
 fn run_command(program: &str, args: &[&str]) -> Result<String> {
@@ -2551,6 +2979,8 @@ async fn main() -> Result<()> {
         .route("/docker/clean", post(docker_clean))
         .route("/docker/ps", get(docker_ps))
         .route("/docker/restart", post(docker_restart))
+        .route("/host/gpu", get(host_gpu))
+        .route("/host/cache", get(host_cache))
         .route("/status", get(status))
         .route("/dstack-agent/:action", post(dstack_agent_action))
         .route("/admin/kernel/algif-blacklist", post(algif_blacklist_action))
@@ -3303,6 +3733,80 @@ mod tests {
         let mut h2 = HeaderMap::new();
         h2.insert("X-Triggered-By", "   ".parse().unwrap());
         assert_eq!(extract_actor(&h2), "automation");
+    }
+
+    #[test]
+    fn gpu_indices_from_device_requests_and_env() {
+        // DeviceRequests numeric IDs + NVIDIA_VISIBLE_DEVICES env, deduped.
+        let v = serde_json::json!([{
+            "HostConfig": { "DeviceRequests": [{ "DeviceIDs": ["0", "1"] }] },
+            "Config": { "Env": ["FOO=bar", "NVIDIA_VISIBLE_DEVICES=1,2"] }
+        }]);
+        let mut idx = gpu_indices_from_inspect(&v);
+        idx.sort_unstable();
+        assert_eq!(idx, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn gpu_indices_ignores_non_numeric_and_all() {
+        // "all" / UUID device IDs aren't mappable to nvidia-smi indices.
+        let v = serde_json::json!([{
+            "HostConfig": { "DeviceRequests": [{ "DeviceIDs": ["GPU-abc"] }] },
+            "Config": { "Env": ["NVIDIA_VISIBLE_DEVICES=all"] }
+        }]);
+        assert!(gpu_indices_from_inspect(&v).is_empty());
+    }
+
+    #[test]
+    fn parse_nvidia_smi_rows() {
+        let out = "0, 81920, 1024, 33\n1, 81920, 40000, 95\nbad line\n";
+        let m = parse_nvidia_smi(out);
+        assert_eq!(m.get(&0), Some(&(81920u64, 1024u64, 33u32)));
+        assert_eq!(m.get(&1), Some(&(81920u64, 40000u64, 95u32)));
+        assert_eq!(m.len(), 2);
+    }
+
+    #[test]
+    fn parse_human_size_decimal_units() {
+        assert_eq!(parse_human_size("0B"), Some(0));
+        assert_eq!(parse_human_size("512MB"), Some(512_000_000));
+        assert_eq!(parse_human_size("1.5GB"), Some(1_500_000_000));
+        assert_eq!(parse_human_size("12.3kB"), Some(12_300));
+        assert_eq!(parse_human_size("garbage"), None);
+    }
+
+    #[test]
+    fn docker_volume_name_grammar() {
+        assert!(is_valid_docker_volume_name("huggingface_cache"));
+        assert!(is_valid_docker_volume_name("vllm-cache.1"));
+        assert!(is_valid_docker_volume_name("a"));
+        // Must start alphanumeric; no path/spaces/colons.
+        assert!(!is_valid_docker_volume_name("_leading"));
+        assert!(!is_valid_docker_volume_name("/etc/passwd"));
+        assert!(!is_valid_docker_volume_name("has space"));
+        assert!(!is_valid_docker_volume_name("name:with:colon"));
+        assert!(!is_valid_docker_volume_name(""));
+    }
+
+    #[test]
+    fn parse_volume_sizes_reads_local_volumes_table() {
+        let df = "\
+Images space usage:
+REPOSITORY  TAG  SIZE
+foo         a    100MB
+
+Local Volumes space usage:
+VOLUME NAME            LINKS     SIZE
+huggingface_cache      2         120GB
+vllm_cache             1         3.5GB
+
+Build cache usage: 0B
+";
+        let sizes = parse_volume_sizes(df);
+        assert_eq!(sizes.get("huggingface_cache"), Some(&120_000_000_000));
+        assert_eq!(sizes.get("vllm_cache"), Some(&3_500_000_000));
+        // The images-section row must not leak into volume sizes.
+        assert!(!sizes.contains_key("foo"));
     }
 
     /// Live end-to-end delivery against a real Slack incoming webhook. Ignored
