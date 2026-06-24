@@ -17,7 +17,7 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     process::Command,
-    sync::{Arc, Mutex as StdMutex},
+    sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock},
     task::{Context as TaskContext, Poll},
     time::Duration,
 };
@@ -151,14 +151,14 @@ fn load_actions_from_disk(work_dir: &Path) -> Vec<DeploymentAction> {
     }
 }
 
-/// The last *successfully* deployed tag/file/commit, persisted to `deployed.json`
-/// so /version (and the dashboard) keep showing it across a compose-manager
-/// restart — most commonly a launcher hot-swap, where the deployed fields would
-/// otherwise reset to blank until the next deploy. Written ONLY after a
-/// compose_up stream completes successfully (so a failed attempt never overwrites
-/// the last good deploy), and read once at startup.
-#[derive(Clone, Serialize, Deserialize, Default)]
-struct DeployedVersion {
+/// A single deployed tag/file/commit tuple for one Compose project.
+///
+/// Used both for the in-memory per-project state and as the on-disk
+/// `deployed.json` record. All fields are `Option` + `skip_serializing_if` so a
+/// record carrying only some fields (e.g. a legacy single-tuple) round-trips
+/// without injecting nulls.
+#[derive(Clone, Serialize, Deserialize, Default, PartialEq, Debug)]
+struct DeployedRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     tag: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -169,31 +169,104 @@ struct DeployedVersion {
     file_sha256: Option<String>,
 }
 
+/// Per-project deployed state: the `current` (last-successful) deploy plus the
+/// `previous` (last-known-good before it), so the external reconciler can read a
+/// rollback target. `previous` is omitted (serialized as absent) until the first
+/// successful re-deploy rotates a `current` into it.
+#[derive(Clone, Serialize, Deserialize, Default, PartialEq, Debug)]
+struct ProjectDeployed {
+    current: DeployedRecord,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous: Option<DeployedRecord>,
+}
+
+/// The default Compose project name a legacy single-tuple `deployed.json`
+/// migrates into. Matches the historical working-directory basename default
+/// (`/app/work` -> `work`); see `compose_project_name`.
+const LEGACY_PROJECT_KEY: &str = "work";
+
+/// Persisted per-project deployed state, written to `deployed.json`.
+///
+/// Post-#46 a CVM can run N Compose projects, so /version must report deployed
+/// state PER project rather than collapsing to one global tuple. Written ONLY
+/// after a compose_up stream completes successfully (so a failed attempt never
+/// overwrites the last good deploy), and read once at startup.
+///
+/// On-disk format is a JSON object keyed by project name:
+/// `{"<project>": {"current": {...}, "previous": {...}|absent}}`. A pre-existing
+/// LEGACY single-tuple `deployed.json` (`{"tag":...,"file":...}`) is migrated
+/// into `projects["work"].current` with `previous` absent — see
+/// `load_deployed_state`.
+#[derive(Clone, Serialize, Deserialize, Default, PartialEq, Debug)]
+struct DeployedState {
+    #[serde(flatten)]
+    projects: std::collections::BTreeMap<String, ProjectDeployed>,
+}
+
 fn deployed_version_file(work_dir: &Path) -> PathBuf {
     work_dir.join("deployed.json")
 }
 
-fn load_deployed_version(work_dir: &Path) -> DeployedVersion {
-    match std::fs::read_to_string(deployed_version_file(work_dir)) {
-        Ok(content) => serde_json::from_str(&content).unwrap_or_else(|e| {
-            error!(error = %e, "deployed.json is corrupt, ignoring");
-            DeployedVersion::default()
-        }),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => DeployedVersion::default(),
+/// Load the per-project deployed state from `deployed.json`.
+///
+/// Accepts BOTH the new per-project map format and the LEGACY single-tuple
+/// format written before this change. A legacy tuple is migrated into
+/// `projects["work"].current` (previous absent), since `work` was the only
+/// project that could exist pre-#46. A corrupt/unreadable file is ignored
+/// (empty state), exactly as the single-tuple loader did.
+fn load_deployed_state(work_dir: &Path) -> DeployedState {
+    let content = match std::fs::read_to_string(deployed_version_file(work_dir)) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return DeployedState::default(),
         Err(e) => {
             error!(error = %e, "Failed to read deployed.json, ignoring");
-            DeployedVersion::default()
+            return DeployedState::default();
         }
-    }
+    };
+    parse_deployed_state(&content).unwrap_or_else(|| {
+        error!("deployed.json is corrupt, ignoring");
+        DeployedState::default()
+    })
 }
 
-/// Persist the last successful deploy to `deployed.json`, synchronously, via a
-/// temp-file + atomic rename. Deliberately blocking (std::fs): the compose_up
+/// Parse `deployed.json` content, accepting the new per-project map OR a legacy
+/// single-tuple. Returns `None` only when the content is neither (corrupt).
+fn parse_deployed_state(content: &str) -> Option<DeployedState> {
+    // Try the new per-project map first. A legacy single-tuple
+    // (`{"tag":...}`) would deserialize here as a project named "tag" whose
+    // value is a string — which fails the ProjectDeployed shape — so the map
+    // parse rejects legacy input rather than silently mis-keying it.
+    if let Ok(state) = serde_json::from_str::<DeployedState>(content) {
+        // An empty `{}` legitimately parses as the new empty map; a legacy
+        // tuple with only e.g. `{"tag":"v1"}` would NOT (string value), so we
+        // can trust this branch for the new format.
+        if !state.projects.is_empty() || content.trim() == "{}" {
+            return Some(state);
+        }
+    }
+    // Fall back to the legacy single-tuple, migrating it into `work`.
+    if let Ok(legacy) = serde_json::from_str::<DeployedRecord>(content) {
+        if legacy != DeployedRecord::default() {
+            let mut projects = std::collections::BTreeMap::new();
+            projects.insert(
+                LEGACY_PROJECT_KEY.to_string(),
+                ProjectDeployed { current: legacy, previous: None },
+            );
+            return Some(DeployedState { projects });
+        }
+        // Empty legacy record (`{}`) -> empty state.
+        return Some(DeployedState::default());
+    }
+    None
+}
+
+/// Persist the per-project deployed state to `deployed.json`, synchronously, via
+/// a temp-file + atomic rename. Deliberately blocking (std::fs): the compose_up
 /// completion path calls this BEFORE emitting the terminal `done` event so the
 /// write is durable before the client is told the deploy succeeded — a detached
 /// async write could lose to an immediate restart. The file is tiny.
-fn persist_deployed_version(work_dir: &Path, v: &DeployedVersion) -> std::io::Result<()> {
-    let json = serde_json::to_string(v)
+fn persist_deployed_state(work_dir: &Path, state: &DeployedState) -> std::io::Result<()> {
+    let json = serde_json::to_string(state)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     let tmp = work_dir.join("deployed.json.tmp");
     std::fs::write(&tmp, &json)?;
@@ -202,15 +275,16 @@ fn persist_deployed_version(work_dir: &Path, v: &DeployedVersion) -> std::io::Re
 }
 
 /// Best-effort migration source for installs that predate `deployed.json`:
-/// derive a `DeployedVersion` from the most recent `compose_up` in the legacy
+/// derive a `DeployedRecord` from the most recent `compose_up` in the legacy
 /// action log. Legacy actions carry no success/failure outcome, so this is only
-/// used to seed `deployed.json` once when it's missing.
-fn deployed_version_from_actions(actions: &[DeploymentAction]) -> Option<DeployedVersion> {
+/// used to seed `deployed.json` once when it's missing. The result lands in the
+/// `work` project (legacy installs only ran the single default project).
+fn deployed_version_from_actions(actions: &[DeploymentAction]) -> Option<DeployedRecord> {
     actions
         .iter()
         .rev()
         .find(|a| a.action == "compose_up")
-        .map(|a| DeployedVersion {
+        .map(|a| DeployedRecord {
             tag: a.tag.clone(),
             commit: a.commit.clone(),
             file: a.file.clone(),
@@ -243,18 +317,25 @@ fn migration_marker_file(work_dir: &Path) -> PathBuf {
 fn migrate_legacy_deployed_version(
     work_dir: &Path,
     actions: &[DeploymentAction],
-) -> Option<DeployedVersion> {
+) -> Option<DeployedState> {
     let marker = migration_marker_file(work_dir);
     if marker.exists() {
         return None;
     }
-    let result = deployed_version_from_actions(actions);
+    let result = deployed_version_from_actions(actions).map(|current| {
+        let mut projects = std::collections::BTreeMap::new();
+        projects.insert(
+            LEGACY_PROJECT_KEY.to_string(),
+            ProjectDeployed { current, previous: None },
+        );
+        DeployedState { projects }
+    });
     if let Some(ref v) = result {
-        if let Err(e) = persist_deployed_version(work_dir, v) {
+        if let Err(e) = persist_deployed_state(work_dir, v) {
             error!(error = %e, "Failed to backfill deployed.json; will retry next boot");
             return result; // don't write the marker — retry on next boot
         }
-        info!(tag = ?v.tag, file = ?v.file, "Backfilled deployed.json from action log (one-shot legacy migration)");
+        info!("Backfilled deployed.json from action log (one-shot legacy migration)");
     }
     // Mark migration done so a later failed compose_up (pre-outcome action, no
     // deployed.json) is never backfilled. Best-effort.
@@ -391,10 +472,20 @@ struct AppState {
     /// Sourced from the `INSTANCE_LABEL` env var (templated to the ansible
     /// inventory hostname). Empty string falls back to "unknown-host".
     instance_label: String,
-    deployed_tag: RwLock<Option<String>>,
-    deployed_commit: RwLock<Option<String>>,
-    deployed_file: RwLock<Option<String>>,
-    deployed_file_sha256: RwLock<Option<String>>,
+    /// Per-project deployed state ({current, previous} per Compose project).
+    /// Drives the additive `projects` map on /version. The 4 `deployed_*`
+    /// fields below mirror the LAST-written project's `current` so the existing
+    /// top-level /version fields stay byte-identical on single-project CVMs.
+    ///
+    /// These use a SYNC `std::sync::RwLock` (not the tokio one): they are also
+    /// written from `NdjsonStream::poll_next` — a sync `Stream::poll_next` where
+    /// `.await` is illegal and `blocking_write` would panic on the runtime. The
+    /// critical sections are tiny in-memory swaps never held across an `.await`.
+    deployed_projects: StdRwLock<std::collections::BTreeMap<String, ProjectDeployed>>,
+    deployed_tag: StdRwLock<Option<String>>,
+    deployed_commit: StdRwLock<Option<String>>,
+    deployed_file: StdRwLock<Option<String>>,
+    deployed_file_sha256: StdRwLock<Option<String>>,
     actions: RwLock<Vec<DeploymentAction>>,
     http: reqwest::Client,
     /// Mutual-exclusion lock for mutating docker/compose operations.
@@ -476,6 +567,11 @@ struct StatusResponse {
     /// Running compose-manager image digest (repo@sha256:…); populated by /version.
     #[serde(skip_serializing_if = "Option::is_none")]
     image: Option<String>,
+    /// Per-project deployed state ({current, previous}), populated by /version
+    /// only. Additive: omitted entirely when empty so every other response and
+    /// the single-project /version top-level fields stay byte-identical.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty", default)]
+    projects: std::collections::BTreeMap<String, ProjectDeployed>,
 }
 
 #[derive(Serialize)]
@@ -487,19 +583,19 @@ struct OperationStatusResponse {
 type ApiResult = (StatusCode, Json<StatusResponse>);
 
 fn ok(tag: Option<String>) -> ApiResult {
-    (StatusCode::OK, Json(StatusResponse { status: "ok".into(), tag, commit: None, file: None, file_sha256: None, output: None, exit_code: None, error: None, image: None }))
+    (StatusCode::OK, Json(StatusResponse { status: "ok".into(), tag, commit: None, file: None, file_sha256: None, output: None, exit_code: None, error: None, image: None, projects: Default::default() }))
 }
 
 fn ok_output(output: String) -> ApiResult {
-    (StatusCode::OK, Json(StatusResponse { status: "ok".into(), tag: None, commit: None, file: None, file_sha256: None, output: Some(output), exit_code: None, error: None, image: None }))
+    (StatusCode::OK, Json(StatusResponse { status: "ok".into(), tag: None, commit: None, file: None, file_sha256: None, output: Some(output), exit_code: None, error: None, image: None, projects: Default::default() }))
 }
 
 fn ok_systemctl(output: String, exit_code: Option<i32>) -> ApiResult {
-    (StatusCode::OK, Json(StatusResponse { status: "ok".into(), tag: None, commit: None, file: None, file_sha256: None, output: Some(output), exit_code, error: None, image: None }))
+    (StatusCode::OK, Json(StatusResponse { status: "ok".into(), tag: None, commit: None, file: None, file_sha256: None, output: Some(output), exit_code, error: None, image: None, projects: Default::default() }))
 }
 
 fn err(code: StatusCode, msg: impl Into<String>) -> ApiResult {
-    (code, Json(StatusResponse { status: "error".into(), tag: None, commit: None, file: None, file_sha256: None, output: None, exit_code: None, error: Some(msg.into()), image: None }))
+    (code, Json(StatusResponse { status: "error".into(), tag: None, commit: None, file: None, file_sha256: None, output: None, exit_code: None, error: Some(msg.into()), image: None, projects: Default::default() }))
 }
 
 fn err_response(code: StatusCode, msg: impl Into<String>) -> Response {
@@ -513,6 +609,7 @@ fn err_response(code: StatusCode, msg: impl Into<String>) -> Response {
         exit_code: None,
         error: Some(msg.into()),
         image: None,
+        projects: Default::default(),
     })
     .unwrap();
     Response::builder()
@@ -834,6 +931,11 @@ mod notify {
         pub state: Arc<AppState>,
         pub action: DeploymentAction,
         pub actor: String,
+        /// Resolved Compose project this op ran under, so the success hook can
+        /// rotate the right per-project deployed record. Threaded HERE (not on
+        /// DeploymentAction) so the attested action schema — and thus
+        /// `report_data = SHA256(canonical actions)` — is unchanged.
+        pub project: String,
     }
 
     /// Render a `DeploymentAction` into a Slack message. `outcome` is
@@ -1203,15 +1305,45 @@ impl Stream for NdjsonStream {
                             // Written synchronously HERE — before the `done` event
                             // below — so it is durable before the client sees
                             // success (a detached write could lose to an immediate
-                            // restart).
+                            // restart). This is the DISK success path (the eager
+                            // in-memory write in the compose_up handler is
+                            // last-ATTEMPTED; this is last-SUCCEEDED). On success
+                            // we rotate this project's current -> previous, set the
+                            // new current, mirror it to the legacy top-level fields,
+                            // and persist the whole per-project map atomically.
+                            //
+                            // compose_stage (materialize_only) and compose_down do
+                            // NOT rotate: staging activates nothing and teardown is
+                            // observed via /docker/ps, so deployed state is left
+                            // intact (see compose_down).
                             if status.success() && notice.action.action == "compose_up" {
-                                let v = DeployedVersion {
+                                let new_current = DeployedRecord {
                                     tag: notice.action.tag.clone(),
                                     commit: notice.action.commit.clone(),
                                     file: notice.action.file.clone(),
                                     file_sha256: notice.action.file_sha256.clone(),
                                 };
-                                if let Err(e) = persist_deployed_version(&notice.state.work_dir, &v) {
+                                let state = &notice.state;
+                                let snapshot = {
+                                    let mut projects = state.deployed_projects.write().expect("deployed_projects lock poisoned");
+                                    let entry = projects.entry(notice.project.clone()).or_default();
+                                    // Rotate the prior current into previous (the
+                                    // last-known-good rollback target), then set
+                                    // the new current.
+                                    if entry.current != DeployedRecord::default() {
+                                        entry.previous = Some(entry.current.clone());
+                                    }
+                                    entry.current = new_current.clone();
+                                    DeployedState { projects: projects.clone() }
+                                };
+                                // Mirror the just-written project to the legacy
+                                // top-level fields so single-project /version
+                                // stays byte-identical.
+                                *state.deployed_tag.write().expect("deployed_tag lock poisoned") = new_current.tag.clone();
+                                *state.deployed_commit.write().expect("deployed_commit lock poisoned") = new_current.commit.clone();
+                                *state.deployed_file.write().expect("deployed_file lock poisoned") = new_current.file.clone();
+                                *state.deployed_file_sha256.write().expect("deployed_file_sha256 lock poisoned") = new_current.file_sha256.clone();
+                                if let Err(e) = persist_deployed_state(&state.work_dir, &snapshot) {
                                     error!(error = %e, "Failed to persist deployed.json");
                                 }
                             }
@@ -1605,12 +1737,18 @@ async fn compose_up(
         state: state.clone(),
         action,
         actor,
+        project: project.clone(),
     });
 
-    *state.deployed_tag.write().await = Some(payload.tag);
-    *state.deployed_commit.write().await = Some(tag_info.commit_sha);
-    *state.deployed_file.write().await = Some(file);
-    *state.deployed_file_sha256.write().await = Some(file_sha256);
+    // Eager in-memory write of the legacy top-level fields = last-ATTEMPTED up
+    // (byte-identical to pre-#46 behavior; /version surfaces these). The new
+    // per-project `deployed_projects` map is updated only on SUCCESS in the
+    // stream-completion hook above, so it always reflects last-SUCCEEDED and a
+    // failed attempt never appears as a project's `current`.
+    *state.deployed_tag.write().expect("deployed_tag lock poisoned") = Some(payload.tag);
+    *state.deployed_commit.write().expect("deployed_commit lock poisoned") = Some(tag_info.commit_sha);
+    *state.deployed_file.write().expect("deployed_file lock poisoned") = Some(file);
+    *state.deployed_file_sha256.write().expect("deployed_file_sha256 lock poisoned") = Some(file_sha256);
 
     Response::builder()
         .status(StatusCode::OK)
@@ -1704,10 +1842,18 @@ async fn compose_down(
     if record_action(&state, &action).await.is_err() {
         return err_response(StatusCode::INTERNAL_SERVER_ERROR, "Failed to persist action log");
     }
+    // compose_down LIFECYCLE: deployed state is deliberately LEFT INTACT on a
+    // down. The success hook only rotates on `compose_up`, so /version keeps
+    // reporting the last-deployed tuple after a teardown. Teardown is observed
+    // via /docker/ps (which reflects the actually-running containers), not by
+    // clearing deployed state here. This matches pre-#46 behavior (down never
+    // cleared the deployed_* fields) and is made explicit so the reconciler
+    // does not treat a stale `current` as "still running".
     stream.completion = Some(notify::CompletionNotice {
         state: state.clone(),
         action,
         actor,
+        project,
     });
 
     Response::builder()
@@ -2167,11 +2313,17 @@ async fn attestation_report(
 }
 
 async fn version(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let tag = state.deployed_tag.read().await.clone();
-    let commit = state.deployed_commit.read().await.clone();
-    let file = state.deployed_file.read().await.clone();
-    let file_sha256 = state.deployed_file_sha256.read().await.clone();
-    (StatusCode::OK, Json(StatusResponse { status: "ok".into(), tag, commit, file, file_sha256, output: None, exit_code: None, error: None, image: state.running_image.clone() }))
+    // Top-level tag/commit/file/file_sha256 stay byte-identical to the
+    // pre-#46 single-tuple contract: they mirror the LAST-written project's
+    // `current`. The additive `projects` map exposes per-project
+    // {current, previous} for the external reconciler; it is omitted entirely
+    // when empty, so single-project CVMs see no shape change.
+    let tag = state.deployed_tag.read().expect("deployed_tag lock poisoned").clone();
+    let commit = state.deployed_commit.read().expect("deployed_commit lock poisoned").clone();
+    let file = state.deployed_file.read().expect("deployed_file lock poisoned").clone();
+    let file_sha256 = state.deployed_file_sha256.read().expect("deployed_file_sha256 lock poisoned").clone();
+    let projects = state.deployed_projects.read().expect("deployed_projects lock poisoned").clone();
+    (StatusCode::OK, Json(StatusResponse { status: "ok".into(), tag, commit, file, file_sha256, output: None, exit_code: None, error: None, image: state.running_image.clone(), projects }))
 }
 
 // --- Dstack guest-agent management ---
@@ -3387,8 +3539,10 @@ async fn main() -> Result<()> {
     // though the same stack is still running. deployed.json is written only when a
     // compose_up stream completes successfully, so a failed attempt can't surface
     // here as the deployed version.
-    let mut restored = load_deployed_version(&work_dir);
-    if restored.tag.is_none() && restored.file.is_none() {
+    // Per-project state. A legacy single-tuple deployed.json migrates into
+    // projects["work"].current via load_deployed_state.
+    let mut restored = load_deployed_state(&work_dir);
+    if restored.projects.is_empty() {
         // One-shot legacy migration (gated by a marker) for installs that predate
         // deployed.json. See migrate_legacy_deployed_version: this never backfills
         // a failed compose_up created under this code.
@@ -3396,9 +3550,20 @@ async fn main() -> Result<()> {
             restored = v;
         }
     }
-    if restored.tag.is_some() || restored.file.is_some() {
-        info!(tag = ?restored.tag, file = ?restored.file, "Restored last-deployed version");
+    if !restored.projects.is_empty() {
+        info!(projects = ?restored.projects.keys().collect::<Vec<_>>(), "Restored last-deployed per-project state");
     }
+    // Mirror the most-recently-written project's `current` into the legacy
+    // top-level fields so /version's top-level tuple is byte-identical to the
+    // pre-#46 contract. BTreeMap iteration is name-ordered (not write-ordered);
+    // a single-project CVM has exactly one entry, so the mirror is unambiguous
+    // there — the case the byte-identity contract covers.
+    let restored_top = restored
+        .projects
+        .values()
+        .next_back()
+        .map(|p| p.current.clone())
+        .unwrap_or_default();
 
     // Resolve the image this process is running so the running version can be
     // attested — recorded as the `compose_manager_started` action below (hashed
@@ -3418,10 +3583,11 @@ async fn main() -> Result<()> {
         env_files,
         slack_webhook_url,
         instance_label,
-        deployed_tag: RwLock::new(restored.tag),
-        deployed_commit: RwLock::new(restored.commit),
-        deployed_file: RwLock::new(restored.file),
-        deployed_file_sha256: RwLock::new(restored.file_sha256),
+        deployed_projects: StdRwLock::new(restored.projects),
+        deployed_tag: StdRwLock::new(restored_top.tag),
+        deployed_commit: StdRwLock::new(restored_top.commit),
+        deployed_file: StdRwLock::new(restored_top.file),
+        deployed_file_sha256: StdRwLock::new(restored_top.file_sha256),
         actions: RwLock::new(initial_actions),
         // Bounded timeouts: the compose lock is held across GitHub fetches in
         // compose_up/compose_down, so a hung GitHub call would otherwise gate
@@ -3520,7 +3686,10 @@ mod tests {
         let dir = temp_work_dir();
         let legacy = vec![compose_up_action("v1", "a.yaml")];
         let v = migrate_legacy_deployed_version(&dir, &legacy).unwrap();
-        assert_eq!(v.tag.as_deref(), Some("v1"));
+        // Legacy action-log backfill lands in projects["work"].current, previous=null.
+        let work = v.projects.get(LEGACY_PROJECT_KEY).expect("migrated into work");
+        assert_eq!(work.current.tag.as_deref(), Some("v1"));
+        assert!(work.previous.is_none());
         assert!(deployed_version_file(&dir).exists(), "deployed.json should be written");
         assert!(migration_marker_file(&dir).exists(), "marker should be written");
 
@@ -3546,34 +3715,169 @@ mod tests {
     }
 
     #[test]
-    fn load_deployed_version_handles_missing_and_corrupt() {
+    fn load_deployed_state_handles_missing_and_corrupt() {
         let dir = temp_work_dir();
         // No file yet -> empty (the pre-first-deploy / pre-upgrade state).
-        let v = load_deployed_version(&dir);
-        assert!(v.tag.is_none() && v.file.is_none());
+        let v = load_deployed_state(&dir);
+        assert!(v.projects.is_empty());
         // Corrupt file -> ignored, not a panic.
         std::fs::write(deployed_version_file(&dir), b"{not json").unwrap();
-        let v = load_deployed_version(&dir);
-        assert!(v.tag.is_none() && v.file.is_none());
+        let v = load_deployed_state(&dir);
+        assert!(v.projects.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn deployed_record(tag: &str, file: &str) -> DeployedRecord {
+        DeployedRecord {
+            tag: Some(tag.into()),
+            commit: Some("abc123".into()),
+            file: Some(file.into()),
+            file_sha256: Some("deadbeef".into()),
+        }
+    }
+
+    #[test]
+    fn deployed_state_round_trips_through_disk() {
+        let dir = temp_work_dir();
+        let mut projects = std::collections::BTreeMap::new();
+        projects.insert(
+            "glm-5-1".to_string(),
+            ProjectDeployed {
+                current: deployed_record("v0.0.211", "GLM-5.1.yaml"),
+                previous: Some(deployed_record("v0.0.210", "GLM-5.1.yaml")),
+            },
+        );
+        let state = DeployedState { projects };
+        persist_deployed_state(&dir, &state).unwrap();
+        let loaded = load_deployed_state(&dir);
+        assert_eq!(loaded, state);
+        let p = loaded.projects.get("glm-5-1").unwrap();
+        assert_eq!(p.current.tag.as_deref(), Some("v0.0.211"));
+        assert_eq!(p.previous.as_ref().unwrap().tag.as_deref(), Some("v0.0.210"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn deployed_version_round_trips_through_disk() {
+    fn legacy_single_tuple_deployed_json_migrates_into_work() {
+        // A pre-existing single-tuple deployed.json (the on-disk format before
+        // this change) must load into projects["work"].current with previous=null.
         let dir = temp_work_dir();
-        let v = DeployedVersion {
-            tag: Some("v0.0.211".into()),
-            commit: Some("abc123".into()),
-            file: Some("GLM-5.1.yaml".into()),
-            file_sha256: Some("deadbeef".into()),
-        };
-        persist_deployed_version(&dir, &v).unwrap();
-        let loaded = load_deployed_version(&dir);
-        assert_eq!(loaded.tag.as_deref(), Some("v0.0.211"));
-        assert_eq!(loaded.commit.as_deref(), Some("abc123"));
-        assert_eq!(loaded.file.as_deref(), Some("GLM-5.1.yaml"));
-        assert_eq!(loaded.file_sha256.as_deref(), Some("deadbeef"));
+        std::fs::write(
+            deployed_version_file(&dir),
+            br#"{"tag":"v0.0.99","commit":"c0ffee","file":"old.yaml","file_sha256":"abcd"}"#,
+        )
+        .unwrap();
+        let loaded = load_deployed_state(&dir);
+        assert_eq!(loaded.projects.len(), 1);
+        let work = loaded.projects.get(LEGACY_PROJECT_KEY).expect("migrated into work");
+        assert_eq!(work.current.tag.as_deref(), Some("v0.0.99"));
+        assert_eq!(work.current.file.as_deref(), Some("old.yaml"));
+        assert!(work.previous.is_none(), "legacy migration carries no previous");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn empty_deployed_json_is_empty_state() {
+        // Both an empty object and an empty map deserialize to empty state.
+        assert!(parse_deployed_state("{}").unwrap().projects.is_empty());
+        assert!(parse_deployed_state(r#"{"work":{"current":{}}}"#).unwrap()
+            .projects
+            .get("work")
+            .unwrap()
+            .current
+            == DeployedRecord::default());
+    }
+
+    /// Mirror the rotation the stream-completion success hook performs, so we can
+    /// unit-test the current->previous semantics without spawning docker. Keep in
+    /// lock-step with the inline logic in `NdjsonStream::poll_next`.
+    fn rotate_on_success(state: &mut DeployedState, project: &str, new_current: DeployedRecord) {
+        let entry = state.projects.entry(project.to_string()).or_default();
+        if entry.current != DeployedRecord::default() {
+            entry.previous = Some(entry.current.clone());
+        }
+        entry.current = new_current;
+    }
+
+    #[test]
+    fn rotation_moves_current_to_previous_on_success() {
+        let mut state = DeployedState::default();
+        // First successful deploy: current set, previous still null.
+        rotate_on_success(&mut state, "glm", deployed_record("v1", "a.yaml"));
+        let p = state.projects.get("glm").unwrap();
+        assert_eq!(p.current.tag.as_deref(), Some("v1"));
+        assert!(p.previous.is_none(), "first deploy has no previous");
+        // Second successful deploy: v1 rotates into previous, v2 becomes current.
+        rotate_on_success(&mut state, "glm", deployed_record("v2", "a.yaml"));
+        let p = state.projects.get("glm").unwrap();
+        assert_eq!(p.current.tag.as_deref(), Some("v2"));
+        assert_eq!(p.previous.as_ref().unwrap().tag.as_deref(), Some("v1"));
+    }
+
+    #[test]
+    fn failed_up_does_not_rotate_deployed_state() {
+        // The rotation only runs inside the `status.success()` branch. A failed
+        // up never calls it, so deployed state is untouched. Modeled here by NOT
+        // invoking rotate_on_success for the failed attempt.
+        let mut state = DeployedState::default();
+        rotate_on_success(&mut state, "glm", deployed_record("v1", "a.yaml"));
+        let before = state.clone();
+        // (failed up: no rotation)
+        assert_eq!(state, before, "a failed up must not change deployed state");
+        let p = state.projects.get("glm").unwrap();
+        assert_eq!(p.current.tag.as_deref(), Some("v1"));
+        assert!(p.previous.is_none());
+    }
+
+    #[test]
+    fn single_project_version_top_level_is_byte_identical() {
+        // Contract: on a single-project CVM the 5 legacy top-level /version fields
+        // (status/tag/commit/file/file_sha256) must serialize byte-identically to
+        // the pre-#46 response, with `projects` appended additively. Build the
+        // exact StatusResponse /version emits and diff the legacy prefix.
+        let mut projects = std::collections::BTreeMap::new();
+        projects.insert(
+            "glm".to_string(),
+            ProjectDeployed { current: deployed_record("v1", "a.yaml"), previous: None },
+        );
+        let with_projects = StatusResponse {
+            status: "ok".into(),
+            tag: Some("v1".into()),
+            commit: Some("abc123".into()),
+            file: Some("a.yaml".into()),
+            file_sha256: Some("deadbeef".into()),
+            output: None,
+            exit_code: None,
+            error: None,
+            image: None,
+            projects,
+        };
+        let json = serde_json::to_string(&with_projects).unwrap();
+        // Legacy top-level fields are present and unchanged.
+        assert!(json.contains(r#""status":"ok""#));
+        assert!(json.contains(r#""tag":"v1""#));
+        assert!(json.contains(r#""commit":"abc123""#));
+        assert!(json.contains(r#""file":"a.yaml""#));
+        assert!(json.contains(r#""file_sha256":"deadbeef""#));
+        // `projects` is additive.
+        assert!(json.contains(r#""projects":{"glm":"#));
+
+        // With NO projects, `projects` is omitted entirely => byte-identical to
+        // the pre-#46 shape (no trailing field, no null).
+        let empty = StatusResponse {
+            status: "ok".into(),
+            tag: Some("v1".into()),
+            commit: None,
+            file: None,
+            file_sha256: None,
+            output: None,
+            exit_code: None,
+            error: None,
+            image: None,
+            projects: Default::default(),
+        };
+        let json = serde_json::to_string(&empty).unwrap();
+        assert_eq!(json, r#"{"status":"ok","tag":"v1"}"#);
     }
 
     #[test]
@@ -3984,10 +4288,11 @@ mod tests {
             env_files: vec![],
             slack_webhook_url: None,
             instance_label: "test-host".into(),
-            deployed_tag: RwLock::new(None),
-            deployed_commit: RwLock::new(None),
-            deployed_file: RwLock::new(None),
-            deployed_file_sha256: RwLock::new(None),
+            deployed_projects: StdRwLock::new(Default::default()),
+            deployed_tag: StdRwLock::new(None),
+            deployed_commit: StdRwLock::new(None),
+            deployed_file: StdRwLock::new(None),
+            deployed_file_sha256: StdRwLock::new(None),
             actions: RwLock::new(vec![]),
             http: reqwest::Client::new(),
             compose_lock: Arc::new(Mutex::new(())),

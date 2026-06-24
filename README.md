@@ -88,6 +88,38 @@ Returns the currently deployed tag.
 {"status": "ok", "tag": "v1.0.0"}
 ```
 
+Post-#46 a CVM can run N Compose projects, so `/version` ALSO returns an additive
+per-project `projects` map alongside the legacy top-level tuple. The top-level
+`tag`/`commit`/`file`/`file_sha256` fields are unchanged (they mirror the
+last-written project's `current`), so single-project CVMs and existing callers
+see no shape change. `projects` is omitted entirely when empty.
+
+```json
+{
+  "status": "ok",
+  "tag": "v0.0.211",
+  "commit": "abc123",
+  "file": "GLM-5.1.yaml",
+  "file_sha256": "…",
+  "projects": {
+    "glm-5-1": {
+      "current":  {"tag": "v0.0.211", "commit": "abc123", "file": "GLM-5.1.yaml", "file_sha256": "…"},
+      "previous": {"tag": "v0.0.210", "commit": "…",      "file": "GLM-5.1.yaml", "file_sha256": "…"}
+    }
+  }
+}
+```
+
+- A project's `current` is its last-SUCCEEDED `compose_up`; `previous` is the
+  last-known-good before it (the rollback target). `previous` is absent until the
+  first successful re-deploy rotates a `current` into it.
+- A FAILED `compose_up` never rotates state. `compose_down` deliberately LEAVES
+  `current` intact — teardown is observed via `/docker/ps`, not by clearing
+  deployed state. `materialize_only` (`compose_stage`) activates nothing and so
+  never touches deployed state.
+- A pre-existing single-tuple `deployed.json` migrates into `projects["work"]`
+  with `previous` absent.
+
 ### GET /status
 Returns the currently running mutating Docker/Compose operation, if any.
 
