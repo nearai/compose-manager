@@ -658,6 +658,20 @@ struct ComposeRequest {
     /// command a real apply with the same body would run. See `compose_up`.
     #[serde(default)]
     dry_run: bool,
+    /// Pre-materialize artifacts (pull images + run in-CVM `build:` + download
+    /// weights via the compose file's model-downloader service) WITHOUT
+    /// activating, so the OLD model keeps serving and GPU idle at cutover is
+    /// near-zero. Runs the up prologue + `pull` + `build` phases and STOPS
+    /// before `up`. Records a DISTINCT lower-privilege `compose_stage` action
+    /// (NOT compose_up) and never writes deployed state (staging activates
+    /// nothing, so recording compose_up / flipping deployed state would make
+    /// /version + the attested log LIE about what is running). Emits a terminal
+    /// additive `staged` NDJSON line listing the landed image digests. Weight
+    /// download is the compose file's EXISTING model-downloader service,
+    /// selected via `services` with platform-controlled `HF_HUB_OFFLINE` in
+    /// `env` — no separate downloader trigger. See `compose_up`.
+    #[serde(default)]
+    materialize_only: bool,
 }
 
 #[derive(Deserialize)]
@@ -968,6 +982,7 @@ mod notify {
         } else {
             match action.action.as_str() {
                 "compose_up" => ":rocket:",
+                "compose_stage" => ":package:",
                 "compose_down" => ":octagonal_sign:",
                 "docker_restart" => ":arrows_counterclockwise:",
                 "docker_clean" => ":broom:",
@@ -979,6 +994,20 @@ mod notify {
         let detail = match action.action.as_str() {
             "compose_up" => {
                 let title = if failed { "Deploy failed" } else { "Deployed" };
+                let mut d = format!("*{}* on `{}`", title, host);
+                if let Some(f) = &action.file {
+                    d.push_str(&format!(" — `{}`", f));
+                }
+                if let Some(t) = &action.tag {
+                    d.push_str(&format!(" → `{}`", t));
+                }
+                if !action.services.is_empty() {
+                    d.push_str(&format!(" ({})", action.services.join(", ")));
+                }
+                d
+            }
+            "compose_stage" => {
+                let title = if failed { "Stage failed" } else { "Staged (not activated)" };
                 let mut d = format!("*{}* on `{}`", title, host);
                 if let Some(f) = &action.file {
                     d.push_str(&format!(" — `{}`", f));
@@ -1234,6 +1263,76 @@ struct NdjsonStream {
     /// terminal event (e.g. the dry-run `plan`) can be emitted on the poll
     /// BEFORE `done`. Emitted on the next poll, after which the stream finishes.
     pending_terminal: Option<String>,
+    /// When `Some`, this is a `materialize_only` stage stream: on SUCCESSFUL
+    /// completion it emits a terminal additive `staged` event (carrying the
+    /// landed image digests from `docker compose images -q`) as the
+    /// materialization done-marker, before `done`. `None` for every other
+    /// stream.
+    staged: Option<StagedMeta>,
+}
+
+/// Metadata for the `materialize_only` terminal `staged` event. The image
+/// digests are resolved at terminal time from `docker compose images -q`.
+#[derive(Clone)]
+struct StagedMeta {
+    work_dir: PathBuf,
+    project: String,
+    file: String,
+    env_files: Vec<String>,
+    services: Vec<String>,
+    temp_env_file: Option<PathBuf>,
+    tag: String,
+    file_sha256: String,
+}
+
+/// Resolve the image IDs the staged compose project currently has on disk via
+/// `docker compose images -q`. Best-effort: on any failure returns an empty
+/// list so the `staged` marker still fires (the platform learns staging
+/// finished even if the digest probe hiccupped). Honors the same project / file
+/// / env-file scoping as the stage itself so it reports THIS project's images.
+fn staged_image_digests(meta: &StagedMeta) -> Vec<String> {
+    let mut cmd = std::process::Command::new("docker");
+    cmd.arg("compose");
+    cmd.args(["-p", &meta.project, "-f", &meta.file]);
+    for ef in &meta.env_files {
+        cmd.args(["--env-file", ef.as_str()]);
+    }
+    if let Some(tef) = &meta.temp_env_file {
+        if let Some(p) = tef.to_str() {
+            cmd.args(["--env-file", p]);
+        }
+    }
+    cmd.args(["images", "-q"]);
+    for service in &meta.services {
+        cmd.arg(service);
+    }
+    cmd.current_dir(&meta.work_dir);
+    match cmd.output() {
+        Ok(out) if out.status.success() => {
+            parse_image_ids(&String::from_utf8_lossy(&out.stdout))
+        }
+        Ok(out) => {
+            warn!(status = ?out.status, "docker compose images -q failed during stage; staged.images will be empty");
+            Vec::new()
+        }
+        Err(e) => {
+            warn!(error = %e, "could not run docker compose images -q during stage; staged.images will be empty");
+            Vec::new()
+        }
+    }
+}
+
+/// Parse the stdout of `docker compose images -q` into a deduplicated,
+/// order-preserving list of non-empty image IDs (one per line).
+fn parse_image_ids(stdout: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    stdout
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .filter(|l| seen.insert(l.to_string()))
+        .map(|l| l.to_string())
+        .collect()
 }
 
 impl Stream for NdjsonStream {
@@ -1498,6 +1597,27 @@ impl Stream for NdjsonStream {
                             return Poll::Ready(Some(Ok(plan_json)));
                         }
 
+                        // materialize_only: on SUCCESS emit the terminal `staged`
+                        // done-marker (image digests landed) first, defer `done`.
+                        // On a failed stage we skip `staged` (materialization did
+                        // not finish) and just emit `done` with success:false.
+                        if let Some(meta) = this.staged.take() {
+                            if status.success() {
+                                let images = staged_image_digests(&meta);
+                                let staged_line = serde_json::json!({
+                                    "event": "staged",
+                                    "tag": meta.tag,
+                                    "file": meta.file,
+                                    "file_sha256": meta.file_sha256,
+                                    "images": images,
+                                });
+                                let mut staged_json = serde_json::to_string(&staged_line).unwrap();
+                                staged_json.push('\n');
+                                this.pending_terminal = Some(done_json);
+                                return Poll::Ready(Some(Ok(staged_json)));
+                            }
+                        }
+
                         this.done = true;
                         return Poll::Ready(Some(Ok(done_json)));
                     }
@@ -1745,6 +1865,7 @@ fn stream_docker_compose_phased(
         endpoint_retry: None,
         dry_run_lines: if dry_run { Some(Vec::new()) } else { None },
         pending_terminal: None,
+        staged: None,
     })
 }
 
@@ -1871,6 +1992,76 @@ async fn compose_up(
             Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         };
         stream.compose_guard = Some(guard);
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/x-ndjson")
+            .body(Body::from_stream(stream))
+            .unwrap();
+    }
+
+    // MATERIALIZE-only: run the prologue (already done above: lock, validate_tag
+    // age-guard, fetch+write compose, env validation, temp-env-file, project
+    // resolve), then run ONLY the `pull` + `build` phases — STOP before `up`.
+    // The old model keeps serving; nothing is activated. We record a DISTINCT
+    // lower-privilege `compose_stage` action (NOT compose_up) and DO NOT write
+    // deployed_* or persist deployed.json (staging activates nothing, so a
+    // compose_up record / deployed flip would make /version + the attested log
+    // LIE about what is running). The success hook only rotates on `compose_up`,
+    // so the attached completion notice reports the stage outcome to Slack
+    // without touching deployed state. A terminal `staged` event marks
+    // materialization done and lists the landed image digests. Weight download
+    // is the compose file's EXISTING model-downloader service, selected via the
+    // `services` field with platform-controlled HF_HUB_OFFLINE in `env`.
+    if payload.materialize_only {
+        let mut stream = match stream_docker_compose_phased(
+            &state.work_dir,
+            &project,
+            &[&["pull", "--ignore-buildable"], &["build"]], // STOP before `up`
+            &file,
+            &state.env_files,
+            &payload.services,
+            temp_env_file,
+            false,
+        ) {
+            Ok(s) => s,
+            Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        };
+        stream.compose_guard = Some(guard);
+        stream.staged = Some(StagedMeta {
+            work_dir: state.work_dir.clone(),
+            project: project.clone(),
+            file: file.clone(),
+            env_files: state.env_files.clone(),
+            services: payload.services.clone(),
+            temp_env_file: temp_env_file_for_retry,
+            tag: payload.tag.clone(),
+            file_sha256: file_sha256.clone(),
+        });
+
+        let actor = extract_actor(&headers);
+        let action = DeploymentAction {
+            timestamp: Utc::now().to_rfc3339(),
+            action: "compose_stage".into(),
+            image: None,
+            tag: Some(payload.tag.clone()),
+            commit: Some(tag_info.commit_sha.clone()),
+            file: Some(file.clone()),
+            file_sha256: Some(file_sha256.clone()),
+            services: payload.services.clone(),
+            container: None,
+        };
+        if record_action(&state, &action).await.is_err() {
+            return err_response(StatusCode::INTERNAL_SERVER_ERROR, "Failed to persist action log");
+        }
+        // Slack outcome only — never touches deployed state (rotation is gated
+        // on compose_up).
+        stream.completion = Some(notify::CompletionNotice {
+            state: state.clone(),
+            action,
+            actor,
+            project: project.clone(),
+        });
+
         return Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", "application/x-ndjson")
@@ -4161,6 +4352,67 @@ mod tests {
         let plan = DryRunPlan::default();
         let json = serde_json::to_string(&plan).unwrap();
         assert_eq!(json, r#"{"create":[],"recreate":[],"remove":[],"unchanged":[]}"#);
+    }
+
+    // --- materialize_only (Commit C) ---
+
+    #[test]
+    fn parse_image_ids_dedups_and_trims() {
+        let out = "  sha256:aaa  \nsha256:bbb\n\nsha256:aaa\n  \nsha256:ccc\n";
+        assert_eq!(
+            parse_image_ids(out),
+            vec!["sha256:aaa", "sha256:bbb", "sha256:ccc"]
+        );
+        assert!(parse_image_ids("").is_empty());
+        assert!(parse_image_ids("\n  \n").is_empty());
+    }
+
+    #[test]
+    fn staged_event_line_has_documented_shape() {
+        // The terminal `staged` done-marker shape the platform consumes.
+        let staged_line = serde_json::json!({
+            "event": "staged",
+            "tag": "v0.0.211",
+            "file": "GLM-5.1.yaml",
+            "file_sha256": "deadbeef",
+            "images": ["sha256:aaa", "sha256:bbb"],
+        });
+        let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&staged_line).unwrap()).unwrap();
+        assert_eq!(v["event"], "staged");
+        assert_eq!(v["tag"], "v0.0.211");
+        assert_eq!(v["file"], "GLM-5.1.yaml");
+        assert_eq!(v["file_sha256"], "deadbeef");
+        assert_eq!(v["images"], serde_json::json!(["sha256:aaa", "sha256:bbb"]));
+    }
+
+    #[test]
+    fn compose_stage_is_distinct_verb_and_never_migrates_as_deployed() {
+        // compose_stage MUST be a distinct verb (not compose_up): the
+        // success-rotation hook only rotates on compose_up, and the legacy
+        // action-log migration only seeds deployed state from a compose_up — so
+        // a staged-but-not-activated model can never surface as "deployed".
+        let stage = DeploymentAction {
+            action: "compose_stage".into(),
+            tag: Some("v-staged".into()),
+            file: Some("staged.yaml".into()),
+            ..Default::default()
+        };
+        assert!(
+            deployed_version_from_actions(&[stage]).is_none(),
+            "a compose_stage action must never be picked as the deployed version"
+        );
+    }
+
+    #[test]
+    fn compose_stage_slack_message_reads_as_staged_not_deployed() {
+        let mut a = sample_action("compose_stage");
+        a.tag = Some("v1".into());
+        a.file = Some("glm.yaml".into());
+        let ok = notify::format_message(&a, "gpu30", "ops", Some(true));
+        assert!(ok.contains("Staged (not activated)"), "got: {ok}");
+        assert!(!ok.contains("Deployed"), "must not read as an activation: {ok}");
+        let failed = notify::format_message(&a, "gpu30", "ops", Some(false));
+        assert!(failed.contains("Stage failed"), "got: {failed}");
     }
 
     #[test]

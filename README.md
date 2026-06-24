@@ -42,6 +42,34 @@ Compose's progress-writer status verbs); it is pinned to the
 (`5.1.4-1~debian.12~bookworm`; see Dockerfile). Read the raw lines, not `plan`,
 when you need a guarantee.
 
+**`materialize_only` (stage without activating):** set `"materialize_only": true`
+to pre-materialize a model's artifacts on the target host — pull images, run any
+in-CVM `build:`, and download weights via the compose file's model-downloader
+service — WITHOUT activating it. The old model keeps serving and GPU idle at
+cutover is near-zero. compose-manager runs the `pull` + `build` phases and STOPS
+before `up`.
+
+- It records a DISTINCT lower-privilege `compose_stage` action (NOT compose_up)
+  and never writes deployed state: staging activates nothing, so /version and
+  the attested action log keep reporting the model that is actually running.
+- Weight download uses the compose file's EXISTING model-downloader service,
+  selected via the `services` field, with platform-controlled `HF_HUB_OFFLINE`
+  passed in `env`. There is no separate downloader trigger.
+- The stream ends with a terminal additive `staged` done-marker so the platform
+  knows materialization finished and what landed:
+  ```json
+  {"event":"staged","tag":"v0.0.211","file":"GLM-5.1.yaml","file_sha256":"…",
+   "images":["sha256:…","sha256:…"]}
+  ```
+  `images` is the output of `docker compose images -q` for the staged project
+  (best-effort: empty if the probe fails — the marker still fires).
+
+> STAGING PRECONDITION (zero-GPU-idle): `materialize_only` only guarantees the
+> running model is untouched on CVMs where each model lives in its OWN
+> non-reserved compose project. The default `work` project is shared and cannot
+> be overridden to `work`/`dstack` (see `project`), so on a shared-project CVM a
+> later `up` of the staged model can still recreate co-located services.
+
 ### POST /compose/down
 Stop containers with `docker compose down`.
 
