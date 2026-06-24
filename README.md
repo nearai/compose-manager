@@ -20,6 +20,56 @@ Start containers with `docker compose up -d`.
 {"file": "docker-compose.prod.yml"}
 ```
 
+**`dry_run` (plan-only):** set `"dry_run": true` to PLAN a change without applying
+it. compose-manager simulates ONLY the `up` phase with docker compose's global
+`--dry-run`, so automation can see the per-service config-hash recreate verdict
+(which `file_sha256` cannot predict) before SIGTERMing a model mid-warmup. It is
+genuinely read-only: no action is recorded, no deployed state is written, and
+nothing is pulled/built/spawned. All scoping fields (`tag`, `file`, `project`,
+`services`, `env`, `force_recreate`) are honored so the plan reflects the EXACT
+command a real apply with the same body would run.
+
+The streamed NDJSON carries the RAW dry-run output lines (the documented
+contract) plus a terminal additive `plan` event with a best-effort parsed
+verdict:
+```json
+{"event":"plan","success":true,"exit_code":0,
+ "plan":{"create":["glm-vllm-1"],"recreate":[],"remove":["orphan-1"],"unchanged":["glm-nginx-1"]}}
+```
+The parsed `plan` is ADVISORY and Compose-version-sensitive (it keys on
+Compose's progress-writer status verbs); it is pinned to the
+`docker-compose-plugin` version in the attested image
+(`5.1.4-1~debian.12~bookworm`; see Dockerfile). Read the raw lines, not `plan`,
+when you need a guarantee.
+
+**`materialize_only` (stage without activating):** set `"materialize_only": true`
+to pre-materialize a model's artifacts on the target host — pull images, run any
+in-CVM `build:`, and download weights via the compose file's model-downloader
+service — WITHOUT activating it. The old model keeps serving and GPU idle at
+cutover is near-zero. compose-manager runs the `pull` + `build` phases and STOPS
+before `up`.
+
+- It records a DISTINCT lower-privilege `compose_stage` action (NOT compose_up)
+  and never writes deployed state: staging activates nothing, so /version and
+  the attested action log keep reporting the model that is actually running.
+- Weight download uses the compose file's EXISTING model-downloader service,
+  selected via the `services` field, with platform-controlled `HF_HUB_OFFLINE`
+  passed in `env`. There is no separate downloader trigger.
+- The stream ends with a terminal additive `staged` done-marker so the platform
+  knows materialization finished and what landed:
+  ```json
+  {"event":"staged","tag":"v0.0.211","file":"GLM-5.1.yaml","file_sha256":"…",
+   "images":["sha256:…","sha256:…"]}
+  ```
+  `images` is the output of `docker compose images -q` for the staged project
+  (best-effort: empty if the probe fails — the marker still fires).
+
+> STAGING PRECONDITION (zero-GPU-idle): `materialize_only` only guarantees the
+> running model is untouched on CVMs where each model lives in its OWN
+> non-reserved compose project. The default `work` project is shared and cannot
+> be overridden to `work`/`dstack` (see `project`), so on a shared-project CVM a
+> later `up` of the staged model can still recreate co-located services.
+
 ### POST /compose/down
 Stop containers with `docker compose down`.
 
@@ -87,6 +137,38 @@ Returns the currently deployed tag.
 ```json
 {"status": "ok", "tag": "v1.0.0"}
 ```
+
+Post-#46 a CVM can run N Compose projects, so `/version` ALSO returns an additive
+per-project `projects` map alongside the legacy top-level tuple. The top-level
+`tag`/`commit`/`file`/`file_sha256` fields are unchanged (they mirror the
+last-written project's `current`), so single-project CVMs and existing callers
+see no shape change. `projects` is omitted entirely when empty.
+
+```json
+{
+  "status": "ok",
+  "tag": "v0.0.211",
+  "commit": "abc123",
+  "file": "GLM-5.1.yaml",
+  "file_sha256": "…",
+  "projects": {
+    "glm-5-1": {
+      "current":  {"tag": "v0.0.211", "commit": "abc123", "file": "GLM-5.1.yaml", "file_sha256": "…"},
+      "previous": {"tag": "v0.0.210", "commit": "…",      "file": "GLM-5.1.yaml", "file_sha256": "…"}
+    }
+  }
+}
+```
+
+- A project's `current` is its last-SUCCEEDED `compose_up`; `previous` is the
+  last-known-good before it (the rollback target). `previous` is absent until the
+  first successful re-deploy rotates a `current` into it.
+- A FAILED `compose_up` never rotates state. `compose_down` deliberately LEAVES
+  `current` intact — teardown is observed via `/docker/ps`, not by clearing
+  deployed state. `materialize_only` (`compose_stage`) activates nothing and so
+  never touches deployed state.
+- A pre-existing single-tuple `deployed.json` migrates into `projects["work"]`
+  with `previous` absent.
 
 ### GET /status
 Returns the currently running mutating Docker/Compose operation, if any.

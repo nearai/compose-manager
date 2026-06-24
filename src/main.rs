@@ -17,7 +17,7 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     process::Command,
-    sync::{Arc, Mutex as StdMutex},
+    sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock},
     task::{Context as TaskContext, Poll},
     time::Duration,
 };
@@ -151,14 +151,14 @@ fn load_actions_from_disk(work_dir: &Path) -> Vec<DeploymentAction> {
     }
 }
 
-/// The last *successfully* deployed tag/file/commit, persisted to `deployed.json`
-/// so /version (and the dashboard) keep showing it across a compose-manager
-/// restart — most commonly a launcher hot-swap, where the deployed fields would
-/// otherwise reset to blank until the next deploy. Written ONLY after a
-/// compose_up stream completes successfully (so a failed attempt never overwrites
-/// the last good deploy), and read once at startup.
-#[derive(Clone, Serialize, Deserialize, Default)]
-struct DeployedVersion {
+/// A single deployed tag/file/commit tuple for one Compose project.
+///
+/// Used both for the in-memory per-project state and as the on-disk
+/// `deployed.json` record. All fields are `Option` + `skip_serializing_if` so a
+/// record carrying only some fields (e.g. a legacy single-tuple) round-trips
+/// without injecting nulls.
+#[derive(Clone, Serialize, Deserialize, Default, PartialEq, Debug)]
+struct DeployedRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     tag: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -169,31 +169,104 @@ struct DeployedVersion {
     file_sha256: Option<String>,
 }
 
+/// Per-project deployed state: the `current` (last-successful) deploy plus the
+/// `previous` (last-known-good before it), so the external reconciler can read a
+/// rollback target. `previous` is omitted (serialized as absent) until the first
+/// successful re-deploy rotates a `current` into it.
+#[derive(Clone, Serialize, Deserialize, Default, PartialEq, Debug)]
+struct ProjectDeployed {
+    current: DeployedRecord,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous: Option<DeployedRecord>,
+}
+
+/// The default Compose project name a legacy single-tuple `deployed.json`
+/// migrates into. Matches the historical working-directory basename default
+/// (`/app/work` -> `work`); see `compose_project_name`.
+const LEGACY_PROJECT_KEY: &str = "work";
+
+/// Persisted per-project deployed state, written to `deployed.json`.
+///
+/// Post-#46 a CVM can run N Compose projects, so /version must report deployed
+/// state PER project rather than collapsing to one global tuple. Written ONLY
+/// after a compose_up stream completes successfully (so a failed attempt never
+/// overwrites the last good deploy), and read once at startup.
+///
+/// On-disk format is a JSON object keyed by project name:
+/// `{"<project>": {"current": {...}, "previous": {...}|absent}}`. A pre-existing
+/// LEGACY single-tuple `deployed.json` (`{"tag":...,"file":...}`) is migrated
+/// into `projects["work"].current` with `previous` absent — see
+/// `load_deployed_state`.
+#[derive(Clone, Serialize, Deserialize, Default, PartialEq, Debug)]
+struct DeployedState {
+    #[serde(flatten)]
+    projects: std::collections::BTreeMap<String, ProjectDeployed>,
+}
+
 fn deployed_version_file(work_dir: &Path) -> PathBuf {
     work_dir.join("deployed.json")
 }
 
-fn load_deployed_version(work_dir: &Path) -> DeployedVersion {
-    match std::fs::read_to_string(deployed_version_file(work_dir)) {
-        Ok(content) => serde_json::from_str(&content).unwrap_or_else(|e| {
-            error!(error = %e, "deployed.json is corrupt, ignoring");
-            DeployedVersion::default()
-        }),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => DeployedVersion::default(),
+/// Load the per-project deployed state from `deployed.json`.
+///
+/// Accepts BOTH the new per-project map format and the LEGACY single-tuple
+/// format written before this change. A legacy tuple is migrated into
+/// `projects["work"].current` (previous absent), since `work` was the only
+/// project that could exist pre-#46. A corrupt/unreadable file is ignored
+/// (empty state), exactly as the single-tuple loader did.
+fn load_deployed_state(work_dir: &Path) -> DeployedState {
+    let content = match std::fs::read_to_string(deployed_version_file(work_dir)) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return DeployedState::default(),
         Err(e) => {
             error!(error = %e, "Failed to read deployed.json, ignoring");
-            DeployedVersion::default()
+            return DeployedState::default();
         }
-    }
+    };
+    parse_deployed_state(&content).unwrap_or_else(|| {
+        error!("deployed.json is corrupt, ignoring");
+        DeployedState::default()
+    })
 }
 
-/// Persist the last successful deploy to `deployed.json`, synchronously, via a
-/// temp-file + atomic rename. Deliberately blocking (std::fs): the compose_up
+/// Parse `deployed.json` content, accepting the new per-project map OR a legacy
+/// single-tuple. Returns `None` only when the content is neither (corrupt).
+fn parse_deployed_state(content: &str) -> Option<DeployedState> {
+    // Try the new per-project map first. A legacy single-tuple
+    // (`{"tag":...}`) would deserialize here as a project named "tag" whose
+    // value is a string — which fails the ProjectDeployed shape — so the map
+    // parse rejects legacy input rather than silently mis-keying it.
+    if let Ok(state) = serde_json::from_str::<DeployedState>(content) {
+        // An empty `{}` legitimately parses as the new empty map; a legacy
+        // tuple with only e.g. `{"tag":"v1"}` would NOT (string value), so we
+        // can trust this branch for the new format.
+        if !state.projects.is_empty() || content.trim() == "{}" {
+            return Some(state);
+        }
+    }
+    // Fall back to the legacy single-tuple, migrating it into `work`.
+    if let Ok(legacy) = serde_json::from_str::<DeployedRecord>(content) {
+        if legacy != DeployedRecord::default() {
+            let mut projects = std::collections::BTreeMap::new();
+            projects.insert(
+                LEGACY_PROJECT_KEY.to_string(),
+                ProjectDeployed { current: legacy, previous: None },
+            );
+            return Some(DeployedState { projects });
+        }
+        // Empty legacy record (`{}`) -> empty state.
+        return Some(DeployedState::default());
+    }
+    None
+}
+
+/// Persist the per-project deployed state to `deployed.json`, synchronously, via
+/// a temp-file + atomic rename. Deliberately blocking (std::fs): the compose_up
 /// completion path calls this BEFORE emitting the terminal `done` event so the
 /// write is durable before the client is told the deploy succeeded — a detached
 /// async write could lose to an immediate restart. The file is tiny.
-fn persist_deployed_version(work_dir: &Path, v: &DeployedVersion) -> std::io::Result<()> {
-    let json = serde_json::to_string(v)
+fn persist_deployed_state(work_dir: &Path, state: &DeployedState) -> std::io::Result<()> {
+    let json = serde_json::to_string(state)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     let tmp = work_dir.join("deployed.json.tmp");
     std::fs::write(&tmp, &json)?;
@@ -202,15 +275,16 @@ fn persist_deployed_version(work_dir: &Path, v: &DeployedVersion) -> std::io::Re
 }
 
 /// Best-effort migration source for installs that predate `deployed.json`:
-/// derive a `DeployedVersion` from the most recent `compose_up` in the legacy
+/// derive a `DeployedRecord` from the most recent `compose_up` in the legacy
 /// action log. Legacy actions carry no success/failure outcome, so this is only
-/// used to seed `deployed.json` once when it's missing.
-fn deployed_version_from_actions(actions: &[DeploymentAction]) -> Option<DeployedVersion> {
+/// used to seed `deployed.json` once when it's missing. The result lands in the
+/// `work` project (legacy installs only ran the single default project).
+fn deployed_version_from_actions(actions: &[DeploymentAction]) -> Option<DeployedRecord> {
     actions
         .iter()
         .rev()
         .find(|a| a.action == "compose_up")
-        .map(|a| DeployedVersion {
+        .map(|a| DeployedRecord {
             tag: a.tag.clone(),
             commit: a.commit.clone(),
             file: a.file.clone(),
@@ -243,18 +317,25 @@ fn migration_marker_file(work_dir: &Path) -> PathBuf {
 fn migrate_legacy_deployed_version(
     work_dir: &Path,
     actions: &[DeploymentAction],
-) -> Option<DeployedVersion> {
+) -> Option<DeployedState> {
     let marker = migration_marker_file(work_dir);
     if marker.exists() {
         return None;
     }
-    let result = deployed_version_from_actions(actions);
+    let result = deployed_version_from_actions(actions).map(|current| {
+        let mut projects = std::collections::BTreeMap::new();
+        projects.insert(
+            LEGACY_PROJECT_KEY.to_string(),
+            ProjectDeployed { current, previous: None },
+        );
+        DeployedState { projects }
+    });
     if let Some(ref v) = result {
-        if let Err(e) = persist_deployed_version(work_dir, v) {
+        if let Err(e) = persist_deployed_state(work_dir, v) {
             error!(error = %e, "Failed to backfill deployed.json; will retry next boot");
             return result; // don't write the marker — retry on next boot
         }
-        info!(tag = ?v.tag, file = ?v.file, "Backfilled deployed.json from action log (one-shot legacy migration)");
+        info!("Backfilled deployed.json from action log (one-shot legacy migration)");
     }
     // Mark migration done so a later failed compose_up (pre-outcome action, no
     // deployed.json) is never backfilled. Best-effort.
@@ -391,10 +472,20 @@ struct AppState {
     /// Sourced from the `INSTANCE_LABEL` env var (templated to the ansible
     /// inventory hostname). Empty string falls back to "unknown-host".
     instance_label: String,
-    deployed_tag: RwLock<Option<String>>,
-    deployed_commit: RwLock<Option<String>>,
-    deployed_file: RwLock<Option<String>>,
-    deployed_file_sha256: RwLock<Option<String>>,
+    /// Per-project deployed state ({current, previous} per Compose project).
+    /// Drives the additive `projects` map on /version. The 4 `deployed_*`
+    /// fields below mirror the LAST-written project's `current` so the existing
+    /// top-level /version fields stay byte-identical on single-project CVMs.
+    ///
+    /// These use a SYNC `std::sync::RwLock` (not the tokio one): they are also
+    /// written from `NdjsonStream::poll_next` — a sync `Stream::poll_next` where
+    /// `.await` is illegal and `blocking_write` would panic on the runtime. The
+    /// critical sections are tiny in-memory swaps never held across an `.await`.
+    deployed_projects: StdRwLock<std::collections::BTreeMap<String, ProjectDeployed>>,
+    deployed_tag: StdRwLock<Option<String>>,
+    deployed_commit: StdRwLock<Option<String>>,
+    deployed_file: StdRwLock<Option<String>>,
+    deployed_file_sha256: StdRwLock<Option<String>>,
     actions: RwLock<Vec<DeploymentAction>>,
     http: reqwest::Client,
     /// Mutual-exclusion lock for mutating docker/compose operations.
@@ -476,6 +567,11 @@ struct StatusResponse {
     /// Running compose-manager image digest (repo@sha256:…); populated by /version.
     #[serde(skip_serializing_if = "Option::is_none")]
     image: Option<String>,
+    /// Per-project deployed state ({current, previous}), populated by /version
+    /// only. Additive: omitted entirely when empty so every other response and
+    /// the single-project /version top-level fields stay byte-identical.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty", default)]
+    projects: std::collections::BTreeMap<String, ProjectDeployed>,
 }
 
 #[derive(Serialize)]
@@ -487,19 +583,19 @@ struct OperationStatusResponse {
 type ApiResult = (StatusCode, Json<StatusResponse>);
 
 fn ok(tag: Option<String>) -> ApiResult {
-    (StatusCode::OK, Json(StatusResponse { status: "ok".into(), tag, commit: None, file: None, file_sha256: None, output: None, exit_code: None, error: None, image: None }))
+    (StatusCode::OK, Json(StatusResponse { status: "ok".into(), tag, commit: None, file: None, file_sha256: None, output: None, exit_code: None, error: None, image: None, projects: Default::default() }))
 }
 
 fn ok_output(output: String) -> ApiResult {
-    (StatusCode::OK, Json(StatusResponse { status: "ok".into(), tag: None, commit: None, file: None, file_sha256: None, output: Some(output), exit_code: None, error: None, image: None }))
+    (StatusCode::OK, Json(StatusResponse { status: "ok".into(), tag: None, commit: None, file: None, file_sha256: None, output: Some(output), exit_code: None, error: None, image: None, projects: Default::default() }))
 }
 
 fn ok_systemctl(output: String, exit_code: Option<i32>) -> ApiResult {
-    (StatusCode::OK, Json(StatusResponse { status: "ok".into(), tag: None, commit: None, file: None, file_sha256: None, output: Some(output), exit_code, error: None, image: None }))
+    (StatusCode::OK, Json(StatusResponse { status: "ok".into(), tag: None, commit: None, file: None, file_sha256: None, output: Some(output), exit_code, error: None, image: None, projects: Default::default() }))
 }
 
 fn err(code: StatusCode, msg: impl Into<String>) -> ApiResult {
-    (code, Json(StatusResponse { status: "error".into(), tag: None, commit: None, file: None, file_sha256: None, output: None, exit_code: None, error: Some(msg.into()), image: None }))
+    (code, Json(StatusResponse { status: "error".into(), tag: None, commit: None, file: None, file_sha256: None, output: None, exit_code: None, error: Some(msg.into()), image: None, projects: Default::default() }))
 }
 
 fn err_response(code: StatusCode, msg: impl Into<String>) -> Response {
@@ -513,6 +609,7 @@ fn err_response(code: StatusCode, msg: impl Into<String>) -> Response {
         exit_code: None,
         error: Some(msg.into()),
         image: None,
+        projects: Default::default(),
     })
     .unwrap();
     Response::builder()
@@ -551,6 +648,30 @@ struct ComposeRequest {
     /// under its own project. See `resolve_compose_project`.
     #[serde(default)]
     project: Option<String>,
+    /// PLAN-only mode. When true, simulate the `up` with docker compose's global
+    /// `--dry-run` and report what WOULD recreate, WITHOUT applying anything.
+    /// Genuinely read-only: no action recorded, no deployed_* / deployed.json
+    /// write, nothing pulled/built/spawned. Lets automation see the per-service
+    /// config-hash recreate verdict (which file_sha256 cannot predict) before
+    /// SIGTERMing a model mid-warmup. Honors all scoping fields (tag/file/
+    /// project/services/env/force_recreate) so the plan reflects the EXACT
+    /// command a real apply with the same body would run. See `compose_up`.
+    #[serde(default)]
+    dry_run: bool,
+    /// Pre-materialize artifacts (pull images + run in-CVM `build:` + download
+    /// weights via the compose file's model-downloader service) WITHOUT
+    /// activating, so the OLD model keeps serving and GPU idle at cutover is
+    /// near-zero. Runs the up prologue + `pull` + `build` phases and STOPS
+    /// before `up`. Records a DISTINCT lower-privilege `compose_stage` action
+    /// (NOT compose_up) and never writes deployed state (staging activates
+    /// nothing, so recording compose_up / flipping deployed state would make
+    /// /version + the attested log LIE about what is running). Emits a terminal
+    /// additive `staged` NDJSON line listing the landed image digests. Weight
+    /// download is the compose file's EXISTING model-downloader service,
+    /// selected via `services` with platform-controlled `HF_HUB_OFFLINE` in
+    /// `env` — no separate downloader trigger. See `compose_up`.
+    #[serde(default)]
+    materialize_only: bool,
 }
 
 #[derive(Deserialize)]
@@ -834,6 +955,11 @@ mod notify {
         pub state: Arc<AppState>,
         pub action: DeploymentAction,
         pub actor: String,
+        /// Resolved Compose project this op ran under, so the success hook can
+        /// rotate the right per-project deployed record. Threaded HERE (not on
+        /// DeploymentAction) so the attested action schema — and thus
+        /// `report_data = SHA256(canonical actions)` — is unchanged.
+        pub project: String,
     }
 
     /// Render a `DeploymentAction` into a Slack message. `outcome` is
@@ -856,6 +982,7 @@ mod notify {
         } else {
             match action.action.as_str() {
                 "compose_up" => ":rocket:",
+                "compose_stage" => ":package:",
                 "compose_down" => ":octagonal_sign:",
                 "docker_restart" => ":arrows_counterclockwise:",
                 "docker_clean" => ":broom:",
@@ -867,6 +994,20 @@ mod notify {
         let detail = match action.action.as_str() {
             "compose_up" => {
                 let title = if failed { "Deploy failed" } else { "Deployed" };
+                let mut d = format!("*{}* on `{}`", title, host);
+                if let Some(f) = &action.file {
+                    d.push_str(&format!(" — `{}`", f));
+                }
+                if let Some(t) = &action.tag {
+                    d.push_str(&format!(" → `{}`", t));
+                }
+                if !action.services.is_empty() {
+                    d.push_str(&format!(" ({})", action.services.join(", ")));
+                }
+                d
+            }
+            "compose_stage" => {
+                let title = if failed { "Stage failed" } else { "Staged (not activated)" };
                 let mut d = format!("*{}* on `{}`", title, host);
                 if let Some(f) = &action.file {
                     d.push_str(&format!(" — `{}`", f));
@@ -988,7 +1129,9 @@ struct EndpointRetry {
 impl EndpointRetry {
     fn build_cmd(&self) -> AsyncCommand {
         let args_ref: Vec<&str> = self.up_args.iter().map(|s| s.as_str()).collect();
-        build_compose_cmd(&self.work_dir, &self.project, &args_ref, &self.file, &self.env_files, &self.services, self.temp_env_file.as_deref())
+        // A retry is always a REAL apply (the endpoint-conflict recovery only
+        // fires on a non-dry-run up), so dry_run=false.
+        build_compose_cmd(&self.work_dir, &self.project, &args_ref, &self.file, &self.env_files, &self.services, self.temp_env_file.as_deref(), false)
     }
 }
 
@@ -1006,6 +1149,79 @@ fn parse_endpoint_errors(lines: &VecDeque<String>) -> Vec<(String, String)> {
         if container.is_empty() || network.is_empty() { return None; }
         Some((network, container))
     }).collect()
+}
+
+/// ADVISORY parsed verdict of a `docker compose --dry-run up`. The RAW dry-run
+/// output lines (streamed as ordinary `stdout`/`stderr` events) are the
+/// DOCUMENTED contract; this parse is a best-effort convenience overlay.
+///
+/// VERSION-SENSITIVE: it keys on Compose's progress-writer status verbs
+/// (`Creating`/`Recreate`/`Removing`/`Running`…), whose exact wording can shift
+/// between Compose releases. It is pinned to the docker-compose-plugin version
+/// shipped in the attested image (5.1.4-1~debian.12~bookworm; see Dockerfile).
+/// Automation that needs a guarantee must read the raw lines, not this field.
+#[derive(Serialize, Default, PartialEq, Debug)]
+struct DryRunPlan {
+    create: Vec<String>,
+    recreate: Vec<String>,
+    remove: Vec<String>,
+    unchanged: Vec<String>,
+}
+
+/// Parse a `docker compose --dry-run up` transcript into an advisory plan.
+///
+/// Compose's progress writer emits one resource line per container of the form
+/// `[DRY-RUN MODE - ] <resource-name>  <Verb>` (it goes to stderr; the leading
+/// `DRY-RUN MODE -` prefix and surrounding whitespace vary). We bucket by the
+/// trailing verb: `Creating`/`Created` -> create (new container);
+/// `Recreate`/`Recreated` -> recreate (config-hash changed);
+/// `Removing`/`Removed` -> remove (e.g. `--remove-orphans`);
+/// `Running`/`Started`/`Skipped` -> unchanged (already up to date).
+///
+/// A resource is recorded once, by the STRONGEST verb seen for it (recreate >
+/// create > remove > unchanged), so paired progress lines (Creating then
+/// Created) don't double-count.
+fn parse_dry_run_plan(lines: &[String]) -> DryRunPlan {
+    use std::collections::BTreeMap;
+    // 3 = recreate, 2 = create, 1 = remove, 0 = unchanged. Highest wins.
+    let mut rank: BTreeMap<String, u8> = BTreeMap::new();
+    for raw in lines {
+        // Strip the dry-run prefix if present, then split off the trailing verb.
+        let line = raw
+            .split_once("DRY-RUN MODE -")
+            .map(|(_, rest)| rest)
+            .unwrap_or(raw)
+            .trim();
+        if line.is_empty() {
+            continue;
+        }
+        let (name, verb) = match line.rsplit_once(char::is_whitespace) {
+            Some((n, v)) => (n.trim(), v.trim()),
+            None => continue,
+        };
+        if name.is_empty() {
+            continue;
+        }
+        let weight = match verb {
+            "Recreate" | "Recreated" => 3u8,
+            "Creating" | "Created" => 2,
+            "Removing" | "Removed" => 1,
+            "Running" | "Started" | "Skipped" => 0,
+            _ => continue,
+        };
+        let entry = rank.entry(name.to_string()).or_insert(0);
+        *entry = (*entry).max(weight);
+    }
+    let mut plan = DryRunPlan::default();
+    for (name, weight) in rank {
+        match weight {
+            3 => plan.recreate.push(name),
+            2 => plan.create.push(name),
+            1 => plan.remove.push(name),
+            _ => plan.unchanged.push(name),
+        }
+    }
+    plan
 }
 
 #[derive(Serialize)]
@@ -1038,6 +1254,85 @@ struct NdjsonStream {
     /// If set, a failed phase will check stderr_tail for stale-endpoint errors.
     /// On match: disconnect the endpoint(s) and retry `up` once.
     endpoint_retry: Option<EndpointRetry>,
+    /// When `Some`, this stream is a `--dry-run` plan: every stdout+stderr line
+    /// is also accumulated here so a terminal additive `plan` event can carry an
+    /// advisory parsed verdict (the RAW lines remain the contract). `None` for
+    /// every real (mutating) stream, which is then byte-identical to before.
+    dry_run_lines: Option<Vec<String>>,
+    /// A pre-rendered terminal NDJSON line (`done`) buffered so an additive
+    /// terminal event (e.g. the dry-run `plan`) can be emitted on the poll
+    /// BEFORE `done`. Emitted on the next poll, after which the stream finishes.
+    pending_terminal: Option<String>,
+    /// When `Some`, this is a `materialize_only` stage stream: on SUCCESSFUL
+    /// completion it emits a terminal additive `staged` event (carrying the
+    /// landed image digests from `docker compose images -q`) as the
+    /// materialization done-marker, before `done`. `None` for every other
+    /// stream.
+    staged: Option<StagedMeta>,
+}
+
+/// Metadata for the `materialize_only` terminal `staged` event. The image
+/// digests are resolved at terminal time from `docker compose images -q`.
+#[derive(Clone)]
+struct StagedMeta {
+    work_dir: PathBuf,
+    project: String,
+    file: String,
+    env_files: Vec<String>,
+    services: Vec<String>,
+    temp_env_file: Option<PathBuf>,
+    tag: String,
+    file_sha256: String,
+}
+
+/// Resolve the image IDs the staged compose project currently has on disk via
+/// `docker compose images -q`. Best-effort: on any failure returns an empty
+/// list so the `staged` marker still fires (the platform learns staging
+/// finished even if the digest probe hiccupped). Honors the same project / file
+/// / env-file scoping as the stage itself so it reports THIS project's images.
+fn staged_image_digests(meta: &StagedMeta) -> Vec<String> {
+    let mut cmd = std::process::Command::new("docker");
+    cmd.arg("compose");
+    cmd.args(["-p", &meta.project, "-f", &meta.file]);
+    for ef in &meta.env_files {
+        cmd.args(["--env-file", ef.as_str()]);
+    }
+    if let Some(tef) = &meta.temp_env_file {
+        if let Some(p) = tef.to_str() {
+            cmd.args(["--env-file", p]);
+        }
+    }
+    cmd.args(["images", "-q"]);
+    for service in &meta.services {
+        cmd.arg(service);
+    }
+    cmd.current_dir(&meta.work_dir);
+    match cmd.output() {
+        Ok(out) if out.status.success() => {
+            parse_image_ids(&String::from_utf8_lossy(&out.stdout))
+        }
+        Ok(out) => {
+            warn!(status = ?out.status, "docker compose images -q failed during stage; staged.images will be empty");
+            Vec::new()
+        }
+        Err(e) => {
+            warn!(error = %e, "could not run docker compose images -q during stage; staged.images will be empty");
+            Vec::new()
+        }
+    }
+}
+
+/// Parse the stdout of `docker compose images -q` into a deduplicated,
+/// order-preserving list of non-empty image IDs (one per line).
+fn parse_image_ids(stdout: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    stdout
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .filter(|l| seen.insert(l.to_string()))
+        .map(|l| l.to_string())
+        .collect()
 }
 
 impl Stream for NdjsonStream {
@@ -1050,6 +1345,14 @@ impl Stream for NdjsonStream {
             return Poll::Ready(None);
         }
 
+        // A buffered terminal line (e.g. `done`, deferred so an additive
+        // terminal event like the dry-run `plan` could be emitted first). Once
+        // this flushes the stream is finished.
+        if let Some(line) = this.pending_terminal.take() {
+            this.done = true;
+            return Poll::Ready(Some(Ok(line)));
+        }
+
         // Poll stderr first
         if let Some(ref mut stderr) = this.stderr {
             match Pin::new(stderr).poll_next_line(cx) {
@@ -1058,6 +1361,11 @@ impl Stream for NdjsonStream {
                     this.stderr_tail.push_back(line.clone());
                     if this.stderr_tail.len() > 30 {
                         this.stderr_tail.pop_front();
+                    }
+                    // Compose's dry-run progress goes to stderr; collect for the
+                    // advisory plan parse on a dry-run stream.
+                    if let Some(buf) = this.dry_run_lines.as_mut() {
+                        buf.push(line.clone());
                     }
                     let event = NdjsonEvent {
                         event: "stderr".into(),
@@ -1081,6 +1389,11 @@ impl Stream for NdjsonStream {
         if let Some(ref mut stdout) = this.stdout {
             match Pin::new(stdout).poll_next_line(cx) {
                 Poll::Ready(Ok(Some(line))) => {
+                    // Some Compose builds also surface dry-run plan lines on
+                    // stdout; collect those too for the advisory plan parse.
+                    if let Some(buf) = this.dry_run_lines.as_mut() {
+                        buf.push(line.clone());
+                    }
                     let event = NdjsonEvent {
                         event: "stdout".into(),
                         data: Some(line),
@@ -1186,7 +1499,12 @@ impl Stream for NdjsonStream {
                             }
                         }
 
-                        this.done = true;
+                        // NOTE: `done` is NOT necessarily set here. When this is a
+                        // dry-run stream we emit an additive `plan` event now and
+                        // buffer the `done` line in `pending_terminal`, flushing it
+                        // (and setting `done`) on the next poll. For every other
+                        // (real) stream the behavior is unchanged: `done` is set
+                        // and emitted immediately below.
 
                         // Notify Slack with the real outcome now that the
                         // streaming op has finished (best-effort, non-blocking).
@@ -1203,15 +1521,45 @@ impl Stream for NdjsonStream {
                             // Written synchronously HERE — before the `done` event
                             // below — so it is durable before the client sees
                             // success (a detached write could lose to an immediate
-                            // restart).
+                            // restart). This is the DISK success path (the eager
+                            // in-memory write in the compose_up handler is
+                            // last-ATTEMPTED; this is last-SUCCEEDED). On success
+                            // we rotate this project's current -> previous, set the
+                            // new current, mirror it to the legacy top-level fields,
+                            // and persist the whole per-project map atomically.
+                            //
+                            // compose_stage (materialize_only) and compose_down do
+                            // NOT rotate: staging activates nothing and teardown is
+                            // observed via /docker/ps, so deployed state is left
+                            // intact (see compose_down).
                             if status.success() && notice.action.action == "compose_up" {
-                                let v = DeployedVersion {
+                                let new_current = DeployedRecord {
                                     tag: notice.action.tag.clone(),
                                     commit: notice.action.commit.clone(),
                                     file: notice.action.file.clone(),
                                     file_sha256: notice.action.file_sha256.clone(),
                                 };
-                                if let Err(e) = persist_deployed_version(&notice.state.work_dir, &v) {
+                                let state = &notice.state;
+                                let snapshot = {
+                                    let mut projects = state.deployed_projects.write().expect("deployed_projects lock poisoned");
+                                    let entry = projects.entry(notice.project.clone()).or_default();
+                                    // Rotate the prior current into previous (the
+                                    // last-known-good rollback target), then set
+                                    // the new current.
+                                    if entry.current != DeployedRecord::default() {
+                                        entry.previous = Some(entry.current.clone());
+                                    }
+                                    entry.current = new_current.clone();
+                                    DeployedState { projects: projects.clone() }
+                                };
+                                // Mirror the just-written project to the legacy
+                                // top-level fields so single-project /version
+                                // stays byte-identical.
+                                *state.deployed_tag.write().expect("deployed_tag lock poisoned") = new_current.tag.clone();
+                                *state.deployed_commit.write().expect("deployed_commit lock poisoned") = new_current.commit.clone();
+                                *state.deployed_file.write().expect("deployed_file lock poisoned") = new_current.file.clone();
+                                *state.deployed_file_sha256.write().expect("deployed_file_sha256 lock poisoned") = new_current.file_sha256.clone();
+                                if let Err(e) = persist_deployed_state(&state.work_dir, &snapshot) {
                                     error!(error = %e, "Failed to persist deployed.json");
                                 }
                             }
@@ -1222,15 +1570,56 @@ impl Stream for NdjsonStream {
                             let _ = std::fs::remove_file(path);
                         }
 
-                        let event = NdjsonEvent {
+                        // Render the terminal `done` line up front.
+                        let done_event = NdjsonEvent {
                             event: "done".into(),
                             data: None,
                             success: Some(status.success()),
                             exit_code: status.code(),
                         };
-                        let mut json = serde_json::to_string(&event).unwrap();
-                        json.push('\n');
-                        return Poll::Ready(Some(Ok(json)));
+                        let mut done_json = serde_json::to_string(&done_event).unwrap();
+                        done_json.push('\n');
+
+                        // Dry-run: emit the advisory `plan` first, defer `done`.
+                        if let Some(lines) = this.dry_run_lines.take() {
+                            let plan = parse_dry_run_plan(&lines);
+                            let plan_line = serde_json::json!({
+                                "event": "plan",
+                                "success": status.success(),
+                                "exit_code": status.code(),
+                                "plan": plan,
+                            });
+                            let mut plan_json = serde_json::to_string(&plan_line).unwrap();
+                            plan_json.push('\n');
+                            // Buffer `done` for the next poll; this stream stays
+                            // not-done so the top-of-poll flush can emit it.
+                            this.pending_terminal = Some(done_json);
+                            return Poll::Ready(Some(Ok(plan_json)));
+                        }
+
+                        // materialize_only: on SUCCESS emit the terminal `staged`
+                        // done-marker (image digests landed) first, defer `done`.
+                        // On a failed stage we skip `staged` (materialization did
+                        // not finish) and just emit `done` with success:false.
+                        if let Some(meta) = this.staged.take() {
+                            if status.success() {
+                                let images = staged_image_digests(&meta);
+                                let staged_line = serde_json::json!({
+                                    "event": "staged",
+                                    "tag": meta.tag,
+                                    "file": meta.file,
+                                    "file_sha256": meta.file_sha256,
+                                    "images": images,
+                                });
+                                let mut staged_json = serde_json::to_string(&staged_line).unwrap();
+                                staged_json.push('\n');
+                                this.pending_terminal = Some(done_json);
+                                return Poll::Ready(Some(Ok(staged_json)));
+                            }
+                        }
+
+                        this.done = true;
+                        return Poll::Ready(Some(Ok(done_json)));
                     }
                     Poll::Ready(Err(e)) => {
                         this.done = true;
@@ -1370,6 +1759,7 @@ fn resolve_compose_project(project: Option<&str>, work_dir: &Path) -> Result<Str
     }
 }
 
+#[allow(clippy::too_many_arguments)] // cohesive compose-invocation builder
 fn build_compose_cmd(
     work_dir: &Path,
     project: &str,
@@ -1378,6 +1768,7 @@ fn build_compose_cmd(
     env_files: &[String],
     services: &[String],
     temp_env_file: Option<&Path>,
+    dry_run: bool,
 ) -> AsyncCommand {
     let mut cmd = AsyncCommand::new("docker");
     // `-p` BEFORE the subcommand pins the project, overriding any leaked
@@ -1386,7 +1777,16 @@ fn build_compose_cmd(
     // by the caller (default = working-directory basename via
     // compose_project_name; optional override validated by
     // resolve_compose_project). See compose_project_name.
-    cmd.args(["compose", "-p", project, "-f", file]);
+    //
+    // `--dry-run` is docker compose's GLOBAL flag and MUST sit right after the
+    // `compose` word (before the subcommand). It makes the whole invocation
+    // simulate only — Compose computes the per-service resolved config-hash and
+    // prints what WOULD create/recreate/remove without touching any container.
+    cmd.arg("compose");
+    if dry_run {
+        cmd.arg("--dry-run");
+    }
+    cmd.args(["-p", project, "-f", file]);
     for ef in env_files {
         cmd.args(["--env-file", ef.as_str()]);
     }
@@ -1403,6 +1803,7 @@ fn build_compose_cmd(
     cmd
 }
 
+#[allow(clippy::too_many_arguments)] // cohesive compose-invocation builder
 fn stream_docker_compose_phased(
     work_dir: &Path,
     project: &str,
@@ -1411,6 +1812,7 @@ fn stream_docker_compose_phased(
     env_files: &[String],
     services: &[String],
     temp_env_file: Option<PathBuf>,
+    dry_run: bool,
 ) -> Result<NdjsonStream> {
     let all_env_files: Vec<&str> = env_files.iter().map(|s| s.as_str())
         .chain(temp_env_file.as_ref().map(|p| p.to_str().unwrap()))
@@ -1428,7 +1830,7 @@ fn stream_docker_compose_phased(
     );
 
     let mut commands: VecDeque<AsyncCommand> = phases.iter()
-        .map(|args| build_compose_cmd(work_dir, project, args, file, env_files, services, temp_env_file.as_deref()))
+        .map(|args| build_compose_cmd(work_dir, project, args, file, env_files, services, temp_env_file.as_deref(), dry_run))
         .collect();
 
     let mut first_cmd = commands.pop_front()
@@ -1461,6 +1863,9 @@ fn stream_docker_compose_phased(
         completion: None,
         stderr_tail: VecDeque::new(),
         endpoint_retry: None,
+        dry_run_lines: if dry_run { Some(Vec::new()) } else { None },
+        pending_terminal: None,
+        staged: None,
     })
 }
 
@@ -1473,7 +1878,9 @@ fn stream_docker_compose(
     services: &[String],
     temp_env_file: Option<PathBuf>,
 ) -> Result<NdjsonStream> {
-    stream_docker_compose_phased(work_dir, project, &[args], file, env_files, services, temp_env_file)
+    // compose_down is always a real apply (never dry-run); dry_run is an `up`
+    // affordance only.
+    stream_docker_compose_phased(work_dir, project, &[args], file, env_files, services, temp_env_file, false)
 }
 
 // --- Handlers ---
@@ -1561,6 +1968,107 @@ async fn compose_up(
         up_args.push("--force-recreate");
     }
 
+    // PLAN-only (dry_run): genuinely read-only. We simulate ONLY the `up` phase
+    // with docker compose's global `--dry-run` (the recreate verdict comes from
+    // up's per-service config-hash; the pull/build dry-run output is noise per
+    // the audit), and STOP. We do NOT record an action, NOT write deployed_* or
+    // deployed.json, and attach NO completion (no Slack, no deployed rotation)
+    // and NO endpoint_retry (recovery only makes sense for a real apply).
+    // Nothing mutates, spawns, pulls, builds, or writes the action log. All
+    // scoping fields (tag/file/project/services/env/force_recreate) are honored
+    // so the plan reflects the EXACT command a real apply with this body runs.
+    if payload.dry_run {
+        let mut stream = match stream_docker_compose_phased(
+            &state.work_dir,
+            &project,
+            &[&up_args],
+            &file,
+            &state.env_files,
+            &payload.services,
+            temp_env_file,
+            true, // --dry-run
+        ) {
+            Ok(s) => s,
+            Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        };
+        stream.compose_guard = Some(guard);
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/x-ndjson")
+            .body(Body::from_stream(stream))
+            .unwrap();
+    }
+
+    // MATERIALIZE-only: run the prologue (already done above: lock, validate_tag
+    // age-guard, fetch+write compose, env validation, temp-env-file, project
+    // resolve), then run ONLY the `pull` + `build` phases — STOP before `up`.
+    // The old model keeps serving; nothing is activated. We record a DISTINCT
+    // lower-privilege `compose_stage` action (NOT compose_up) and DO NOT write
+    // deployed_* or persist deployed.json (staging activates nothing, so a
+    // compose_up record / deployed flip would make /version + the attested log
+    // LIE about what is running). The success hook only rotates on `compose_up`,
+    // so the attached completion notice reports the stage outcome to Slack
+    // without touching deployed state. A terminal `staged` event marks
+    // materialization done and lists the landed image digests. Weight download
+    // is the compose file's EXISTING model-downloader service, selected via the
+    // `services` field with platform-controlled HF_HUB_OFFLINE in `env`.
+    if payload.materialize_only {
+        let mut stream = match stream_docker_compose_phased(
+            &state.work_dir,
+            &project,
+            &[&["pull", "--ignore-buildable"], &["build"]], // STOP before `up`
+            &file,
+            &state.env_files,
+            &payload.services,
+            temp_env_file,
+            false,
+        ) {
+            Ok(s) => s,
+            Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        };
+        stream.compose_guard = Some(guard);
+        stream.staged = Some(StagedMeta {
+            work_dir: state.work_dir.clone(),
+            project: project.clone(),
+            file: file.clone(),
+            env_files: state.env_files.clone(),
+            services: payload.services.clone(),
+            temp_env_file: temp_env_file_for_retry,
+            tag: payload.tag.clone(),
+            file_sha256: file_sha256.clone(),
+        });
+
+        let actor = extract_actor(&headers);
+        let action = DeploymentAction {
+            timestamp: Utc::now().to_rfc3339(),
+            action: "compose_stage".into(),
+            image: None,
+            tag: Some(payload.tag.clone()),
+            commit: Some(tag_info.commit_sha.clone()),
+            file: Some(file.clone()),
+            file_sha256: Some(file_sha256.clone()),
+            services: payload.services.clone(),
+            container: None,
+        };
+        if record_action(&state, &action).await.is_err() {
+            return err_response(StatusCode::INTERNAL_SERVER_ERROR, "Failed to persist action log");
+        }
+        // Slack outcome only — never touches deployed state (rotation is gated
+        // on compose_up).
+        stream.completion = Some(notify::CompletionNotice {
+            state: state.clone(),
+            action,
+            actor,
+            project: project.clone(),
+        });
+
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/x-ndjson")
+            .body(Body::from_stream(stream))
+            .unwrap();
+    }
+
     let mut stream = match stream_docker_compose_phased(
         &state.work_dir,
         &project,
@@ -1569,6 +2077,7 @@ async fn compose_up(
         &state.env_files,
         &payload.services,
         temp_env_file,
+        false,
     ) {
         Ok(s) => s,
         Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
@@ -1605,12 +2114,18 @@ async fn compose_up(
         state: state.clone(),
         action,
         actor,
+        project: project.clone(),
     });
 
-    *state.deployed_tag.write().await = Some(payload.tag);
-    *state.deployed_commit.write().await = Some(tag_info.commit_sha);
-    *state.deployed_file.write().await = Some(file);
-    *state.deployed_file_sha256.write().await = Some(file_sha256);
+    // Eager in-memory write of the legacy top-level fields = last-ATTEMPTED up
+    // (byte-identical to pre-#46 behavior; /version surfaces these). The new
+    // per-project `deployed_projects` map is updated only on SUCCESS in the
+    // stream-completion hook above, so it always reflects last-SUCCEEDED and a
+    // failed attempt never appears as a project's `current`.
+    *state.deployed_tag.write().expect("deployed_tag lock poisoned") = Some(payload.tag);
+    *state.deployed_commit.write().expect("deployed_commit lock poisoned") = Some(tag_info.commit_sha);
+    *state.deployed_file.write().expect("deployed_file lock poisoned") = Some(file);
+    *state.deployed_file_sha256.write().expect("deployed_file_sha256 lock poisoned") = Some(file_sha256);
 
     Response::builder()
         .status(StatusCode::OK)
@@ -1704,10 +2219,18 @@ async fn compose_down(
     if record_action(&state, &action).await.is_err() {
         return err_response(StatusCode::INTERNAL_SERVER_ERROR, "Failed to persist action log");
     }
+    // compose_down LIFECYCLE: deployed state is deliberately LEFT INTACT on a
+    // down. The success hook only rotates on `compose_up`, so /version keeps
+    // reporting the last-deployed tuple after a teardown. Teardown is observed
+    // via /docker/ps (which reflects the actually-running containers), not by
+    // clearing deployed state here. This matches pre-#46 behavior (down never
+    // cleared the deployed_* fields) and is made explicit so the reconciler
+    // does not treat a stale `current` as "still running".
     stream.completion = Some(notify::CompletionNotice {
         state: state.clone(),
         action,
         actor,
+        project,
     });
 
     Response::builder()
@@ -2167,11 +2690,17 @@ async fn attestation_report(
 }
 
 async fn version(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let tag = state.deployed_tag.read().await.clone();
-    let commit = state.deployed_commit.read().await.clone();
-    let file = state.deployed_file.read().await.clone();
-    let file_sha256 = state.deployed_file_sha256.read().await.clone();
-    (StatusCode::OK, Json(StatusResponse { status: "ok".into(), tag, commit, file, file_sha256, output: None, exit_code: None, error: None, image: state.running_image.clone() }))
+    // Top-level tag/commit/file/file_sha256 stay byte-identical to the
+    // pre-#46 single-tuple contract: they mirror the LAST-written project's
+    // `current`. The additive `projects` map exposes per-project
+    // {current, previous} for the external reconciler; it is omitted entirely
+    // when empty, so single-project CVMs see no shape change.
+    let tag = state.deployed_tag.read().expect("deployed_tag lock poisoned").clone();
+    let commit = state.deployed_commit.read().expect("deployed_commit lock poisoned").clone();
+    let file = state.deployed_file.read().expect("deployed_file lock poisoned").clone();
+    let file_sha256 = state.deployed_file_sha256.read().expect("deployed_file_sha256 lock poisoned").clone();
+    let projects = state.deployed_projects.read().expect("deployed_projects lock poisoned").clone();
+    (StatusCode::OK, Json(StatusResponse { status: "ok".into(), tag, commit, file, file_sha256, output: None, exit_code: None, error: None, image: state.running_image.clone(), projects }))
 }
 
 // --- Dstack guest-agent management ---
@@ -3387,8 +3916,10 @@ async fn main() -> Result<()> {
     // though the same stack is still running. deployed.json is written only when a
     // compose_up stream completes successfully, so a failed attempt can't surface
     // here as the deployed version.
-    let mut restored = load_deployed_version(&work_dir);
-    if restored.tag.is_none() && restored.file.is_none() {
+    // Per-project state. A legacy single-tuple deployed.json migrates into
+    // projects["work"].current via load_deployed_state.
+    let mut restored = load_deployed_state(&work_dir);
+    if restored.projects.is_empty() {
         // One-shot legacy migration (gated by a marker) for installs that predate
         // deployed.json. See migrate_legacy_deployed_version: this never backfills
         // a failed compose_up created under this code.
@@ -3396,9 +3927,20 @@ async fn main() -> Result<()> {
             restored = v;
         }
     }
-    if restored.tag.is_some() || restored.file.is_some() {
-        info!(tag = ?restored.tag, file = ?restored.file, "Restored last-deployed version");
+    if !restored.projects.is_empty() {
+        info!(projects = ?restored.projects.keys().collect::<Vec<_>>(), "Restored last-deployed per-project state");
     }
+    // Mirror the most-recently-written project's `current` into the legacy
+    // top-level fields so /version's top-level tuple is byte-identical to the
+    // pre-#46 contract. BTreeMap iteration is name-ordered (not write-ordered);
+    // a single-project CVM has exactly one entry, so the mirror is unambiguous
+    // there — the case the byte-identity contract covers.
+    let restored_top = restored
+        .projects
+        .values()
+        .next_back()
+        .map(|p| p.current.clone())
+        .unwrap_or_default();
 
     // Resolve the image this process is running so the running version can be
     // attested — recorded as the `compose_manager_started` action below (hashed
@@ -3418,10 +3960,11 @@ async fn main() -> Result<()> {
         env_files,
         slack_webhook_url,
         instance_label,
-        deployed_tag: RwLock::new(restored.tag),
-        deployed_commit: RwLock::new(restored.commit),
-        deployed_file: RwLock::new(restored.file),
-        deployed_file_sha256: RwLock::new(restored.file_sha256),
+        deployed_projects: StdRwLock::new(restored.projects),
+        deployed_tag: StdRwLock::new(restored_top.tag),
+        deployed_commit: StdRwLock::new(restored_top.commit),
+        deployed_file: StdRwLock::new(restored_top.file),
+        deployed_file_sha256: StdRwLock::new(restored_top.file_sha256),
         actions: RwLock::new(initial_actions),
         // Bounded timeouts: the compose lock is held across GitHub fetches in
         // compose_up/compose_down, so a hung GitHub call would otherwise gate
@@ -3520,7 +4063,10 @@ mod tests {
         let dir = temp_work_dir();
         let legacy = vec![compose_up_action("v1", "a.yaml")];
         let v = migrate_legacy_deployed_version(&dir, &legacy).unwrap();
-        assert_eq!(v.tag.as_deref(), Some("v1"));
+        // Legacy action-log backfill lands in projects["work"].current, previous=null.
+        let work = v.projects.get(LEGACY_PROJECT_KEY).expect("migrated into work");
+        assert_eq!(work.current.tag.as_deref(), Some("v1"));
+        assert!(work.previous.is_none());
         assert!(deployed_version_file(&dir).exists(), "deployed.json should be written");
         assert!(migration_marker_file(&dir).exists(), "marker should be written");
 
@@ -3546,34 +4092,327 @@ mod tests {
     }
 
     #[test]
-    fn load_deployed_version_handles_missing_and_corrupt() {
+    fn load_deployed_state_handles_missing_and_corrupt() {
         let dir = temp_work_dir();
         // No file yet -> empty (the pre-first-deploy / pre-upgrade state).
-        let v = load_deployed_version(&dir);
-        assert!(v.tag.is_none() && v.file.is_none());
+        let v = load_deployed_state(&dir);
+        assert!(v.projects.is_empty());
         // Corrupt file -> ignored, not a panic.
         std::fs::write(deployed_version_file(&dir), b"{not json").unwrap();
-        let v = load_deployed_version(&dir);
-        assert!(v.tag.is_none() && v.file.is_none());
+        let v = load_deployed_state(&dir);
+        assert!(v.projects.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn deployed_record(tag: &str, file: &str) -> DeployedRecord {
+        DeployedRecord {
+            tag: Some(tag.into()),
+            commit: Some("abc123".into()),
+            file: Some(file.into()),
+            file_sha256: Some("deadbeef".into()),
+        }
+    }
+
+    #[test]
+    fn deployed_state_round_trips_through_disk() {
+        let dir = temp_work_dir();
+        let mut projects = std::collections::BTreeMap::new();
+        projects.insert(
+            "glm-5-1".to_string(),
+            ProjectDeployed {
+                current: deployed_record("v0.0.211", "GLM-5.1.yaml"),
+                previous: Some(deployed_record("v0.0.210", "GLM-5.1.yaml")),
+            },
+        );
+        let state = DeployedState { projects };
+        persist_deployed_state(&dir, &state).unwrap();
+        let loaded = load_deployed_state(&dir);
+        assert_eq!(loaded, state);
+        let p = loaded.projects.get("glm-5-1").unwrap();
+        assert_eq!(p.current.tag.as_deref(), Some("v0.0.211"));
+        assert_eq!(p.previous.as_ref().unwrap().tag.as_deref(), Some("v0.0.210"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn deployed_version_round_trips_through_disk() {
+    fn legacy_single_tuple_deployed_json_migrates_into_work() {
+        // A pre-existing single-tuple deployed.json (the on-disk format before
+        // this change) must load into projects["work"].current with previous=null.
         let dir = temp_work_dir();
-        let v = DeployedVersion {
-            tag: Some("v0.0.211".into()),
-            commit: Some("abc123".into()),
-            file: Some("GLM-5.1.yaml".into()),
-            file_sha256: Some("deadbeef".into()),
-        };
-        persist_deployed_version(&dir, &v).unwrap();
-        let loaded = load_deployed_version(&dir);
-        assert_eq!(loaded.tag.as_deref(), Some("v0.0.211"));
-        assert_eq!(loaded.commit.as_deref(), Some("abc123"));
-        assert_eq!(loaded.file.as_deref(), Some("GLM-5.1.yaml"));
-        assert_eq!(loaded.file_sha256.as_deref(), Some("deadbeef"));
+        std::fs::write(
+            deployed_version_file(&dir),
+            br#"{"tag":"v0.0.99","commit":"c0ffee","file":"old.yaml","file_sha256":"abcd"}"#,
+        )
+        .unwrap();
+        let loaded = load_deployed_state(&dir);
+        assert_eq!(loaded.projects.len(), 1);
+        let work = loaded.projects.get(LEGACY_PROJECT_KEY).expect("migrated into work");
+        assert_eq!(work.current.tag.as_deref(), Some("v0.0.99"));
+        assert_eq!(work.current.file.as_deref(), Some("old.yaml"));
+        assert!(work.previous.is_none(), "legacy migration carries no previous");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn empty_deployed_json_is_empty_state() {
+        // Both an empty object and an empty map deserialize to empty state.
+        assert!(parse_deployed_state("{}").unwrap().projects.is_empty());
+        assert!(parse_deployed_state(r#"{"work":{"current":{}}}"#).unwrap()
+            .projects
+            .get("work")
+            .unwrap()
+            .current
+            == DeployedRecord::default());
+    }
+
+    /// Mirror the rotation the stream-completion success hook performs, so we can
+    /// unit-test the current->previous semantics without spawning docker. Keep in
+    /// lock-step with the inline logic in `NdjsonStream::poll_next`.
+    fn rotate_on_success(state: &mut DeployedState, project: &str, new_current: DeployedRecord) {
+        let entry = state.projects.entry(project.to_string()).or_default();
+        if entry.current != DeployedRecord::default() {
+            entry.previous = Some(entry.current.clone());
+        }
+        entry.current = new_current;
+    }
+
+    #[test]
+    fn rotation_moves_current_to_previous_on_success() {
+        let mut state = DeployedState::default();
+        // First successful deploy: current set, previous still null.
+        rotate_on_success(&mut state, "glm", deployed_record("v1", "a.yaml"));
+        let p = state.projects.get("glm").unwrap();
+        assert_eq!(p.current.tag.as_deref(), Some("v1"));
+        assert!(p.previous.is_none(), "first deploy has no previous");
+        // Second successful deploy: v1 rotates into previous, v2 becomes current.
+        rotate_on_success(&mut state, "glm", deployed_record("v2", "a.yaml"));
+        let p = state.projects.get("glm").unwrap();
+        assert_eq!(p.current.tag.as_deref(), Some("v2"));
+        assert_eq!(p.previous.as_ref().unwrap().tag.as_deref(), Some("v1"));
+    }
+
+    #[test]
+    fn failed_up_does_not_rotate_deployed_state() {
+        // The rotation only runs inside the `status.success()` branch. A failed
+        // up never calls it, so deployed state is untouched. Modeled here by NOT
+        // invoking rotate_on_success for the failed attempt.
+        let mut state = DeployedState::default();
+        rotate_on_success(&mut state, "glm", deployed_record("v1", "a.yaml"));
+        let before = state.clone();
+        // (failed up: no rotation)
+        assert_eq!(state, before, "a failed up must not change deployed state");
+        let p = state.projects.get("glm").unwrap();
+        assert_eq!(p.current.tag.as_deref(), Some("v1"));
+        assert!(p.previous.is_none());
+    }
+
+    #[test]
+    fn single_project_version_top_level_is_byte_identical() {
+        // Contract: on a single-project CVM the 5 legacy top-level /version fields
+        // (status/tag/commit/file/file_sha256) must serialize byte-identically to
+        // the pre-#46 response, with `projects` appended additively. Build the
+        // exact StatusResponse /version emits and diff the legacy prefix.
+        let mut projects = std::collections::BTreeMap::new();
+        projects.insert(
+            "glm".to_string(),
+            ProjectDeployed { current: deployed_record("v1", "a.yaml"), previous: None },
+        );
+        let with_projects = StatusResponse {
+            status: "ok".into(),
+            tag: Some("v1".into()),
+            commit: Some("abc123".into()),
+            file: Some("a.yaml".into()),
+            file_sha256: Some("deadbeef".into()),
+            output: None,
+            exit_code: None,
+            error: None,
+            image: None,
+            projects,
+        };
+        let json = serde_json::to_string(&with_projects).unwrap();
+        // Legacy top-level fields are present and unchanged.
+        assert!(json.contains(r#""status":"ok""#));
+        assert!(json.contains(r#""tag":"v1""#));
+        assert!(json.contains(r#""commit":"abc123""#));
+        assert!(json.contains(r#""file":"a.yaml""#));
+        assert!(json.contains(r#""file_sha256":"deadbeef""#));
+        // `projects` is additive.
+        assert!(json.contains(r#""projects":{"glm":"#));
+
+        // With NO projects, `projects` is omitted entirely => byte-identical to
+        // the pre-#46 shape (no trailing field, no null).
+        let empty = StatusResponse {
+            status: "ok".into(),
+            tag: Some("v1".into()),
+            commit: None,
+            file: None,
+            file_sha256: None,
+            output: None,
+            exit_code: None,
+            error: None,
+            image: None,
+            projects: Default::default(),
+        };
+        let json = serde_json::to_string(&empty).unwrap();
+        assert_eq!(json, r#"{"status":"ok","tag":"v1"}"#);
+    }
+
+    // --- dry_run (Commit B) ---
+
+    fn cmd_args(cmd: &AsyncCommand) -> Vec<String> {
+        cmd.as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn dry_run_flag_sits_right_after_compose() {
+        // --dry-run is a GLOBAL flag and MUST precede the subcommand (`up`).
+        let cmd = build_compose_cmd(
+            Path::new("/tmp"),
+            "glm",
+            &["up", "-d", "--remove-orphans"],
+            "f.yml",
+            &[],
+            &[],
+            None,
+            true,
+        );
+        let args = cmd_args(&cmd);
+        assert_eq!(args[0], "compose");
+        assert_eq!(args[1], "--dry-run", "global flag must immediately follow `compose`");
+        assert_eq!(args[2], "-p");
+        // The subcommand still comes after -p/-f.
+        assert!(args.iter().position(|a| a == "up").unwrap() > args.iter().position(|a| a == "--dry-run").unwrap());
+    }
+
+    #[test]
+    fn non_dry_run_command_has_no_dry_run_flag() {
+        let cmd = build_compose_cmd(
+            Path::new("/tmp"),
+            "glm",
+            &["up", "-d"],
+            "f.yml",
+            &[],
+            &[],
+            None,
+            false,
+        );
+        let args = cmd_args(&cmd);
+        assert!(!args.iter().any(|a| a == "--dry-run"), "real apply must never carry --dry-run");
+        assert_eq!(args[0], "compose");
+        assert_eq!(args[1], "-p");
+    }
+
+    #[test]
+    fn parse_dry_run_plan_buckets_each_verb() {
+        // Compose's progress writer style, including the DRY-RUN MODE prefix.
+        let lines = vec![
+            "DRY-RUN MODE -  glm-vllm-1  Creating".to_string(),
+            "DRY-RUN MODE -  glm-proxy-1  Recreate".to_string(),
+            "DRY-RUN MODE -  glm-old-1  Removing".to_string(),
+            "DRY-RUN MODE -  glm-nginx-1  Running".to_string(),
+        ];
+        let plan = parse_dry_run_plan(&lines);
+        assert_eq!(plan.create, vec!["glm-vllm-1"]);
+        assert_eq!(plan.recreate, vec!["glm-proxy-1"]);
+        assert_eq!(plan.remove, vec!["glm-old-1"]);
+        assert_eq!(plan.unchanged, vec!["glm-nginx-1"]);
+    }
+
+    #[test]
+    fn parse_dry_run_plan_remove_orphans_and_strongest_verb_wins() {
+        // The `remove` case from `--remove-orphans` with an EMPTY services[]:
+        // an orphan container shows a Removing line; an unchanged one shows
+        // Running. Paired progress lines (Creating then Created) must not
+        // double-count — the strongest verb for a name wins.
+        let lines = vec![
+            "orphan-1  Removing".to_string(),
+            "orphan-1  Removed".to_string(),
+            "svc-1  Creating".to_string(),
+            "svc-1  Created".to_string(),
+            "svc-2  Running".to_string(),
+            // A later Recreate for svc-2 must upgrade it past unchanged.
+            "svc-2  Recreate".to_string(),
+            "noise that is not a status line".to_string(),
+            "".to_string(),
+        ];
+        let plan = parse_dry_run_plan(&lines);
+        assert_eq!(plan.remove, vec!["orphan-1"]);
+        assert_eq!(plan.create, vec!["svc-1"]);
+        assert_eq!(plan.recreate, vec!["svc-2"]);
+        assert!(plan.unchanged.is_empty(), "svc-2 upgraded to recreate, not left unchanged");
+    }
+
+    #[test]
+    fn dry_run_plan_serializes_with_all_four_buckets() {
+        // The advisory plan always serializes all four arrays (empty when none),
+        // so the contract shape is stable for the reconciler.
+        let plan = DryRunPlan::default();
+        let json = serde_json::to_string(&plan).unwrap();
+        assert_eq!(json, r#"{"create":[],"recreate":[],"remove":[],"unchanged":[]}"#);
+    }
+
+    // --- materialize_only (Commit C) ---
+
+    #[test]
+    fn parse_image_ids_dedups_and_trims() {
+        let out = "  sha256:aaa  \nsha256:bbb\n\nsha256:aaa\n  \nsha256:ccc\n";
+        assert_eq!(
+            parse_image_ids(out),
+            vec!["sha256:aaa", "sha256:bbb", "sha256:ccc"]
+        );
+        assert!(parse_image_ids("").is_empty());
+        assert!(parse_image_ids("\n  \n").is_empty());
+    }
+
+    #[test]
+    fn staged_event_line_has_documented_shape() {
+        // The terminal `staged` done-marker shape the platform consumes.
+        let staged_line = serde_json::json!({
+            "event": "staged",
+            "tag": "v0.0.211",
+            "file": "GLM-5.1.yaml",
+            "file_sha256": "deadbeef",
+            "images": ["sha256:aaa", "sha256:bbb"],
+        });
+        let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&staged_line).unwrap()).unwrap();
+        assert_eq!(v["event"], "staged");
+        assert_eq!(v["tag"], "v0.0.211");
+        assert_eq!(v["file"], "GLM-5.1.yaml");
+        assert_eq!(v["file_sha256"], "deadbeef");
+        assert_eq!(v["images"], serde_json::json!(["sha256:aaa", "sha256:bbb"]));
+    }
+
+    #[test]
+    fn compose_stage_is_distinct_verb_and_never_migrates_as_deployed() {
+        // compose_stage MUST be a distinct verb (not compose_up): the
+        // success-rotation hook only rotates on compose_up, and the legacy
+        // action-log migration only seeds deployed state from a compose_up — so
+        // a staged-but-not-activated model can never surface as "deployed".
+        let stage = DeploymentAction {
+            action: "compose_stage".into(),
+            tag: Some("v-staged".into()),
+            file: Some("staged.yaml".into()),
+            ..Default::default()
+        };
+        assert!(
+            deployed_version_from_actions(&[stage]).is_none(),
+            "a compose_stage action must never be picked as the deployed version"
+        );
+    }
+
+    #[test]
+    fn compose_stage_slack_message_reads_as_staged_not_deployed() {
+        let mut a = sample_action("compose_stage");
+        a.tag = Some("v1".into());
+        a.file = Some("glm.yaml".into());
+        let ok = notify::format_message(&a, "gpu30", "ops", Some(true));
+        assert!(ok.contains("Staged (not activated)"), "got: {ok}");
+        assert!(!ok.contains("Deployed"), "must not read as an activation: {ok}");
+        let failed = notify::format_message(&a, "gpu30", "ops", Some(false));
+        assert!(failed.contains("Stage failed"), "got: {failed}");
     }
 
     #[test]
@@ -3984,10 +4823,11 @@ mod tests {
             env_files: vec![],
             slack_webhook_url: None,
             instance_label: "test-host".into(),
-            deployed_tag: RwLock::new(None),
-            deployed_commit: RwLock::new(None),
-            deployed_file: RwLock::new(None),
-            deployed_file_sha256: RwLock::new(None),
+            deployed_projects: StdRwLock::new(Default::default()),
+            deployed_tag: StdRwLock::new(None),
+            deployed_commit: StdRwLock::new(None),
+            deployed_file: StdRwLock::new(None),
+            deployed_file_sha256: StdRwLock::new(None),
             actions: RwLock::new(vec![]),
             http: reqwest::Client::new(),
             compose_lock: Arc::new(Mutex::new(())),
