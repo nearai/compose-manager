@@ -558,6 +558,34 @@ struct CleanRequest {
     containers: bool,
 }
 
+/// What to remove for the named model in `POST /docker/evict`.
+#[derive(Deserialize, Default, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "lowercase")]
+enum EvictTarget {
+    /// Only the downloaded HF weights subtree (`hub/models--org--repo`). Default.
+    #[default]
+    Weights,
+    /// Only the best-effort compile/kernel caches for this model.
+    Cache,
+    /// Both weights and best-effort caches.
+    Both,
+}
+
+/// Selective, per-model eviction request. Removes ONLY the named model's
+/// on-disk subtree(s) from the shared HuggingFace cache volume — never the
+/// whole volume (cf. `/docker/clean`, which blindly prunes everything).
+#[derive(Deserialize)]
+struct EvictRequest {
+    /// HF repo id, e.g. `zai-org/GLM-5.2-FP8`. Maps to `hub/models--org--repo`.
+    model: String,
+    #[serde(default)]
+    target: EvictTarget,
+    /// Override the autodetected cache volume name (handles the `huggingface_cache`
+    /// vs. `hugginface_cache` typo and project-prefixed forms automatically).
+    #[serde(default)]
+    cache_volume: Option<String>,
+}
+
 #[derive(Deserialize, Default)]
 struct LogsRequest {
     #[serde(default)]
@@ -1720,6 +1748,177 @@ async fn docker_clean(
     }
 }
 
+/// Selectively evict ONE model's weights/cache from the shared HuggingFace
+/// cache volume, leaving every other model's warm cache intact. This is the
+/// targeted alternative to `/docker/clean`'s blind `docker volume prune -f`.
+///
+/// Safety guard: refuses with 409 if a RUNNING container is actively serving
+/// the SAME model (matched on `--model-path`/`--model` arg or a `MODEL_NAME`-
+/// style env). Evicting a DIFFERENT model's weights while others run is safe
+/// and is the whole point of being selective.
+async fn docker_evict(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(payload): Json<EvictRequest>,
+) -> impl IntoResponse {
+    if let Err(e) = verify_bearer_token(&headers, &state.bearer_token) {
+        return e;
+    }
+
+    let model = payload.model.trim().to_string();
+    let hub_dir = match model_to_hub_dir(&model) {
+        Ok(d) => d,
+        Err(msg) => return err(StatusCode::BAD_REQUEST, msg),
+    };
+
+    // Serialize against compose up/down etc. so we never race a deploy that is
+    // (re)downloading the very weights we're about to delete.
+    let _guard = match state
+        .try_acquire_compose_lock("docker_evict", None, None, vec![], Some(model.clone()))
+        .await
+    {
+        Ok(g) => g,
+        Err(_) => return err(StatusCode::CONFLICT, state.conflict_message().await),
+    };
+
+    // Resolve the cache volume: explicit override, else autodetect across the
+    // typo / project-prefix variants from what actually exists on the host.
+    let volume = match payload.cache_volume.clone() {
+        Some(v) if !v.trim().is_empty() => v.trim().to_string(),
+        _ => {
+            let volumes = match list_docker_volumes() {
+                Ok(v) => v,
+                Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            };
+            match resolve_hf_cache_volume(&volumes) {
+                Ok(v) => v,
+                Err(msg) => return err(StatusCode::NOT_FOUND, msg),
+            }
+        }
+    };
+
+    // Safety guard: refuse to evict weights for a model that is actively served.
+    // (Only relevant when weights are in scope; a pure "cache" evict is harmless.)
+    if matches!(payload.target, EvictTarget::Weights | EvictTarget::Both) {
+        match containers_serving_model(&model) {
+            Ok(running) if !running.is_empty() => {
+                return err(
+                    StatusCode::CONFLICT,
+                    format!(
+                        "refusing to evict weights for '{}': actively served by running container(s): {}",
+                        model,
+                        running.join(", ")
+                    ),
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                // Fail closed: if we can't determine what's running, don't delete.
+                return err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("could not determine running containers: {e}"),
+                );
+            }
+        }
+    }
+
+    info!(
+        command = "docker_evict",
+        model = %model,
+        hub_dir = %hub_dir,
+        volume = %volume,
+        target = ?payload.target,
+        "Evicting model from cache volume"
+    );
+
+    let mut removed_paths: Vec<String> = Vec::new();
+    let mut freed_bytes: u64 = 0;
+
+    // Weights subtree: hub/models--org--repo.
+    if matches!(payload.target, EvictTarget::Weights | EvictTarget::Both) {
+        let rel = format!("hub/{hub_dir}");
+        match evict_subtree(&volume, &rel) {
+            Ok(bytes) => {
+                freed_bytes += bytes;
+                removed_paths.push(format!("{volume}:/{rel}"));
+            }
+            Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        }
+    }
+
+    // Compile/kernel caches: best-effort only — these are hash-keyed and not
+    // cleanly attributable to one model, so we only clear model-named subdirs
+    // if they happen to exist.
+    if matches!(payload.target, EvictTarget::Cache | EvictTarget::Both) {
+        for rel in model_cache_rels(&hub_dir) {
+            match evict_subtree(&volume, &rel) {
+                Ok(bytes) => {
+                    if bytes > 0 {
+                        freed_bytes += bytes;
+                        removed_paths.push(format!("{volume}:/{rel}"));
+                    }
+                }
+                Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            }
+        }
+    }
+
+    let action = DeploymentAction {
+        timestamp: Utc::now().to_rfc3339(),
+        action: "docker_evict".into(),
+        image: None,
+        tag: None,
+        commit: None,
+        file: None,
+        file_sha256: None,
+        services: vec![],
+        container: Some(model.clone()),
+    };
+    if record_action(&state, &action).await.is_err() {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, "Failed to persist action log");
+    }
+    let actor = extract_actor(&headers);
+    notify::spawn_action(&state, &action, &actor, Some(true));
+
+    let cache_note = if matches!(payload.target, EvictTarget::Cache | EvictTarget::Both) {
+        " (compile/kernel caches are hash-keyed and best-effort; only model-named subdirs, if any, were cleared)"
+    } else {
+        ""
+    };
+    let summary = if removed_paths.is_empty() {
+        format!("nothing to evict for '{model}' in volume '{volume}' (not present){cache_note}")
+    } else {
+        format!(
+            "evicted '{}' from volume '{}': removed {} ({}){}",
+            model,
+            volume,
+            removed_paths.join(", "),
+            format_bytes(freed_bytes),
+            cache_note
+        )
+    };
+    ok_output(summary)
+}
+
+/// Human-readable byte count for the eviction summary (best-effort).
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB", "TiB"];
+    if bytes == 0 {
+        return "0 B".into();
+    }
+    let mut v = bytes as f64;
+    let mut u = 0;
+    while v >= 1024.0 && u < UNITS.len() - 1 {
+        v /= 1024.0;
+        u += 1;
+    }
+    if u == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{v:.2} {} ({bytes} bytes)", UNITS[u])
+    }
+}
+
 // --- Attestation ---
 
 #[derive(Deserialize)]
@@ -2245,6 +2444,180 @@ async fn run_host_systemctl(action: &str, unit: &str) -> Result<SystemctlOutput>
     })
 }
 
+// --- Selective per-model cache eviction (POST /docker/evict) ---
+
+/// Map an HF repo id (`org/repo`) to its on-disk hub directory name
+/// (`models--org--repo`), mirroring the `cleanup-hf-model.yaml` fleet pattern.
+/// Returns Err for ids that would escape the hub dir (path traversal / empty).
+fn model_to_hub_dir(model: &str) -> Result<String, String> {
+    let model = model.trim();
+    if model.is_empty() {
+        return Err("model must not be empty".into());
+    }
+    // HF repo ids are `org/repo` (occasionally a bare `repo`). Reject anything
+    // that could escape `hub/` — leading/embedded path components, dot-segments,
+    // backslashes, NUL. The `org/repo -> org--repo` rewrite means a legitimate id
+    // never contains `..` or a leading slash.
+    if model.contains("..")
+        || model.contains('\\')
+        || model.contains('\0')
+        || model.starts_with('/')
+        || model.ends_with('/')
+        || model.contains("//")
+    {
+        return Err(format!("invalid model id: '{model}'"));
+    }
+    Ok(format!("models--{}", model.replace('/', "--")))
+}
+
+/// Candidate names (in priority order) for the shared HuggingFace cache volume.
+/// The name drifts across the fleet: the correct `huggingface_cache`, the known
+/// typo `hugginface_cache`, and either form prefixed by a compose project (e.g.
+/// `small-models_hugginface_cache`). We pick the one that actually exists.
+const HF_VOLUME_BASENAMES: &[&str] = &["huggingface_cache", "hugginface_cache"];
+
+/// List all docker volume names on the host.
+fn list_docker_volumes() -> Result<Vec<String>> {
+    let out = run_command("docker", &["volume", "ls", "--format", "{{.Name}}"])?;
+    Ok(out.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect())
+}
+
+/// Resolve the HuggingFace cache volume that actually exists on this host.
+///
+/// Prefers an exact basename match (`huggingface_cache`/`hugginface_cache`),
+/// then any project-prefixed form (`<project>_<basename>`). Returns a clear
+/// error listing what was searched if none is present.
+fn resolve_hf_cache_volume(volumes: &[String]) -> Result<String, String> {
+    // Exact, un-prefixed match wins.
+    for base in HF_VOLUME_BASENAMES {
+        if volumes.iter().any(|v| v == base) {
+            return Ok((*base).to_string());
+        }
+    }
+    // Otherwise the first project-prefixed form (`<project>_<basename>`).
+    for base in HF_VOLUME_BASENAMES {
+        let suffix = format!("_{base}");
+        if let Some(v) = volumes.iter().find(|v| v.ends_with(&suffix)) {
+            return Ok(v.clone());
+        }
+    }
+    Err(format!(
+        "no HuggingFace cache volume found on host (looked for {} and any `<project>_*` form)",
+        HF_VOLUME_BASENAMES.join(", ")
+    ))
+}
+
+/// Detect whether a RUNNING container is actively serving `model` (the HF
+/// checkpoint `org/repo`). We inspect each running container's full command
+/// args AND environment for an exact token match — covering both the engine
+/// `--model-path <org/repo>` / `--model <org/repo>` flag and a `MODEL_NAME` /
+/// `*=org/repo` env var. Returns the matching container names.
+fn containers_serving_model(model: &str) -> Result<Vec<String>> {
+    let ids = run_command("docker", &["ps", "-q"])?;
+    let ids: Vec<&str> = ids.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    if ids.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let mut matches = Vec::new();
+    for id in ids {
+        // {{json .Args}} = argv after the entrypoint; {{json .Config.Env}} = env;
+        // {{json .Config.Cmd}} covers the (rare) case where the model flag lives
+        // in Cmd rather than Args. .Name is the container name (leading '/').
+        let fmt = "{{.Name}}\t{{json .Args}}\t{{json .Config.Cmd}}\t{{json .Config.Env}}";
+        let raw = match run_command("docker", &["inspect", "--format", fmt, id]) {
+            Ok(s) => s,
+            // A container can vanish between `ps` and `inspect`; skip it.
+            Err(_) => continue,
+        };
+        let line = raw.trim();
+        let mut parts = line.splitn(4, '\t');
+        let name = parts.next().unwrap_or("").trim_start_matches('/').to_string();
+        let args_json = parts.next().unwrap_or("[]");
+        let cmd_json = parts.next().unwrap_or("[]");
+        let env_json = parts.next().unwrap_or("[]");
+
+        let args: Vec<String> = serde_json::from_str(args_json).unwrap_or_default();
+        let cmd: Vec<String> = serde_json::from_str(cmd_json).unwrap_or_default();
+        let env: Vec<String> = serde_json::from_str(env_json).unwrap_or_default();
+
+        if argv_serves_model(&args, model)
+            || argv_serves_model(&cmd, model)
+            || env_serves_model(&env, model)
+        {
+            matches.push(name);
+        }
+    }
+    Ok(matches)
+}
+
+/// True if argv carries the checkpoint as a value to a model-path flag
+/// (`--model-path org/repo`, `--model org/repo`, or the `=` form). Compares the
+/// whole token so `org/repo` never matches `org/repo-other`.
+fn argv_serves_model(argv: &[String], model: &str) -> bool {
+    const FLAGS: &[&str] = &["--model-path", "--model"];
+    let mut prev: Option<&str> = None;
+    for tok in argv {
+        if let Some(flag) = prev.take() {
+            if FLAGS.contains(&flag) && tok == model {
+                return true;
+            }
+        }
+        if let Some((flag, val)) = tok.split_once('=') {
+            if FLAGS.contains(&flag) && val == model {
+                return true;
+            }
+        }
+        prev = Some(tok.as_str());
+    }
+    false
+}
+
+/// True if any env var's VALUE is exactly `model` (e.g. `MODEL_NAME=org/repo`,
+/// `MODEL_PATH=org/repo`). Matches the value, not a substring, so unrelated
+/// vars that merely contain the string don't trip the guard.
+fn env_serves_model(env: &[String], model: &str) -> bool {
+    env.iter().any(|kv| matches!(kv.split_once('='), Some((_, v)) if v == model))
+}
+
+/// Remove a single subtree (relative to the cache volume root) via a throwaway
+/// alpine container — never touches anything outside `/c/<rel>`. Returns the
+/// pre-removal size in bytes (best-effort; 0 if it can't be measured or the
+/// path is absent).
+fn evict_subtree(volume: &str, rel: &str) -> Result<u64> {
+    let mount = format!("{volume}:/c");
+    // `du -sb` prints "<bytes>\t<path>"; missing path => empty output (no error).
+    let target = format!("/c/{rel}");
+    let script = format!(
+        "set -eu; T=\"{target}\"; \
+         if [ ! -e \"$T\" ]; then echo 0; exit 0; fi; \
+         SZ=$(du -sb \"$T\" 2>/dev/null | cut -f1 || echo 0); \
+         rm -rf \"$T\"; \
+         echo \"${{SZ:-0}}\""
+    );
+    let out = run_command(
+        "docker",
+        &["run", "--rm", "-v", &mount, "alpine:3.20", "sh", "-c", &script],
+    )?;
+    Ok(out.trim().lines().last().and_then(|l| l.trim().parse::<u64>().ok()).unwrap_or(0))
+}
+
+/// Best-effort compile/kernel cache subdirs for a model. These caches
+/// (torchinductor/triton/deep_gemm) are keyed by hashes, NOT by model id, so a
+/// model's compile cache is NOT cleanly identifiable on disk. We therefore do
+/// NOT touch them by default; this returns the model-named hub subdir under any
+/// such cache root that DOES carry the model name, if one exists. In practice
+/// it usually returns nothing — "cache" eviction is documented as best-effort.
+fn model_cache_rels(hub_dir: &str) -> Vec<String> {
+    // Some setups stash per-model artifacts under a model-named directory; cover
+    // the few that are cleanly identifiable. Hash-keyed caches are intentionally
+    // excluded (not attributable to a single model without unsafe heuristics).
+    vec![
+        format!("torchinductor/{hub_dir}"),
+        format!("triton/{hub_dir}"),
+    ]
+}
+
 fn run_docker_prune(volumes: bool, images: bool, containers: bool) -> Result<String> {
     let mut output_text = String::new();
 
@@ -2437,6 +2810,7 @@ async fn main() -> Result<()> {
         .route("/compose/down", post(compose_down))
         .route("/compose/logs", post(compose_logs))
         .route("/docker/clean", post(docker_clean))
+        .route("/docker/evict", post(docker_evict))
         .route("/docker/ps", get(docker_ps))
         .route("/docker/restart", post(docker_restart))
         .route("/status", get(status))
@@ -3162,5 +3536,89 @@ mod tests {
             .await
             .expect("request to Slack failed");
         assert!(resp.status().is_success(), "slack returned {}", resp.status());
+    }
+
+    // --- Selective per-model eviction (/docker/evict) tests ---
+
+    #[test]
+    fn model_to_hub_dir_maps_org_repo() {
+        assert_eq!(model_to_hub_dir("zai-org/GLM-5.2-FP8").unwrap(), "models--zai-org--GLM-5.2-FP8");
+        assert_eq!(model_to_hub_dir("deepseek-ai/DeepSeek-V4-Flash").unwrap(), "models--deepseek-ai--DeepSeek-V4-Flash");
+        // Bare repo id (no org) is still accepted.
+        assert_eq!(model_to_hub_dir("gpt2").unwrap(), "models--gpt2");
+        // Leading/trailing whitespace is trimmed.
+        assert_eq!(model_to_hub_dir("  org/repo  ").unwrap(), "models--org--repo");
+    }
+
+    #[test]
+    fn model_to_hub_dir_rejects_traversal() {
+        for bad in ["", "../etc", "org/../../etc", "/abs/path", "org/repo/", "a//b", "org\\repo", "x\0y"] {
+            assert!(model_to_hub_dir(bad).is_err(), "expected reject for {bad:?}");
+        }
+    }
+
+    #[test]
+    fn resolve_hf_cache_volume_prefers_exact_then_prefixed_handles_typo() {
+        // Exact correct name.
+        let vols = vec!["other".into(), "huggingface_cache".into()];
+        assert_eq!(resolve_hf_cache_volume(&vols).unwrap(), "huggingface_cache");
+        // Known typo, exact.
+        let vols = vec!["hugginface_cache".into()];
+        assert_eq!(resolve_hf_cache_volume(&vols).unwrap(), "hugginface_cache");
+        // Project-prefixed typo form.
+        let vols = vec!["small-models_hugginface_cache".into(), "certs".into()];
+        assert_eq!(resolve_hf_cache_volume(&vols).unwrap(), "small-models_hugginface_cache");
+        // Exact wins over prefixed when both present.
+        let vols = vec!["proj_huggingface_cache".into(), "huggingface_cache".into()];
+        assert_eq!(resolve_hf_cache_volume(&vols).unwrap(), "huggingface_cache");
+        // None present.
+        assert!(resolve_hf_cache_volume(&["foo".into(), "bar".into()]).is_err());
+    }
+
+    #[test]
+    fn argv_serves_model_exact_match_only() {
+        let argv: Vec<String> = ["sglang", "serve", "--model-path", "zai-org/GLM-5.2-FP8", "--tp", "8"]
+            .iter().map(|s| s.to_string()).collect();
+        assert!(argv_serves_model(&argv, "zai-org/GLM-5.2-FP8"));
+        // No false positive on a prefix.
+        assert!(!argv_serves_model(&argv, "zai-org/GLM-5.2"));
+        // `--model=val` form.
+        let eq: Vec<String> = ["--model=org/repo".into()].to_vec();
+        assert!(argv_serves_model(&eq, "org/repo"));
+        // A bare value not attached to a model flag must NOT match.
+        let bare: Vec<String> = ["--served-model-name".into(), "org/repo".into()].to_vec();
+        assert!(!argv_serves_model(&bare, "org/repo"));
+    }
+
+    #[test]
+    fn env_serves_model_matches_value_not_substring() {
+        let env: Vec<String> = ["MODEL_NAME=z-ai/glm-5.2".into(), "HF_TOKEN=abc".into()].to_vec();
+        assert!(env_serves_model(&env, "z-ai/glm-5.2"));
+        assert!(!env_serves_model(&env, "z-ai/glm")); // substring must not match
+        let env: Vec<String> = ["MODEL_PATH=zai-org/GLM-5.2-FP8".into()].to_vec();
+        assert!(env_serves_model(&env, "zai-org/GLM-5.2-FP8"));
+    }
+
+    #[test]
+    fn format_bytes_renders_units() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(512), "512 B");
+        assert!(format_bytes(2048).starts_with("2.00 KiB"));
+        assert!(format_bytes(5_368_709_120).starts_with("5.00 GiB"));
+    }
+
+    #[test]
+    fn evict_target_defaults_to_weights() {
+        // Default when `target` omitted.
+        let req: EvictRequest = serde_json::from_str(r#"{"model":"org/repo"}"#).unwrap();
+        assert_eq!(req.target, EvictTarget::Weights);
+        assert_eq!(req.model, "org/repo");
+        assert!(req.cache_volume.is_none());
+        // Explicit variants parse.
+        let req: EvictRequest = serde_json::from_str(r#"{"model":"a/b","target":"both","cache_volume":"v"}"#).unwrap();
+        assert_eq!(req.target, EvictTarget::Both);
+        assert_eq!(req.cache_volume.as_deref(), Some("v"));
+        let req: EvictRequest = serde_json::from_str(r#"{"model":"a/b","target":"cache"}"#).unwrap();
+        assert_eq!(req.target, EvictTarget::Cache);
     }
 }
