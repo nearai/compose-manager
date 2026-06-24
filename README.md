@@ -44,6 +44,42 @@ Prune unused Docker resources.
 
 At least one option must be true.
 
+### POST /docker/evict
+Selectively evict ONE model's weights/cache from the shared HuggingFace cache
+volume, leaving every other model's warm cache intact. This is the targeted
+alternative to `/docker/clean`'s blind `docker volume prune -f`, and mirrors the
+`cleanup-hf-model.yaml` fleet maintenance pattern as a first-class API.
+
+**Request body:**
+```json
+{"model": "zai-org/GLM-5.2-FP8", "target": "weights", "cache_volume": "huggingface_cache"}
+```
+
+- `model` (required): HF repo id `org/repo`. Mapped to the on-disk
+  `hub/models--org--repo` directory.
+- `target` (default `weights`): one of `weights`, `cache`, `both`.
+  - `weights`: remove `hub/models--org--repo`.
+  - `cache`: best-effort removal of model-named compile/kernel cache subdirs.
+    Compile caches (torchinductor/triton/deep_gemm) are hash-keyed and NOT
+    cleanly attributable to a single model, so `cache` only clears model-named
+    subdirs if they happen to exist — it never touches the whole cache.
+  - `both`: weights + best-effort caches.
+- `cache_volume` (optional): override the autodetected volume name. By default
+  the volume is autodetected from `docker volume ls`, handling the correct
+  `huggingface_cache`, the known typo `hugginface_cache`, and any
+  project-prefixed form (e.g. `small-models_hugginface_cache`).
+
+**Safety guard:** when `target` includes weights, the request is rejected with
+`409 Conflict` if a RUNNING container is actively serving the SAME model
+(matched on an exact `--model-path`/`--model` arg value or a `MODEL_NAME`-style
+env value). Evicting a *different* model's weights while others run is allowed —
+that is the point of being selective. If the running set can't be determined the
+request fails closed (500) rather than deleting.
+
+Only that one model's subtree is ever removed; the volume itself is never
+pruned. A missing volume returns `404` and a missing model dir returns a clear
+"nothing to evict" success rather than an error.
+
 ### GET /version
 Returns the currently deployed tag.
 
