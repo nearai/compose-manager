@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: Rust checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust components
+        run: rustup component add clippy
+
+      - name: Run service clippy
+        run: cargo clippy --all-targets --locked
+
+      - name: Run service tests
+        run: cargo test --all-targets --locked
+
+      - name: Run dashboard clippy
+        working-directory: dashboard
+        run: cargo clippy --all-targets --locked
+
+      - name: Run dashboard tests
+        working-directory: dashboard
+        run: cargo test --all-targets --locked
