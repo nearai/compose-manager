@@ -6,6 +6,10 @@ on:
     branches:
       - master
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -13,12 +17,20 @@ jobs:
   rust:
     name: Rust checks
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
 
       - name: Install Rust components
         run: rustup component add clippy
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            dashboard -> dashboard/target
 
       - name: Run service clippy
         run: cargo clippy --all-targets --locked
