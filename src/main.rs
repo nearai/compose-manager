@@ -4075,6 +4075,50 @@ mod tests {
         assert!(state.deployed_projects.read().unwrap().is_empty());
     }
 
+    #[tokio::test]
+    #[ignore = "requires Docker; creates only two isolated synthetic log containers"]
+    async fn logs_real_docker_isolates_default_and_explicit_projects() {
+        let dir = temp_work_dir();
+        let default_project = compose_project_name(&dir);
+        let other_project = format!("{default_project}-other");
+        struct Cleanup(PathBuf, Vec<String>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                for project in &self.1 {
+                    let _ = run_docker_compose(&self.0, &["down"], "docker-compose.yml", &[], &[], project);
+                }
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(dir.clone(), vec![default_project.clone(), other_project.clone()]);
+        for (project, marker) in [(&default_project, "DEFAULT_ONLY"), (&other_project, "ISOLATED_ONLY")] {
+            std::fs::write(dir.join("docker-compose.yml"), format!(
+                "services:\n  probe:\n    image: ghcr.io/astral-sh/uv:python3.11-bookworm-slim@sha256:4f5d923c9dcea037f57bda425dd209f3ec643da2f0b74227f68d09dab0b3bb36\n    network_mode: none\n    read_only: true\n    cap_drop: [ALL]\n    command: [python3, -c, 'print(\"{marker}\")']\n"
+            )).unwrap();
+            run_docker_compose(&dir, &["up", "--abort-on-container-exit", "--exit-code-from", "probe"],
+                "docker-compose.yml", &[], &["probe".into()], project).unwrap();
+        }
+        let mut state = make_test_state();
+        Arc::get_mut(&mut state).unwrap().work_dir = dir;
+        for (project, wanted, forbidden) in [
+            (None, "DEFAULT_ONLY", "ISOLATED_ONLY"),
+            (Some(other_project), "ISOLATED_ONLY", "DEFAULT_ONLY"),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert("authorization", "Bearer test-token".parse().unwrap());
+            let request = LogsRequest { file: None, project, tail: 15, services: vec!["probe".into()] };
+            let response = compose_logs(State(state.clone()), headers, Some(Json(request))).await.into_response();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), 65536).await.unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let output = json["output"].as_str().unwrap();
+            assert!(output.contains(wanted), "Selected project output missing");
+            assert!(!output.contains(forbidden), "Other project output leaked");
+        }
+        assert!(state.actions.read().await.is_empty());
+        assert!(state.deployed_projects.read().unwrap().is_empty());
+    }
+
     #[test]
     fn deployed_version_from_actions_picks_latest_compose_up() {
         let mut up1 = DeploymentAction::default();
