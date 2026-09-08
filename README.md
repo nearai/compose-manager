@@ -81,6 +81,22 @@ Stop containers with `docker compose down`.
 - `file`: Specify compose file (optional)
 - `volumes`: Also remove volumes with `-v` flag (default: false)
 
+### POST /compose/logs
+
+Read bounded logs for the selected Compose services. Use the same `file`,
+`project` and `services` as the deployment:
+
+```json
+{"file":"prod/preflight.yaml","project":"migration-preflight","services":["preflight"],"tail":15}
+```
+
+`project` is optional: omission preserves the working-directory project default.
+Explicit projects use the same canonical-name validation and reserved-name
+rejection as `/compose/up` and `/compose/down`. Invalid values return HTTP 400
+before Docker runs. This endpoint is read-only and does not change deployment
+state. Managers predating this field silently ignore it; upgrade before relying
+on isolated-project logs (an empty result is not evidence of a healthy service).
+
 ### POST /docker/clean
 Prune unused Docker resources.
 
