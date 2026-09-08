@@ -732,6 +732,9 @@ struct EvictRequest {
 struct LogsRequest {
     #[serde(default)]
     file: Option<String>,
+    /// Match the explicit project used by compose/up and compose/down.
+    #[serde(default)]
+    project: Option<String>,
     #[serde(default = "default_tail")]
     tail: u32,
     #[serde(default)]
@@ -2249,14 +2252,19 @@ async fn compose_logs(
         return e;
     }
 
-    let (file, tail, services) = body
-        .map(|b| (b.file.clone(), b.tail, b.services.clone()))
-        .unwrap_or((None, default_tail(), vec![]));
+    let (file, project, tail, services) = body
+        .map(|b| (b.file.clone(), b.project.clone(), b.tail, b.services.clone()))
+        .unwrap_or((None, None, default_tail(), vec![]));
+
+    let project = match resolve_compose_project(project.as_deref(), &state.work_dir) {
+        Ok(project) => project,
+        Err(message) => return err(StatusCode::BAD_REQUEST, message),
+    };
 
     let file = file.unwrap_or_else(|| "docker-compose.yml".into());
     let tail_str = tail.to_string();
 
-    match run_docker_compose(&state.work_dir, &["logs", "--tail", &tail_str], &file, &state.env_files, &services) {
+    match run_docker_compose(&state.work_dir, &["logs", "--tail", &tail_str], &file, &state.env_files, &services, &project) {
         Ok(output) => ok_output(output),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
@@ -3484,13 +3492,11 @@ async fn current_image_digest() -> Option<String> {
     .and_then(|s| s.lines().map(str::trim).find(|l| l.contains("@sha256:")).map(String::from))
 }
 
-fn run_docker_compose(work_dir: &Path, args: &[&str], file: &str, env_files: &[String], services: &[String]) -> Result<String> {
-    info!(command = "docker compose", file = file, args = ?args, env_files = ?env_files, services = ?services, work_dir = %work_dir.display(), "Running command");
+fn docker_compose_command(work_dir: &Path, args: &[&str], file: &str, env_files: &[String], services: &[String], project: &str) -> Command {
     let mut cmd = Command::new("docker");
-    // `-p` pins the project (see compose_project_name) so `--remove-orphans`
-    // can never inherit a leaked COMPOSE_PROJECT_NAME and evict the `dstack`
-    // app-compose project (launcher/certbot/datadog).
-    cmd.args(["compose", "-p", &compose_project_name(work_dir), "-f", file]);
+    // The caller resolves/validates the project. Always pin it explicitly so
+    // neither a leaked environment variable nor YAML name changes log scope.
+    cmd.args(["compose", "-p", project, "-f", file]);
     for env_file in env_files {
         cmd.args(["--env-file", env_file]);
     }
@@ -3498,8 +3504,13 @@ fn run_docker_compose(work_dir: &Path, args: &[&str], file: &str, env_files: &[S
     for service in services {
         cmd.arg(service);
     }
-    let output = cmd
-        .current_dir(work_dir)
+    cmd.current_dir(work_dir);
+    cmd
+}
+
+fn run_docker_compose(work_dir: &Path, args: &[&str], file: &str, env_files: &[String], services: &[String], project: &str) -> Result<String> {
+    info!(command = "docker compose", file = file, project = project, args = ?args, env_files = ?env_files, services = ?services, work_dir = %work_dir.display(), "Running command");
+    let output = docker_compose_command(work_dir, args, file, env_files, services, project)
         .output()
         .with_context(|| format!(
             "Failed to execute: docker compose -f {} {} (work_dir: {})",
@@ -4021,6 +4032,92 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn logs_project_defaults_to_work_and_preserves_explicit_scope() {
+        let work_dir = Path::new("/app/work");
+        for (json, expected) in [
+            (r#"{}"#, "work"),
+            (r#"{"project":"migration-preflight"}"#, "migration-preflight"),
+        ] {
+            let request: LogsRequest = serde_json::from_str(json).unwrap();
+            let project = resolve_compose_project(request.project.as_deref(), work_dir).unwrap();
+            assert_eq!(project, expected);
+            assert_eq!(request.tail, default_tail());
+            let cmd = docker_compose_command(work_dir, &["logs", "--tail", "15"],
+                "prod/preflight.yaml", &["runtime.env".into()], &["preflight".into()], &project);
+            let args: Vec<_> = cmd.get_args().map(|arg| arg.to_str().unwrap()).collect();
+            assert_eq!(args, ["compose", "-p", expected, "-f", "prod/preflight.yaml",
+                "--env-file", "runtime.env", "logs", "--tail", "15", "preflight"]);
+            assert_eq!(cmd.get_current_dir(), Some(work_dir));
+        }
+    }
+
+    #[test]
+    fn logs_rejects_unsafe_explicit_projects() {
+        for project in ["work", "dstack", "", "../work", "Mixed-Case", "--help"] {
+            let request: LogsRequest = serde_json::from_value(serde_json::json!({"project": project})).unwrap();
+            assert!(resolve_compose_project(request.project.as_deref(), Path::new("/app/work")).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn logs_handler_checks_auth_and_rejects_invalid_project_without_docker() {
+        let state = make_test_state();
+        let unauthorized = compose_logs(State(state.clone()), HeaderMap::new(), None).await.into_response();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer test-token".parse().unwrap());
+        let request = LogsRequest { project: Some("dstack".into()), ..Default::default() };
+        let invalid = compose_logs(State(state.clone()), headers, Some(Json(request))).await.into_response();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        assert!(state.actions.read().await.is_empty());
+        assert!(state.deployed_projects.read().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Docker; creates only two isolated synthetic log containers"]
+    async fn logs_real_docker_isolates_default_and_explicit_projects() {
+        let dir = temp_work_dir();
+        let default_project = compose_project_name(&dir);
+        let other_project = format!("{default_project}-other");
+        struct Cleanup(PathBuf, Vec<String>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                for project in &self.1 {
+                    let _ = run_docker_compose(&self.0, &["down"], "docker-compose.yml", &[], &[], project);
+                }
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(dir.clone(), vec![default_project.clone(), other_project.clone()]);
+        for (project, marker) in [(&default_project, "DEFAULT_ONLY"), (&other_project, "ISOLATED_ONLY")] {
+            std::fs::write(dir.join("docker-compose.yml"), format!(
+                "services:\n  probe:\n    image: ghcr.io/astral-sh/uv:python3.11-bookworm-slim@sha256:4f5d923c9dcea037f57bda425dd209f3ec643da2f0b74227f68d09dab0b3bb36\n    network_mode: none\n    read_only: true\n    cap_drop: [ALL]\n    command: [python3, -c, 'print(\"{marker}\")']\n"
+            )).unwrap();
+            run_docker_compose(&dir, &["up", "--abort-on-container-exit", "--exit-code-from", "probe"],
+                "docker-compose.yml", &[], &["probe".into()], project).unwrap();
+        }
+        let mut state = make_test_state();
+        Arc::get_mut(&mut state).unwrap().work_dir = dir;
+        for (project, wanted, forbidden) in [
+            (None, "DEFAULT_ONLY", "ISOLATED_ONLY"),
+            (Some(other_project), "ISOLATED_ONLY", "DEFAULT_ONLY"),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert("authorization", "Bearer test-token".parse().unwrap());
+            let request = LogsRequest { file: None, project, tail: 15, services: vec!["probe".into()] };
+            let response = compose_logs(State(state.clone()), headers, Some(Json(request))).await.into_response();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), 65536).await.unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let output = json["output"].as_str().unwrap();
+            assert!(output.contains(wanted), "Selected project output missing");
+            assert!(!output.contains(forbidden), "Other project output leaked");
+        }
+        assert!(state.actions.read().await.is_empty());
+        assert!(state.deployed_projects.read().unwrap().is_empty());
+    }
 
     #[test]
     fn deployed_version_from_actions_picks_latest_compose_up() {
