@@ -8,7 +8,8 @@ A minimalistic Rust HTTP service that manages Docker Compose deployments from a 
 - **Multiple compose files**: Specify which compose file to use per request
 - **Git tag checkout**: Checkout specific repository tags with configurable age validation
 - **Docker cleanup**: Prune unused volumes and images to save disk space
-- **Bearer token authentication**: Secure all endpoints with a shared secret
+- **Bearer token authentication**: Secure all endpoints with one or more shared secrets, supporting
+  gradual rotation (see [Authentication & token rotation](#authentication--token-rotation))
 
 ## API Endpoints
 
@@ -282,9 +283,38 @@ Checkout a specific git tag.
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `GITHUB_REPO` | Yes | - | GitHub repository URL (e.g., `https://github.com/owner/repo`) |
-| `BEARER_TOKEN` | Yes | - | Bearer token for authenticating requests |
+| `BEARER_TOKEN` | Yes | - | Bearer token(s) for authenticating requests. Comma-separated to accept more than one at once (see [Authentication & token rotation](#authentication--token-rotation)) |
 | `WORK_DIR` | No | `/app/work` | Directory for downloaded compose files |
 | `MIN_TAG_AGE_HOURS` | No | `48` | Minimum tag age in hours before checkout is allowed |
+
+## Authentication & token rotation
+
+Every endpoint (except where noted) requires an `Authorization: Bearer <token>` header. The
+`BEARER_TOKEN` environment variable accepts a **comma-separated list** of tokens, all of which are
+accepted — this allows rotating the shared secret without a hard cutover that would reject every
+in-flight client at once. Tokens are compared in constant time, whitespace around each entry is
+trimmed, and empty entries are ignored. At least one non-empty token is required; the process fails
+to start otherwise. Token values are never logged — only the number of configured tokens.
+
+The dashboard (`dashboard/`) has the identical convention for its own inbound API: set
+`DASHBOARD_TOKEN` to a comma-separated list to accept more than one caller-facing token at a time.
+This is separate from the per-instance `bearer_token` stored in the dashboard's instance config,
+which is the single outbound token the dashboard sends *to* each compose-manager instance — that
+field is unaffected by this rotation mechanism and still takes exactly one token per instance.
+
+**Rotation flow:**
+
+1. **Add** the new token as a second, comma-separated entry: `BEARER_TOKEN=old-token,new-token`
+   (same for `DASHBOARD_TOKEN`), then redeploy/restart. Both tokens are now accepted.
+2. **Move** clients (ansible inventory, dashboard instance config, CI secrets, etc.) over to the
+   new token, one at a time, at whatever pace is safe for the deployment.
+3. **Remove** the old token once nothing is using it any more: `BEARER_TOKEN=new-token`, then
+   redeploy/restart.
+
+> **Caution:** only ever combine tokens as `"old,new"` on an instance already running a binary
+> built from this change. An older compose-manager/dashboard image has no comma-splitting logic and
+> would treat `"old,new"` as one literal token, rejecting every client until it is rolled back or
+> upgraded. Roll the new image out first, then start rotating tokens.
 
 ## Usage
 

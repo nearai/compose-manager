@@ -21,6 +21,7 @@ use std::{
     task::{Context as TaskContext, Poll},
     time::Duration,
 };
+use subtle::ConstantTimeEq;
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::Command as AsyncCommand,
@@ -459,7 +460,9 @@ impl Drop for ComposeGuard {
 }
 
 struct AppState {
-    bearer_token: String,
+    /// Accepted bearer tokens. Parsed from `BEARER_TOKEN` (comma-separated) so
+    /// multiple tokens can be active at once during a rotation.
+    bearer_tokens: Vec<String>,
     github_owner: String,
     github_repo_name: String,
     min_tag_age_hours: i64,
@@ -877,26 +880,59 @@ async fn fetch_github_file(state: &AppState, tag: &str, path: &str) -> Result<St
 
 // --- Auth ---
 
-fn verify_bearer_token(headers: &HeaderMap, expected: &str) -> Result<(), ApiResult> {
+/// Parses a comma-separated bearer token list (e.g. `BEARER_TOKEN=old,new`),
+/// trimming whitespace and dropping empty entries so multiple tokens can be
+/// active at once during a rotation (add the new token as a second entry,
+/// move clients over, then remove the old one). Errors if no non-empty token
+/// remains, so a missing or blank env var still fails startup as before.
+fn parse_bearer_tokens(raw: &str) -> Result<Vec<String>> {
+    let tokens: Vec<String> = raw
+        .split(',')
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect();
+    if tokens.is_empty() {
+        return Err(anyhow!("must contain at least one non-empty token"));
+    }
+    Ok(tokens)
+}
+
+/// Constant-time token comparison to prevent timing attacks. Returns true if
+/// `a` and `b` are equal, using a fixed-time algorithm that does not
+/// short-circuit on the first mismatched byte.
+fn token_eq(a: &str, b: &str) -> bool {
+    a.as_bytes().ct_eq(b.as_bytes()).into()
+}
+
+/// Returns true if `token` constant-time-matches any of `expected`. Always
+/// checks every configured token (no early exit), so the response time does
+/// not leak which token position — if any — matched.
+fn token_matches_any(token: &str, expected: &[String]) -> bool {
+    expected.iter().fold(false, |matched, candidate| {
+        matched | token_eq(token, candidate)
+    })
+}
+
+fn verify_bearer_token(headers: &HeaderMap, expected: &[String]) -> Result<(), ApiResult> {
     let token = headers.get("Authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "Missing or invalid Authorization header"))?;
 
-    if token != expected {
+    if !token_matches_any(token, expected) {
         return Err(err(StatusCode::UNAUTHORIZED, "Invalid token"));
     }
 
     Ok(())
 }
 
-fn verify_bearer_token_raw(headers: &HeaderMap, expected: &str) -> Result<(), (StatusCode, String)> {
+fn verify_bearer_token_raw(headers: &HeaderMap, expected: &[String]) -> Result<(), (StatusCode, String)> {
     let token = headers.get("Authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .ok_or_else(|| (StatusCode::UNAUTHORIZED, "Missing or invalid Authorization header".to_string()))?;
 
-    if token != expected {
+    if !token_matches_any(token, expected) {
         return Err((StatusCode::UNAUTHORIZED, "Invalid token".to_string()));
     }
 
@@ -1893,7 +1929,7 @@ async fn compose_up(
     headers: HeaderMap,
     Json(payload): Json<ComposeRequest>,
 ) -> Response {
-    if let Err((code, msg)) = verify_bearer_token_raw(&headers, &state.bearer_token) {
+    if let Err((code, msg)) = verify_bearer_token_raw(&headers, &state.bearer_tokens) {
         return err_response(code, msg);
     }
 
@@ -2142,7 +2178,7 @@ async fn compose_down(
     headers: HeaderMap,
     Json(payload): Json<ComposeDownRequest>,
 ) -> Response {
-    if let Err((code, msg)) = verify_bearer_token_raw(&headers, &state.bearer_token) {
+    if let Err((code, msg)) = verify_bearer_token_raw(&headers, &state.bearer_tokens) {
         return err_response(code, msg);
     }
 
@@ -2248,7 +2284,7 @@ async fn compose_logs(
     headers: HeaderMap,
     body: Option<Json<LogsRequest>>,
 ) -> impl IntoResponse {
-    if let Err(e) = verify_bearer_token(&headers, &state.bearer_token) {
+    if let Err(e) = verify_bearer_token(&headers, &state.bearer_tokens) {
         return e;
     }
 
@@ -2274,7 +2310,7 @@ async fn docker_ps(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(e) = verify_bearer_token(&headers, &state.bearer_token) {
+    if let Err(e) = verify_bearer_token(&headers, &state.bearer_tokens) {
         return e;
     }
 
@@ -2288,7 +2324,7 @@ async fn status(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err((code, msg)) = verify_bearer_token_raw(&headers, &state.bearer_token) {
+    if let Err((code, msg)) = verify_bearer_token_raw(&headers, &state.bearer_tokens) {
         return err_response(code, msg);
     }
 
@@ -2311,7 +2347,7 @@ async fn docker_restart(
     headers: HeaderMap,
     Json(payload): Json<RestartRequest>,
 ) -> impl IntoResponse {
-    if let Err(e) = verify_bearer_token(&headers, &state.bearer_token) {
+    if let Err(e) = verify_bearer_token(&headers, &state.bearer_tokens) {
         return e;
     }
 
@@ -2362,7 +2398,7 @@ async fn docker_clean(
     headers: HeaderMap,
     Json(payload): Json<CleanRequest>,
 ) -> impl IntoResponse {
-    if let Err(e) = verify_bearer_token(&headers, &state.bearer_token) {
+    if let Err(e) = verify_bearer_token(&headers, &state.bearer_tokens) {
         return e;
     }
 
@@ -2414,7 +2450,7 @@ async fn docker_evict(
     headers: HeaderMap,
     Json(payload): Json<EvictRequest>,
 ) -> impl IntoResponse {
-    if let Err(e) = verify_bearer_token(&headers, &state.bearer_token) {
+    if let Err(e) = verify_bearer_token(&headers, &state.bearer_tokens) {
         return e;
     }
 
@@ -2823,7 +2859,7 @@ async fn algif_blacklist_action(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(e) = verify_bearer_token(&headers, &state.bearer_token) {
+    if let Err(e) = verify_bearer_token(&headers, &state.bearer_tokens) {
         return e;
     }
 
@@ -2904,7 +2940,7 @@ async fn dstack_agent_action(
     AxumPath(action): AxumPath<String>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(e) = verify_bearer_token(&headers, &state.bearer_token) {
+    if let Err(e) = verify_bearer_token(&headers, &state.bearer_tokens) {
         return e;
     }
 
@@ -3193,7 +3229,7 @@ async fn host_gpu(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err((code, msg)) = verify_bearer_token_raw(&headers, &state.bearer_token) {
+    if let Err((code, msg)) = verify_bearer_token_raw(&headers, &state.bearer_tokens) {
         return err_response(code, msg);
     }
 
@@ -3344,7 +3380,7 @@ async fn host_cache(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err((code, msg)) = verify_bearer_token_raw(&headers, &state.bearer_token) {
+    if let Err((code, msg)) = verify_bearer_token_raw(&headers, &state.bearer_tokens) {
         return err_response(code, msg);
     }
 
@@ -3855,8 +3891,12 @@ async fn main() -> Result<()> {
 
     let github_repo = std::env::var("GITHUB_REPO")
         .context("GITHUB_REPO environment variable is required")?;
-    let bearer_token = std::env::var("BEARER_TOKEN")
+    let bearer_token_raw = std::env::var("BEARER_TOKEN")
         .context("BEARER_TOKEN environment variable is required")?;
+    let bearer_tokens = parse_bearer_tokens(&bearer_token_raw)
+        .context("BEARER_TOKEN")?;
+    // Never log token values — only how many are configured.
+    info!(token_count = bearer_tokens.len(), "Loaded bearer token(s)");
     let work_dir = std::env::var("WORK_DIR")
         .unwrap_or_else(|_| "/app/work".to_string());
     let min_tag_age_hours: i64 = std::env::var("MIN_TAG_AGE_HOURS")
@@ -3963,7 +4003,7 @@ async fn main() -> Result<()> {
     }
 
     let state = Arc::new(AppState {
-        bearer_token,
+        bearer_tokens,
         github_owner,
         github_repo_name,
         min_tag_age_hours,
@@ -4908,11 +4948,90 @@ mod tests {
         assert_eq!(both.combined(), "ok\nwarn");
     }
 
+    // --- Bearer token auth tests ---
+
+    #[test]
+    fn parse_bearer_tokens_single_token() {
+        let tokens = parse_bearer_tokens("secret").unwrap();
+        assert_eq!(tokens, vec!["secret"]);
+    }
+
+    #[test]
+    fn parse_bearer_tokens_multiple_tokens() {
+        let tokens = parse_bearer_tokens("old-secret,new-secret").unwrap();
+        assert_eq!(tokens, vec!["old-secret", "new-secret"]);
+    }
+
+    #[test]
+    fn parse_bearer_tokens_ignores_whitespace_and_empty_entries() {
+        let tokens = parse_bearer_tokens(" old-secret , , new-secret ,,").unwrap();
+        assert_eq!(tokens, vec!["old-secret", "new-secret"]);
+    }
+
+    #[test]
+    fn parse_bearer_tokens_rejects_missing_or_empty() {
+        assert!(parse_bearer_tokens("").is_err());
+        assert!(parse_bearer_tokens("   ").is_err());
+        assert!(parse_bearer_tokens(" , , ").is_err());
+    }
+
+    fn auth_header(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", format!("Bearer {token}").parse().unwrap());
+        headers
+    }
+
+    #[test]
+    fn verify_bearer_token_accepts_single_configured_token() {
+        let expected = vec!["secret".to_string()];
+        assert!(verify_bearer_token(&auth_header("secret"), &expected).is_ok());
+    }
+
+    #[test]
+    fn verify_bearer_token_accepts_either_of_two_configured_tokens() {
+        let expected = vec!["old-secret".to_string(), "new-secret".to_string()];
+        assert!(verify_bearer_token(&auth_header("old-secret"), &expected).is_ok());
+        assert!(verify_bearer_token(&auth_header("new-secret"), &expected).is_ok());
+    }
+
+    #[test]
+    fn verify_bearer_token_rejects_unknown_token() {
+        let expected = vec!["old-secret".to_string(), "new-secret".to_string()];
+        let result = verify_bearer_token(&auth_header("someone-elses-secret"), &expected);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn verify_bearer_token_rejects_header_without_bearer_prefix() {
+        let expected = vec!["secret".to_string()];
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "secret".parse().unwrap());
+        let result = verify_bearer_token(&headers, &expected);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn verify_bearer_token_rejects_missing_header() {
+        let expected = vec!["secret".to_string()];
+        let result = verify_bearer_token(&HeaderMap::new(), &expected);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn verify_bearer_token_raw_accepts_any_configured_token() {
+        let expected = vec!["old-secret".to_string(), "new-secret".to_string()];
+        assert!(verify_bearer_token_raw(&auth_header("old-secret"), &expected).is_ok());
+        assert!(verify_bearer_token_raw(&auth_header("new-secret"), &expected).is_ok());
+        assert!(verify_bearer_token_raw(&auth_header("unknown"), &expected).is_err());
+    }
+
     // --- Compose lock tests ---
 
     fn make_test_state() -> Arc<AppState> {
         Arc::new(AppState {
-            bearer_token: "test-token".into(),
+            bearer_tokens: vec!["test-token".into()],
             github_owner: "test".into(),
             github_repo_name: "test".into(),
             min_tag_age_hours: 0,

@@ -9,6 +9,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Instant};
+use subtle::ConstantTimeEq;
 use tokio::sync::RwLock;
 use tracing::{error, info};
 
@@ -38,7 +39,12 @@ struct CacheEntry {
 const GITHUB_CACHE_TTL_SECS: u64 = 300; // 5 minutes
 
 struct AppState {
-    dashboard_token: String,
+    /// Accepted inbound bearer tokens for the dashboard's own API. Parsed
+    /// from `DASHBOARD_TOKEN` (comma-separated) so multiple tokens can be
+    /// active at once during a rotation. Unrelated to `Instance::bearer_token`,
+    /// which is the single outbound token the dashboard sends to each
+    /// compose-manager instance.
+    dashboard_tokens: Vec<String>,
     config_path: PathBuf,
     instances: RwLock<Vec<Instance>>,
     http: reqwest::Client,
@@ -97,14 +103,47 @@ fn err_json(code: StatusCode, msg: impl Into<String>) -> Response {
         .unwrap()
 }
 
-fn verify_bearer_token(headers: &HeaderMap, expected: &str) -> Result<(), Response> {
+/// Parses a comma-separated bearer token list (e.g. `DASHBOARD_TOKEN=old,new`),
+/// trimming whitespace and dropping empty entries so multiple tokens can be
+/// active at once during a rotation (add the new token as a second entry,
+/// move clients over, then remove the old one). Errors if no non-empty token
+/// remains, so a missing or blank env var still fails startup as before.
+fn parse_bearer_tokens(raw: &str) -> Result<Vec<String>> {
+    let tokens: Vec<String> = raw
+        .split(',')
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect();
+    if tokens.is_empty() {
+        return Err(anyhow::anyhow!("must contain at least one non-empty token"));
+    }
+    Ok(tokens)
+}
+
+/// Constant-time token comparison to prevent timing attacks. Returns true if
+/// `a` and `b` are equal, using a fixed-time algorithm that does not
+/// short-circuit on the first mismatched byte.
+fn token_eq(a: &str, b: &str) -> bool {
+    a.as_bytes().ct_eq(b.as_bytes()).into()
+}
+
+/// Returns true if `token` constant-time-matches any of `expected`. Always
+/// checks every configured token (no early exit), so the response time does
+/// not leak which token position — if any — matched.
+fn token_matches_any(token: &str, expected: &[String]) -> bool {
+    expected.iter().fold(false, |matched, candidate| {
+        matched | token_eq(token, candidate)
+    })
+}
+
+fn verify_bearer_token(headers: &HeaderMap, expected: &[String]) -> Result<(), Response> {
     let token = headers
         .get("Authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .ok_or_else(|| err_json(StatusCode::UNAUTHORIZED, "Missing or invalid Authorization header"))?;
 
-    if token != expected {
+    if !token_matches_any(token, expected) {
         return Err(err_json(StatusCode::UNAUTHORIZED, "Invalid token"));
     }
     Ok(())
@@ -264,7 +303,7 @@ async fn list_instances(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(e) = verify_bearer_token(&headers, &state.dashboard_token) {
+    if let Err(e) = verify_bearer_token(&headers, &state.dashboard_tokens) {
         return e;
     }
 
@@ -289,7 +328,7 @@ async fn add_instance(
     headers: HeaderMap,
     Json(payload): Json<AddInstanceRequest>,
 ) -> Response {
-    if let Err(e) = verify_bearer_token(&headers, &state.dashboard_token) {
+    if let Err(e) = verify_bearer_token(&headers, &state.dashboard_tokens) {
         return e;
     }
 
@@ -325,7 +364,7 @@ async fn remove_instance(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(e) = verify_bearer_token(&headers, &state.dashboard_token) {
+    if let Err(e) = verify_bearer_token(&headers, &state.dashboard_tokens) {
         return e;
     }
 
@@ -353,7 +392,7 @@ async fn update_instance_env(
     Path(id): Path<String>,
     Json(env_vars): Json<HashMap<String, String>>,
 ) -> Response {
-    if let Err(e) = verify_bearer_token(&headers, &state.dashboard_token) {
+    if let Err(e) = verify_bearer_token(&headers, &state.dashboard_tokens) {
         return e;
     }
 
@@ -384,7 +423,7 @@ async fn proxy_compose_up(
     Path(id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
-    if let Err(e) = verify_bearer_token(&headers, &state.dashboard_token) {
+    if let Err(e) = verify_bearer_token(&headers, &state.dashboard_tokens) {
         return e;
     }
     proxy_stream(&state, &id, "compose/up", body).await
@@ -396,7 +435,7 @@ async fn proxy_compose_down(
     Path(id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
-    if let Err(e) = verify_bearer_token(&headers, &state.dashboard_token) {
+    if let Err(e) = verify_bearer_token(&headers, &state.dashboard_tokens) {
         return e;
     }
     proxy_stream(&state, &id, "compose/down", body).await
@@ -408,7 +447,7 @@ async fn proxy_compose_logs(
     Path(id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
-    if let Err(e) = verify_bearer_token(&headers, &state.dashboard_token) {
+    if let Err(e) = verify_bearer_token(&headers, &state.dashboard_tokens) {
         return e;
     }
     proxy_json(&state, &id, reqwest::Method::POST, "compose/logs", Some(body), None).await
@@ -419,7 +458,7 @@ async fn proxy_docker_ps(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(e) = verify_bearer_token(&headers, &state.dashboard_token) {
+    if let Err(e) = verify_bearer_token(&headers, &state.dashboard_tokens) {
         return e;
     }
     proxy_json(&state, &id, reqwest::Method::GET, "docker/ps", None, None).await
@@ -431,7 +470,7 @@ async fn proxy_docker_restart(
     Path(id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
-    if let Err(e) = verify_bearer_token(&headers, &state.dashboard_token) {
+    if let Err(e) = verify_bearer_token(&headers, &state.dashboard_tokens) {
         return e;
     }
     proxy_json(&state, &id, reqwest::Method::POST, "docker/restart", Some(body), None).await
@@ -443,7 +482,7 @@ async fn proxy_docker_clean(
     Path(id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
-    if let Err(e) = verify_bearer_token(&headers, &state.dashboard_token) {
+    if let Err(e) = verify_bearer_token(&headers, &state.dashboard_tokens) {
         return e;
     }
     proxy_json(&state, &id, reqwest::Method::POST, "docker/clean", Some(body), None).await
@@ -454,7 +493,7 @@ async fn proxy_version(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(e) = verify_bearer_token(&headers, &state.dashboard_token) {
+    if let Err(e) = verify_bearer_token(&headers, &state.dashboard_tokens) {
         return e;
     }
     proxy_json(&state, &id, reqwest::Method::GET, "version", None, Some(5)).await
@@ -465,7 +504,7 @@ async fn proxy_status(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(e) = verify_bearer_token(&headers, &state.dashboard_token) {
+    if let Err(e) = verify_bearer_token(&headers, &state.dashboard_tokens) {
         return e;
     }
     proxy_json(&state, &id, reqwest::Method::GET, "status", None, Some(5)).await
@@ -478,7 +517,7 @@ async fn github_tags(
     headers: HeaderMap,
     Query(params): Query<GithubQuery>,
 ) -> Response {
-    if let Err(e) = verify_bearer_token(&headers, &state.dashboard_token) {
+    if let Err(e) = verify_bearer_token(&headers, &state.dashboard_tokens) {
         return e;
     }
 
@@ -537,7 +576,7 @@ async fn github_files(
     headers: HeaderMap,
     Query(params): Query<GithubFilesQuery>,
 ) -> Response {
-    if let Err(e) = verify_bearer_token(&headers, &state.dashboard_token) {
+    if let Err(e) = verify_bearer_token(&headers, &state.dashboard_tokens) {
         return e;
     }
 
@@ -615,8 +654,14 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let dashboard_token = std::env::var("DASHBOARD_TOKEN")
+    let dashboard_token_raw = std::env::var("DASHBOARD_TOKEN")
         .context("DASHBOARD_TOKEN environment variable is required")?;
+    let dashboard_tokens = parse_bearer_tokens(&dashboard_token_raw).context("DASHBOARD_TOKEN")?;
+    // Never log token values — only how many are configured.
+    info!(
+        token_count = dashboard_tokens.len(),
+        "Loaded dashboard token(s)"
+    );
     let config_path = PathBuf::from(
         std::env::var("CONFIG_FILE").unwrap_or_else(|_| "dashboard.json".to_string()),
     );
@@ -642,7 +687,7 @@ async fn main() -> Result<()> {
     );
 
     let state = Arc::new(AppState {
-        dashboard_token,
+        dashboard_tokens,
         config_path,
         instances: RwLock::new(config.instances),
         http: reqwest::Client::new(),
@@ -684,4 +729,80 @@ async fn main() -> Result<()> {
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- Bearer token auth tests ---
+
+    #[test]
+    fn parse_bearer_tokens_single_token() {
+        let tokens = parse_bearer_tokens("secret").unwrap();
+        assert_eq!(tokens, vec!["secret"]);
+    }
+
+    #[test]
+    fn parse_bearer_tokens_multiple_tokens() {
+        let tokens = parse_bearer_tokens("old-secret,new-secret").unwrap();
+        assert_eq!(tokens, vec!["old-secret", "new-secret"]);
+    }
+
+    #[test]
+    fn parse_bearer_tokens_ignores_whitespace_and_empty_entries() {
+        let tokens = parse_bearer_tokens(" old-secret , , new-secret ,,").unwrap();
+        assert_eq!(tokens, vec!["old-secret", "new-secret"]);
+    }
+
+    #[test]
+    fn parse_bearer_tokens_rejects_missing_or_empty() {
+        assert!(parse_bearer_tokens("").is_err());
+        assert!(parse_bearer_tokens("   ").is_err());
+        assert!(parse_bearer_tokens(" , , ").is_err());
+    }
+
+    fn auth_header(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", format!("Bearer {token}").parse().unwrap());
+        headers
+    }
+
+    #[test]
+    fn verify_bearer_token_accepts_single_configured_token() {
+        let expected = vec!["secret".to_string()];
+        assert!(verify_bearer_token(&auth_header("secret"), &expected).is_ok());
+    }
+
+    #[test]
+    fn verify_bearer_token_accepts_either_of_two_configured_tokens() {
+        let expected = vec!["old-secret".to_string(), "new-secret".to_string()];
+        assert!(verify_bearer_token(&auth_header("old-secret"), &expected).is_ok());
+        assert!(verify_bearer_token(&auth_header("new-secret"), &expected).is_ok());
+    }
+
+    #[test]
+    fn verify_bearer_token_rejects_unknown_token() {
+        let expected = vec!["old-secret".to_string(), "new-secret".to_string()];
+        let result = verify_bearer_token(&auth_header("someone-elses-secret"), &expected);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn verify_bearer_token_rejects_header_without_bearer_prefix() {
+        let expected = vec!["secret".to_string()];
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "secret".parse().unwrap());
+        let result = verify_bearer_token(&headers, &expected);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn verify_bearer_token_rejects_missing_header() {
+        let expected = vec!["secret".to_string()];
+        let result = verify_bearer_token(&HeaderMap::new(), &expected);
+        assert!(result.is_err());
+    }
 }
