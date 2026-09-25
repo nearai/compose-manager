@@ -14,6 +14,7 @@ env:
   REGISTRY: docker.io
   IMAGE_REPOSITORY: ${{ vars.DOCKER_REGISTRY_USER }}/compose-manager
   LAUNCHER_IMAGE_REPOSITORY: ${{ vars.DOCKER_REGISTRY_USER }}/compose-manager-launcher
+  DASHBOARD_IMAGE_REPOSITORY: ${{ vars.DOCKER_REGISTRY_USER }}/compose-manager-dashboard
 
 concurrency:
   group: prod-image-mutation
@@ -97,15 +98,19 @@ jobs:
 
           resolve_image "CM" "${{ env.IMAGE_REPOSITORY }}"
           resolve_image "LAUNCHER" "${{ env.LAUNCHER_IMAGE_REPOSITORY }}"
+          resolve_image "DASHBOARD" "${{ env.DASHBOARD_IMAGE_REPOSITORY }}"
 
           if [ "$CM_SHORT_SHA" != "$LAUNCHER_SHORT_SHA" ]; then
             echo "::warning::compose-manager and launcher resolved different source suffixes (${CM_SHORT_SHA} vs ${LAUNCHER_SHORT_SHA}); using compose-manager suffix for the shared production tag."
+          fi
+          if [ "$CM_SHORT_SHA" != "$DASHBOARD_SHORT_SHA" ]; then
+            echo "::warning::compose-manager and dashboard resolved different source suffixes (${CM_SHORT_SHA} vs ${DASHBOARD_SHORT_SHA}); using compose-manager suffix for the shared production tag."
           fi
 
       - name: Verify staging images were built and signed by build.yml on master
         run: |
           set -euo pipefail
-          for pair in "${CM_IMAGE}@${CM_DIGEST}" "${LAUNCHER_IMAGE}@${LAUNCHER_DIGEST}"; do
+          for pair in "${CM_IMAGE}@${CM_DIGEST}" "${LAUNCHER_IMAGE}@${LAUNCHER_DIGEST}" "${DASHBOARD_IMAGE}@${DASHBOARD_DIGEST}"; do
             cosign verify \
               --certificate-identity-regexp '^https://github\.com/nearai/compose-manager/\.github/workflows/build\.yml@refs/heads/master$' \
               --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
@@ -131,10 +136,17 @@ jobs:
           skopeo copy --all "docker://${LAUNCHER_IMAGE}@${LAUNCHER_DIGEST}" "docker://${LAUNCHER_IMAGE}:${LAUNCHER_PROD_STAMPED_TAG}"
           skopeo copy --all "docker://${LAUNCHER_IMAGE}@${LAUNCHER_DIGEST}" "docker://${LAUNCHER_IMAGE}:latest"
 
+          DASHBOARD_PROD_STAMPED_TAG="${CM_PROD_STAMPED_TAG}"
+          skopeo copy "docker://${DASHBOARD_IMAGE}@${DASHBOARD_DIGEST}" "docker://${DASHBOARD_IMAGE}:prod"
+          skopeo copy "docker://${DASHBOARD_IMAGE}@${DASHBOARD_DIGEST}" "docker://${DASHBOARD_IMAGE}:${DASHBOARD_PROD_STAMPED_TAG}"
+          skopeo copy "docker://${DASHBOARD_IMAGE}@${DASHBOARD_DIGEST}" "docker://${DASHBOARD_IMAGE}:latest"
+
           echo "CM_PROD_STAMPED_TAG=${CM_PROD_STAMPED_TAG}" >> "$GITHUB_ENV"
           echo "CM_PROD_STAMPED_REF=${CM_IMAGE}:${CM_PROD_STAMPED_TAG}" >> "$GITHUB_ENV"
           echo "LAUNCHER_PROD_STAMPED_TAG=${LAUNCHER_PROD_STAMPED_TAG}" >> "$GITHUB_ENV"
           echo "LAUNCHER_PROD_STAMPED_REF=${LAUNCHER_IMAGE}:${LAUNCHER_PROD_STAMPED_TAG}" >> "$GITHUB_ENV"
+          echo "DASHBOARD_PROD_STAMPED_TAG=${DASHBOARD_PROD_STAMPED_TAG}" >> "$GITHUB_ENV"
+          echo "DASHBOARD_PROD_STAMPED_REF=${DASHBOARD_IMAGE}:${DASHBOARD_PROD_STAMPED_TAG}" >> "$GITHUB_ENV"
 
       - name: Confirm prod tags resolve to the promoted digests
         run: |
@@ -155,6 +167,7 @@ jobs:
 
           confirm_image "$CM_IMAGE" "$CM_DIGEST" "$CM_PROD_STAMPED_TAG"
           confirm_image "$LAUNCHER_IMAGE" "$LAUNCHER_DIGEST" "$LAUNCHER_PROD_STAMPED_TAG"
+          confirm_image "$DASHBOARD_IMAGE" "$DASHBOARD_DIGEST" "$DASHBOARD_PROD_STAMPED_TAG"
 
       - name: Create GitHub release
         env:
@@ -181,6 +194,14 @@ jobs:
           - **Digest**: \`${LAUNCHER_DIGEST}\`
           - **Source short-sha**: \`${LAUNCHER_SHORT_SHA}\`
           - **Sigstore**: https://search.sigstore.dev/?hash=${LAUNCHER_DIGEST}
+
+          ### compose-manager-dashboard
+          - **Image**: \`${DASHBOARD_IMAGE}:prod\`
+          - **Stamped image**: \`${DASHBOARD_PROD_STAMPED_REF}\`
+          - **Compatibility alias**: \`${DASHBOARD_IMAGE}:latest\`
+          - **Digest**: \`${DASHBOARD_DIGEST}\`
+          - **Source short-sha**: \`${DASHBOARD_SHORT_SHA}\`
+          - **Sigstore**: https://search.sigstore.dev/?hash=${DASHBOARD_DIGEST}
           EOF
           )
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
@@ -205,4 +226,10 @@ jobs:
             echo "- stamped tag: \`${LAUNCHER_PROD_STAMPED_REF}\`"
             echo "- latest alias: \`${LAUNCHER_IMAGE}:latest\`"
             echo "- digest: \`${LAUNCHER_DIGEST}\`"
+            echo ""
+            echo "### compose-manager-dashboard"
+            echo "- prod: \`${DASHBOARD_IMAGE}:prod\`"
+            echo "- stamped tag: \`${DASHBOARD_PROD_STAMPED_REF}\`"
+            echo "- latest alias: \`${DASHBOARD_IMAGE}:latest\`"
+            echo "- digest: \`${DASHBOARD_DIGEST}\`"
           } >> "$GITHUB_STEP_SUMMARY"
