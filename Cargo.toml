@@ -21,3 +21,13 @@ rand = "0.8"
 subtle = "2.5"
 dstack-sdk-types = { git = "https://github.com/Dstack-TEE/dstack" }
 http-client-unix-domain-socket = "0.1.1"
+# TLS on the API port (src/tls.rs). ring backend: already in the dependency
+# tree, and needs no extra build tooling.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
+tower = { version = "0.5", features = ["util"] }
+
+[dev-dependencies]
+rcgen = "0.13"
