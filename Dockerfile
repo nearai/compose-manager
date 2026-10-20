@@ -25,6 +25,9 @@ FROM debian:bookworm-slim@sha256:78d2f66e0fec9e5a39fb2c72ea5e052b548df75602b5215
 #    normalizes tar mtimes, not file *contents*, so these break byte-for-byte
 #    rebuilds (same size, different bytes every build). Remove them in the same
 #    layer. Mirrors inference-proxy #153.
+#  - eMudhra intermediate CA key compromise (2026-10-20): bookworm has no fixed
+#    ca-certificates yet, so distrust the two roots the compromised intermediates
+#    chain to. Remove once the pinned snapshot ships a fixed ca-certificates.
 RUN sed -i \
         -e 's|http://deb.debian.org/debian-security|http://snapshot.debian.org/archive/debian-security/20251020T000000Z|' \
         -e 's|http://deb.debian.org/debian$|http://snapshot.debian.org/archive/debian/20251020T000000Z|' \
@@ -39,6 +42,11 @@ RUN sed -i \
         docker-ce-cli=5:29.5.3-1~debian.12~bookworm \
         docker-compose-plugin=5.1.4-1~debian.12~bookworm \
         docker-buildx-plugin=0.34.1-1~debian.12~bookworm && \
+    sed -i -e 's|^mozilla/emSign_ECC_Root_CA_-_G3.crt$|!&|' \
+           -e 's|^mozilla/Comodo_AAA_Services_root.crt$|!&|' /etc/ca-certificates.conf && \
+    update-ca-certificates && \
+    test ! -e /etc/ssl/certs/emSign_ECC_Root_CA_-_G3.pem && \
+    test ! -e /etc/ssl/certs/Comodo_AAA_Services_root.pem && \
     apt-get purge -y curl gnupg && apt-get autoremove -y && \
     rm -rf /var/lib/apt/lists/* \
            /var/log/apt/* /var/log/dpkg.log /var/log/alternatives.log \
