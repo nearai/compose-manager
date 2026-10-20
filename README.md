@@ -286,6 +286,31 @@ Checkout a specific git tag.
 | `BEARER_TOKEN` | Yes | - | Bearer token(s) for authenticating requests. Comma-separated to accept more than one at once (see [Authentication & token rotation](#authentication--token-rotation)) |
 | `WORK_DIR` | No | `/app/work` | Directory for downloaded compose files |
 | `MIN_TAG_AGE_HOURS` | No | `48` | Minimum tag age in hours before checkout is allowed |
+| `TLS_MODE` | No | `container` | Where the TLS certificate comes from: `container`, `files` or `off` (see [TLS](#tls)) |
+| `TLS_CERT_SERVICE` | No | `dstack/certbot` | `container` mode: compose `<project>/<service>` whose container holds the certificate |
+| `TLS_CERT_DIR` | No | `/etc/letsencrypt/live/completions.near.ai` | `container` mode: directory with `fullchain.pem` and `privkey.pem` |
+| `TLS_CERT_FILE`, `TLS_KEY_FILE` | `files` mode | - | PEM certificate chain and private key |
+
+## TLS
+
+Port 8080 serves both TLS and plain HTTP. Each connection is routed by its first byte: a TLS
+ClientHello starts with `0x16`, which no HTTP request does. Remote clients should use
+`https://`. Plain HTTP remains for local callers inside the CVM (the launcher health check, the
+attestation fetch from the model proxies).
+
+The certificate is the one the CVM already maintains: by default compose-manager copies
+`fullchain.pem` and `privkey.pem` out of the certbot container with `docker cp -L`, so no extra
+volume mount is needed. It is re-read every 6 hours to pick up renewals (every minute until the
+first successful load). If no certificate can be loaded, or `TLS_MODE` is invalid, the port serves
+plain HTTP only and logs an error; startup never fails because of TLS.
+
+Requests that carry an `Authorization` header over plain HTTP are logged as
+`plain-http authenticated request` with the peer address, so callers that still need to move to
+`https://` show up in the logs.
+
+```bash
+curl https://<host-name>:8080/version
+```
 
 ## Authentication & token rotation
 

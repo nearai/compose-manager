@@ -29,6 +29,8 @@ use tokio::{
 };
 use tracing::{error, info, warn};
 
+mod tls;
+
 // --- Vendored dstack client (lightweight, avoids pulling in alloy) ---
 // Based on dstack-sdk 0.1.2, same pattern as tee-attestation-server
 
@@ -4062,9 +4064,20 @@ async fn main() -> Result<()> {
         .route("/version", get(version))
         .with_state(state);
 
+    // TLS and plain HTTP share port 8080; see src/tls.rs. A missing or
+    // unreadable certificate only disables TLS, never the server.
+    let tls_source = tls::Source::from_env().unwrap_or_else(|e| {
+        error!(error = %format!("{e:#}"), "invalid TLS configuration; serving plain HTTP only");
+        tls::Source::Off
+    });
+    let acceptor = tls::start(tls_source.clone()).await;
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
-    info!("Server listening on port 8080");
-    axum::serve(listener, app).await?;
+    info!(
+        tls_source = %tls::describe(&tls_source),
+        tls_loaded = acceptor.is_loaded(),
+        "Server listening on port 8080 (TLS and plain HTTP)"
+    );
+    tls::serve(listener, app, acceptor).await?;
 
     Ok(())
 }
