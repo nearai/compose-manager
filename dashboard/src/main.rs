@@ -47,7 +47,10 @@ struct AppState {
     dashboard_tokens: Vec<String>,
     config_path: PathBuf,
     instances: RwLock<Vec<Instance>>,
+    /// GitHub API calls.
     http: reqwest::Client,
+    /// Calls to compose-manager instances; see `instance_client`.
+    instance_http: reqwest::Client,
     github_cache: RwLock<HashMap<String, CacheEntry>>,
 }
 
@@ -174,6 +177,49 @@ fn save_config(path: &std::path::Path, config: &Config) -> Result<()> {
     std::fs::write(path, data).context("Failed to write config file")
 }
 
+/// Instance URLs must use https: every proxied call carries the instance's
+/// bearer token, and compose up/down bodies carry its env vars. Plain http is
+/// accepted only for loopback hosts (local development), where nothing
+/// crosses a network.
+fn check_instance_url(url: &str) -> Result<(), String> {
+    let parsed = reqwest::Url::parse(url).map_err(|e| format!("Invalid instance URL: {e}"))?;
+    match parsed.scheme() {
+        "https" => Ok(()),
+        "http" if is_loopback_host(&parsed) => Ok(()),
+        _ => Err(format!(
+            "Instance URL must use https:// (got {}://{})",
+            parsed.scheme(),
+            parsed.host_str().unwrap_or_default()
+        )),
+    }
+}
+
+fn is_loopback_host(url: &reqwest::Url) -> bool {
+    match url.host_str() {
+        Some(host) if host.eq_ignore_ascii_case("localhost") => true,
+        Some(host) => host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false),
+        None => false,
+    }
+}
+
+/// Client for calls to compose-manager instances. These carry the instance
+/// bearer token and, for compose up/down, its env vars, so the URL check must
+/// hold for the whole request: no redirects (compose-manager never sends one,
+/// and following one could move the request to a URL that was never checked)
+/// and no HTTP proxy (the loopback http exception must stay on this host).
+fn instance_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("building the instance HTTP client")
+}
+
 /// Build a proxied request to a compose-manager instance
 async fn proxy_json(
     state: &AppState,
@@ -190,9 +236,13 @@ async fn proxy_json(
     };
     drop(instances);
 
+    if let Err(msg) = check_instance_url(&instance.url) {
+        return err_json(StatusCode::BAD_REQUEST, msg);
+    }
+
     let url = format!("{}/{}", instance.url.trim_end_matches('/'), path);
     let mut req = state
-        .http
+        .instance_http
         .request(method, &url)
         .header("Authorization", format!("Bearer {}", instance.bearer_token))
         // Attribute the action to the dashboard in compose-manager's Slack
@@ -254,9 +304,13 @@ async fn proxy_stream(
     };
     drop(instances);
 
+    if let Err(msg) = check_instance_url(&instance.url) {
+        return err_json(StatusCode::BAD_REQUEST, msg);
+    }
+
     let url = format!("{}/{}", instance.url.trim_end_matches('/'), path);
     let resp = match state
-        .http
+        .instance_http
         .post(&url)
         .header("Authorization", format!("Bearer {}", instance.bearer_token))
         .header("X-Triggered-By", "dashboard")
@@ -332,10 +386,14 @@ async fn add_instance(
         return e;
     }
 
+    if let Err(msg) = check_instance_url(payload.url.trim()) {
+        return err_json(StatusCode::BAD_REQUEST, msg);
+    }
+
     let instance = Instance {
         id: uuid::Uuid::new_v4().to_string(),
         name: payload.name,
-        url: payload.url.trim_end_matches('/').to_string(),
+        url: payload.url.trim().trim_end_matches('/').to_string(),
         bearer_token: payload.bearer_token,
         github_repo: payload.github_repo,
         env_vars: HashMap::new(),
@@ -685,12 +743,18 @@ async fn main() -> Result<()> {
         config = %config_path.display(),
         "Loaded configuration"
     );
+    for instance in &config.instances {
+        if let Err(msg) = check_instance_url(&instance.url) {
+            error!(instance = %instance.name, "{msg}; requests to this instance will be refused");
+        }
+    }
 
     let state = Arc::new(AppState {
         dashboard_tokens,
         config_path,
         instances: RwLock::new(config.instances),
         http: reqwest::Client::new(),
+        instance_http: instance_client(),
         github_cache: RwLock::new(HashMap::new()),
     });
 
@@ -734,6 +798,63 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- Instance URL tests ---
+
+    #[test]
+    fn instance_url_accepts_https() {
+        assert!(check_instance_url("https://host.example.com:8080").is_ok());
+        assert!(check_instance_url("HTTPS://host.example.com:8080/").is_ok());
+    }
+
+    #[test]
+    fn instance_url_accepts_http_on_loopback_only() {
+        assert!(check_instance_url("http://localhost:8080").is_ok());
+        assert!(check_instance_url("http://127.0.0.1:8080").is_ok());
+        assert!(check_instance_url("http://[::1]:8080").is_ok());
+        assert!(check_instance_url("http://192.0.2.10:8080").is_err());
+        assert!(check_instance_url("http://host.example.com:8080").is_err());
+        assert!(check_instance_url("http://localhost.example.com:8080").is_err());
+    }
+
+    #[test]
+    fn instance_url_rejects_other_schemes_and_garbage() {
+        assert!(check_instance_url("ftp://host.example.com").is_err());
+        assert!(check_instance_url("host.example.com:8080").is_err());
+        assert!(check_instance_url("").is_err());
+    }
+
+    /// One test so the proxy env var it sets cannot race another test that
+    /// builds a client.
+    #[tokio::test]
+    async fn instance_client_ignores_proxies_and_does_not_follow_redirects() {
+        use axum::{http::header::LOCATION, response::IntoResponse};
+        let target = Router::new()
+            .route("/ok", get(|| async { "ok" }))
+            .route(
+                "/redirect",
+                get(|| async {
+                    (StatusCode::TEMPORARY_REDIRECT, [(LOCATION, "http://192.0.2.10:8080/ok")])
+                        .into_response()
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, target).await.unwrap() });
+
+        // A proxy that refuses connections: a client that used it would fail.
+        std::env::set_var("ALL_PROXY", "http://127.0.0.1:9");
+        std::env::set_var("HTTP_PROXY", "http://127.0.0.1:9");
+        let client = instance_client();
+        std::env::remove_var("ALL_PROXY");
+        std::env::remove_var("HTTP_PROXY");
+
+        let ok = client.get(format!("http://{addr}/ok")).send().await.unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+
+        let redirected = client.get(format!("http://{addr}/redirect")).send().await.unwrap();
+        assert_eq!(redirected.status(), StatusCode::TEMPORARY_REDIRECT);
+    }
 
     // --- Bearer token auth tests ---
 
