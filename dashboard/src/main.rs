@@ -174,6 +174,36 @@ fn save_config(path: &std::path::Path, config: &Config) -> Result<()> {
     std::fs::write(path, data).context("Failed to write config file")
 }
 
+/// Instance URLs must use https: every proxied call carries the instance's
+/// bearer token, and compose up/down bodies carry its env vars. Plain http is
+/// accepted only for loopback hosts (local development), where nothing
+/// crosses a network.
+fn check_instance_url(url: &str) -> Result<(), String> {
+    let parsed = reqwest::Url::parse(url).map_err(|e| format!("Invalid instance URL: {e}"))?;
+    match parsed.scheme() {
+        "https" => Ok(()),
+        "http" if is_loopback_host(&parsed) => Ok(()),
+        _ => Err(format!(
+            "Instance URL must use https:// (got {}://{})",
+            parsed.scheme(),
+            parsed.host_str().unwrap_or_default()
+        )),
+    }
+}
+
+fn is_loopback_host(url: &reqwest::Url) -> bool {
+    match url.host_str() {
+        Some(host) if host.eq_ignore_ascii_case("localhost") => true,
+        Some(host) => host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false),
+        None => false,
+    }
+}
+
 /// Build a proxied request to a compose-manager instance
 async fn proxy_json(
     state: &AppState,
@@ -189,6 +219,10 @@ async fn proxy_json(
         None => return err_json(StatusCode::NOT_FOUND, "Instance not found"),
     };
     drop(instances);
+
+    if let Err(msg) = check_instance_url(&instance.url) {
+        return err_json(StatusCode::BAD_REQUEST, msg);
+    }
 
     let url = format!("{}/{}", instance.url.trim_end_matches('/'), path);
     let mut req = state
@@ -253,6 +287,10 @@ async fn proxy_stream(
         None => return err_json(StatusCode::NOT_FOUND, "Instance not found"),
     };
     drop(instances);
+
+    if let Err(msg) = check_instance_url(&instance.url) {
+        return err_json(StatusCode::BAD_REQUEST, msg);
+    }
 
     let url = format!("{}/{}", instance.url.trim_end_matches('/'), path);
     let resp = match state
@@ -332,10 +370,14 @@ async fn add_instance(
         return e;
     }
 
+    if let Err(msg) = check_instance_url(payload.url.trim()) {
+        return err_json(StatusCode::BAD_REQUEST, msg);
+    }
+
     let instance = Instance {
         id: uuid::Uuid::new_v4().to_string(),
         name: payload.name,
-        url: payload.url.trim_end_matches('/').to_string(),
+        url: payload.url.trim().trim_end_matches('/').to_string(),
         bearer_token: payload.bearer_token,
         github_repo: payload.github_repo,
         env_vars: HashMap::new(),
@@ -685,6 +727,11 @@ async fn main() -> Result<()> {
         config = %config_path.display(),
         "Loaded configuration"
     );
+    for instance in &config.instances {
+        if let Err(msg) = check_instance_url(&instance.url) {
+            error!(instance = %instance.name, "{msg}; requests to this instance will be refused");
+        }
+    }
 
     let state = Arc::new(AppState {
         dashboard_tokens,
@@ -734,6 +781,31 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- Instance URL tests ---
+
+    #[test]
+    fn instance_url_accepts_https() {
+        assert!(check_instance_url("https://host.example.com:8080").is_ok());
+        assert!(check_instance_url("HTTPS://host.example.com:8080/").is_ok());
+    }
+
+    #[test]
+    fn instance_url_accepts_http_on_loopback_only() {
+        assert!(check_instance_url("http://localhost:8080").is_ok());
+        assert!(check_instance_url("http://127.0.0.1:8080").is_ok());
+        assert!(check_instance_url("http://[::1]:8080").is_ok());
+        assert!(check_instance_url("http://192.0.2.10:8080").is_err());
+        assert!(check_instance_url("http://host.example.com:8080").is_err());
+        assert!(check_instance_url("http://localhost.example.com:8080").is_err());
+    }
+
+    #[test]
+    fn instance_url_rejects_other_schemes_and_garbage() {
+        assert!(check_instance_url("ftp://host.example.com").is_err());
+        assert!(check_instance_url("host.example.com:8080").is_err());
+        assert!(check_instance_url("").is_err());
+    }
 
     // --- Bearer token auth tests ---
 
