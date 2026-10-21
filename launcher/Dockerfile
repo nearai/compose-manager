@@ -1,11 +1,18 @@
 FROM alpine:3.21
 
 RUN apk add --no-cache \
+    ca-certificates \
     bash \
     curl \
     jq \
     docker-cli \
     docker-cli-compose
+
+# eMudhra intermediate CA key compromise (2026-10-20): distrust the two affected roots.
+RUN sed -i -e 's|^mozilla/emSign_ECC_Root_CA_-_G3.crt$|!&|' \
+           -e 's|^mozilla/Comodo_AAA_Services_root.crt$|!&|' /etc/ca-certificates.conf && \
+    update-ca-certificates && \
+    ! grep -qx 'mozilla/emSign_ECC_Root_CA_-_G3.crt' /etc/ca-certificates.conf
 
 # Install cosign static binary. MUST match the cosign-release used to SIGN in
 # .github/workflows/build.yml (sigstore/cosign-installer's cosign-release, v3.0.6).
