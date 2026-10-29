@@ -1,0 +1,185 @@
+name: Promote compose-manager only
+
+# Promotes the compose-manager image (:staging -> :prod and :latest) and leaves
+# compose-manager-launcher untouched. Running CVMs pick up the new image through
+# their launcher, which recreates only the compose-manager container. The
+# launcher image is pinned in each CVM's measured compose and changes only when
+# the CVM is redeployed, so it is promoted separately (promote.yml).
+
+permissions:
+  contents: write
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "promote" to confirm promoting compose-manager :staging to :prod and :latest (launcher unchanged)'
+        required: true
+
+env:
+  REGISTRY: docker.io
+  IMAGE_REPOSITORY: ${{ vars.DOCKER_REGISTRY_USER }}/compose-manager
+  LAUNCHER_IMAGE_REPOSITORY: ${{ vars.DOCKER_REGISTRY_USER }}/compose-manager-launcher
+
+concurrency:
+  group: prod-image-mutation
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    name: Promote compose-manager staging -> prod
+    permissions:
+      contents: write
+      id-token: write
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Validate confirmation
+        env:
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          if [ "$CONFIRM" != "promote" ]; then
+            echo "Confirmation input must be exactly 'promote'" >&2
+            exit 1
+          fi
+
+      - name: Log in to Docker registry
+        uses: docker/login-action@0567fa5ae8c9a197cb207537dc5cbb43ca3d803f
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ vars.DOCKER_REGISTRY_USER }}
+          password: ${{ secrets.DOCKER_REGISTRY_TOKEN }}
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y skopeo jq
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6  # v4.1.2
+
+      - name: Record launcher tags (must not change)
+        run: |
+          set -euo pipefail
+          for tag in prod latest; do
+            digest=$(skopeo inspect --raw "docker://${{ env.REGISTRY }}/${{ env.LAUNCHER_IMAGE_REPOSITORY }}:${tag}" | sha256sum | cut -d' ' -f1)
+            echo "LAUNCHER_${tag^^}_BEFORE=sha256:${digest}" >> "$GITHUB_ENV"
+            echo "compose-manager-launcher:${tag} = sha256:${digest}"
+          done
+
+      - name: Resolve staging digest and source SHA
+        run: |
+          set -euo pipefail
+          image="${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}"
+          repo_name="${{ env.IMAGE_REPOSITORY }}"
+          repo_name="${repo_name##*/}"
+
+          digest=$(skopeo inspect "docker://${image}:staging" | jq -r '.Digest')
+          if [ -z "$digest" ] || [ "$digest" = "null" ]; then
+            echo "::error::Failed to resolve ${image}:staging"
+            exit 1
+          fi
+
+          short_sha=""
+          page_url="https://hub.docker.com/v2/namespaces/${{ vars.DOCKER_REGISTRY_USER }}/repositories/${repo_name}/tags?page_size=100"
+          page_count=0
+          while [ -n "$page_url" ] && [ "$page_url" != "null" ] && [ "$page_count" -lt 50 ]; do
+            resp=$(curl -fsS --max-time 30 --retry 2 --retry-delay 2 "$page_url")
+            match=$(echo "$resp" | jq -r --arg d "$digest" '.results[] | select(.digest==$d) | select(.name | test("^staging-[0-9]{8}-[0-9a-f]{7}$")) | .name' | head -n1)
+            if [ -n "$match" ]; then
+              short_sha=$(echo "$match" | sed -E 's/^staging-[0-9]{8}-//')
+              break
+            fi
+            page_url=$(echo "$resp" | jq -r '.next')
+            page_count=$((page_count + 1))
+          done
+          if [ -z "$short_sha" ]; then
+            echo "::error::No staging-<date>-<sha> tag found for ${digest}; refusing to promote an image of unknown source"
+            exit 1
+          fi
+
+          echo "CM_IMAGE=${image}" >> "$GITHUB_ENV"
+          echo "CM_DIGEST=${digest}" >> "$GITHUB_ENV"
+          echo "CM_SHORT_SHA=${short_sha}" >> "$GITHUB_ENV"
+          echo "compose-manager:staging = ${digest} (${short_sha})"
+
+      - name: Verify staging image was built and signed by build.yml on master
+        run: |
+          set -euo pipefail
+          cosign verify \
+            --certificate-identity-regexp '^https://github\.com/nearai/compose-manager/\.github/workflows/build\.yml@refs/heads/master$' \
+            --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+            --certificate-github-workflow-repository 'nearai/compose-manager' \
+            --certificate-github-workflow-ref 'refs/heads/master' \
+            "${CM_IMAGE}@${CM_DIGEST}"
+
+      - name: Re-tag staging digest to prod aliases
+        run: |
+          set -euo pipefail
+          STAMP=$(date -u +%Y%m%d)
+          CM_PROD_STAMPED_TAG="prod-${STAMP}-${CM_SHORT_SHA}"
+          skopeo copy "docker://${CM_IMAGE}@${CM_DIGEST}" "docker://${CM_IMAGE}:prod"
+          skopeo copy "docker://${CM_IMAGE}@${CM_DIGEST}" "docker://${CM_IMAGE}:${CM_PROD_STAMPED_TAG}"
+          skopeo copy "docker://${CM_IMAGE}@${CM_DIGEST}" "docker://${CM_IMAGE}:latest"
+          echo "CM_PROD_STAMPED_TAG=${CM_PROD_STAMPED_TAG}" >> "$GITHUB_ENV"
+          echo "CM_PROD_STAMPED_REF=${CM_IMAGE}:${CM_PROD_STAMPED_TAG}" >> "$GITHUB_ENV"
+
+      - name: Confirm prod tags resolve to the promoted digest and the launcher is unchanged
+        run: |
+          set -euo pipefail
+          for tag in prod "$CM_PROD_STAMPED_TAG" latest; do
+            resolved_digest=$(skopeo inspect "docker://${CM_IMAGE}:${tag}" | jq -r '.Digest')
+            if [ "$resolved_digest" != "$CM_DIGEST" ]; then
+              echo "::error::${CM_IMAGE}:${tag} resolved to ${resolved_digest}, expected ${CM_DIGEST}"
+              exit 1
+            fi
+          done
+          for tag in prod latest; do
+            before_var="LAUNCHER_${tag^^}_BEFORE"
+            after="sha256:$(skopeo inspect --raw "docker://${{ env.REGISTRY }}/${{ env.LAUNCHER_IMAGE_REPOSITORY }}:${tag}" | sha256sum | cut -d' ' -f1)"
+            if [ "$after" != "${!before_var}" ]; then
+              echo "::error::compose-manager-launcher:${tag} changed from ${!before_var} to ${after}"
+              exit 1
+            fi
+          done
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          RELEASE_TAG="${CM_PROD_STAMPED_TAG}"
+          NOTES=$(cat <<EOF
+          ## Production Promotion (compose-manager only)
+
+          ### compose-manager
+          - **Image**: \`${CM_IMAGE}:prod\`
+          - **Stamped image**: \`${CM_PROD_STAMPED_REF}\`
+          - **Compatibility alias**: \`${CM_IMAGE}:latest\`
+          - **Digest**: \`${CM_DIGEST}\`
+          - **Source short-sha**: \`${CM_SHORT_SHA}\`
+          - **Sigstore**: https://search.sigstore.dev/?hash=${CM_DIGEST}
+
+          ### compose-manager-launcher
+          - Not promoted. \`:prod\` stays \`${LAUNCHER_PROD_BEFORE}\`.
+          EOF
+          )
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" --title "Production Release ${RELEASE_TAG}" --notes "$NOTES"
+          else
+            gh release create "$RELEASE_TAG" --title "Production Release ${RELEASE_TAG}" --notes "$NOTES" --latest
+          fi
+
+      - name: Generate build summary
+        run: |
+          {
+            echo "## Promotion: compose-manager staging -> prod"
+            echo ""
+            echo "- prod: \`${CM_IMAGE}:prod\`"
+            echo "- stamped tag: \`${CM_PROD_STAMPED_REF}\`"
+            echo "- latest alias: \`${CM_IMAGE}:latest\`"
+            echo "- digest: \`${CM_DIGEST}\`"
+            echo ""
+            echo "compose-manager-launcher not promoted (\`:prod\` = \`${LAUNCHER_PROD_BEFORE}\`)."
+          } >> "$GITHUB_STEP_SUMMARY"
