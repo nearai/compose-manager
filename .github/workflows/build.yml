@@ -203,6 +203,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+      attestations: write
+      id-token: write
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -228,11 +230,26 @@ jobs:
           echo "DASHBOARD_IMAGE_REFERENCE=${{ env.REGISTRY }}/${{ env.DASHBOARD_IMAGE_REPOSITORY }}:${TAG}" >> "$GITHUB_ENV"
 
       - name: Build and push dashboard image
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: ./dashboard
           push: true
           tags: ${{ env.DASHBOARD_IMAGE_REFERENCE }}
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6  # v4.1.2
+
+      - name: Sign dashboard image with cosign (keyless)
+        run: |
+          cosign sign --yes "${{ env.REGISTRY }}/${{ env.DASHBOARD_IMAGE_REPOSITORY }}@${{ steps.build.outputs.digest }}"
+
+      - name: Generate artifact attestation
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.DASHBOARD_IMAGE_REPOSITORY }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
 
       - name: Generate build summary
         run: |
@@ -240,4 +257,6 @@ jobs:
             echo "## compose-manager-dashboard docker image"
             echo ""
             echo "- tag: \`${{ env.DASHBOARD_IMAGE_REFERENCE }}\`"
+            echo "- digest: \`${{ steps.build.outputs.digest }}\`"
+            echo "- sigstore: https://search.sigstore.dev/?hash=${{ steps.build.outputs.digest }}"
           } >> "$GITHUB_STEP_SUMMARY"

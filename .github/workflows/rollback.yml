@@ -24,6 +24,7 @@ env:
   REGISTRY: docker.io
   IMAGE_REPOSITORY: ${{ vars.DOCKER_REGISTRY_USER }}/compose-manager
   LAUNCHER_IMAGE_REPOSITORY: ${{ vars.DOCKER_REGISTRY_USER }}/compose-manager-launcher
+  DASHBOARD_IMAGE_REPOSITORY: ${{ vars.DOCKER_REGISTRY_USER }}/compose-manager-dashboard
 
 jobs:
   rollback-prod:
@@ -63,16 +64,22 @@ jobs:
           set -euo pipefail
           CM_IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}"
           LAUNCHER_IMAGE="${{ env.REGISTRY }}/${{ env.LAUNCHER_IMAGE_REPOSITORY }}"
+          DASHBOARD_IMAGE="${{ env.REGISTRY }}/${{ env.DASHBOARD_IMAGE_REPOSITORY }}"
           TARGET_TAG="$TARGET_TAG_INPUT"
 
           CM_CURRENT_DIGEST=$(skopeo inspect "docker://${CM_IMAGE}:prod" 2>/dev/null | jq -r '.Digest' || true)
           LAUNCHER_CURRENT_DIGEST=$(skopeo inspect "docker://${LAUNCHER_IMAGE}:prod" 2>/dev/null | jq -r '.Digest' || true)
+          DASHBOARD_CURRENT_DIGEST=$(skopeo inspect "docker://${DASHBOARD_IMAGE}:prod" 2>/dev/null | jq -r '.Digest' || true)
           if [ -z "$CM_CURRENT_DIGEST" ] || [ "$CM_CURRENT_DIGEST" = "null" ]; then
             echo "::error::Failed to inspect current compose-manager :prod digest."
             exit 1
           fi
           if [ -z "$LAUNCHER_CURRENT_DIGEST" ] || [ "$LAUNCHER_CURRENT_DIGEST" = "null" ]; then
             echo "::error::Failed to inspect current compose-manager-launcher :prod digest."
+            exit 1
+          fi
+          if [ -z "$DASHBOARD_CURRENT_DIGEST" ] || [ "$DASHBOARD_CURRENT_DIGEST" = "null" ]; then
+            echo "::error::Failed to inspect current compose-manager-dashboard :prod digest."
             exit 1
           fi
 
@@ -104,6 +111,7 @@ jobs:
 
           CM_TARGET_DIGEST=$(skopeo inspect "docker://${CM_IMAGE}:${TARGET_TAG}" 2>/dev/null | jq -r '.Digest' || true)
           LAUNCHER_TARGET_DIGEST=$(skopeo inspect "docker://${LAUNCHER_IMAGE}:${TARGET_TAG}" 2>/dev/null | jq -r '.Digest' || true)
+          DASHBOARD_TARGET_DIGEST=$(skopeo inspect "docker://${DASHBOARD_IMAGE}:${TARGET_TAG}" 2>/dev/null | jq -r '.Digest' || true)
           if [ -z "$CM_TARGET_DIGEST" ] || [ "$CM_TARGET_DIGEST" = "null" ]; then
             echo "::error::compose-manager tag ${TARGET_TAG} not found"
             exit 1
@@ -112,19 +120,26 @@ jobs:
             echo "::error::compose-manager-launcher tag ${TARGET_TAG} not found"
             exit 1
           fi
-          if [ "$CM_TARGET_DIGEST" = "$CM_CURRENT_DIGEST" ] && [ "$LAUNCHER_TARGET_DIGEST" = "$LAUNCHER_CURRENT_DIGEST" ]; then
-            echo "::error::Target tag ${TARGET_TAG} already matches current :prod for both images."
+          if [ -z "$DASHBOARD_TARGET_DIGEST" ] || [ "$DASHBOARD_TARGET_DIGEST" = "null" ]; then
+            echo "::error::compose-manager-dashboard tag ${TARGET_TAG} not found"
+            exit 1
+          fi
+          if [ "$CM_TARGET_DIGEST" = "$CM_CURRENT_DIGEST" ] && [ "$LAUNCHER_TARGET_DIGEST" = "$LAUNCHER_CURRENT_DIGEST" ] && [ "$DASHBOARD_TARGET_DIGEST" = "$DASHBOARD_CURRENT_DIGEST" ]; then
+            echo "::error::Target tag ${TARGET_TAG} already matches current :prod for all three images."
             exit 1
           fi
 
           AUDIT_TAG="prod-rollback-$(date -u +%Y%m%d-%H%M%S)-from-${TARGET_TAG#prod-}"
           echo "cm_image=${CM_IMAGE}" >> "$GITHUB_OUTPUT"
           echo "launcher_image=${LAUNCHER_IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "dashboard_image=${DASHBOARD_IMAGE}" >> "$GITHUB_OUTPUT"
           echo "target_tag=${TARGET_TAG}" >> "$GITHUB_OUTPUT"
           echo "cm_target_digest=${CM_TARGET_DIGEST}" >> "$GITHUB_OUTPUT"
           echo "launcher_target_digest=${LAUNCHER_TARGET_DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "dashboard_target_digest=${DASHBOARD_TARGET_DIGEST}" >> "$GITHUB_OUTPUT"
           echo "cm_previous_digest=${CM_CURRENT_DIGEST}" >> "$GITHUB_OUTPUT"
           echo "launcher_previous_digest=${LAUNCHER_CURRENT_DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "dashboard_previous_digest=${DASHBOARD_CURRENT_DIGEST}" >> "$GITHUB_OUTPUT"
           echo "audit_tag=${AUDIT_TAG}" >> "$GITHUB_OUTPUT"
 
       - name: Verify rollback targets were built and signed by build.yml on master
@@ -132,7 +147,8 @@ jobs:
           set -euo pipefail
           for pair in \
             "${{ steps.resolve.outputs.cm_image }}@${{ steps.resolve.outputs.cm_target_digest }}" \
-            "${{ steps.resolve.outputs.launcher_image }}@${{ steps.resolve.outputs.launcher_target_digest }}"; do
+            "${{ steps.resolve.outputs.launcher_image }}@${{ steps.resolve.outputs.launcher_target_digest }}" \
+            "${{ steps.resolve.outputs.dashboard_image }}@${{ steps.resolve.outputs.dashboard_target_digest }}"; do
             cosign verify \
               --certificate-identity-regexp '^https://github\.com/nearai/compose-manager/\.github/workflows/build\.yml@refs/heads/master$' \
               --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
@@ -155,6 +171,7 @@ jobs:
 
           retag_image "${{ steps.resolve.outputs.cm_image }}" "${{ steps.resolve.outputs.cm_target_digest }}"
           retag_image "${{ steps.resolve.outputs.launcher_image }}" "${{ steps.resolve.outputs.launcher_target_digest }}"
+          retag_image "${{ steps.resolve.outputs.dashboard_image }}" "${{ steps.resolve.outputs.dashboard_target_digest }}"
 
       - name: Confirm rollback tags resolve to the target digests
         run: |
@@ -174,6 +191,7 @@ jobs:
 
           confirm_image "${{ steps.resolve.outputs.cm_image }}" "${{ steps.resolve.outputs.cm_target_digest }}"
           confirm_image "${{ steps.resolve.outputs.launcher_image }}" "${{ steps.resolve.outputs.launcher_target_digest }}"
+          confirm_image "${{ steps.resolve.outputs.dashboard_image }}" "${{ steps.resolve.outputs.dashboard_target_digest }}"
 
       - name: Create GitHub release
         env:
@@ -202,6 +220,15 @@ jobs:
           - **New digest**: \`${{ steps.resolve.outputs.launcher_target_digest }}\`
           - **Previous digest**: \`${{ steps.resolve.outputs.launcher_previous_digest }}\`
           - **Sigstore**: https://search.sigstore.dev/?hash=${{ steps.resolve.outputs.launcher_target_digest }}
+
+          ### compose-manager-dashboard
+          - **Image**: \`${{ steps.resolve.outputs.dashboard_image }}:prod\`
+          - **Compatibility alias**: \`${{ steps.resolve.outputs.dashboard_image }}:latest\`
+          - **Rolled back to**: \`${{ steps.resolve.outputs.dashboard_image }}:${{ steps.resolve.outputs.target_tag }}\`
+          - **Audit tag**: \`${{ steps.resolve.outputs.dashboard_image }}:${TAG}\`
+          - **New digest**: \`${{ steps.resolve.outputs.dashboard_target_digest }}\`
+          - **Previous digest**: \`${{ steps.resolve.outputs.dashboard_previous_digest }}\`
+          - **Sigstore**: https://search.sigstore.dev/?hash=${{ steps.resolve.outputs.dashboard_target_digest }}
           EOF
           )
           if gh release view "$TAG" >/dev/null 2>&1; then
@@ -222,6 +249,10 @@ jobs:
             echo "### compose-manager-launcher"
             echo "- target digest: \`${{ steps.resolve.outputs.launcher_target_digest }}\`"
             echo "- previous digest: \`${{ steps.resolve.outputs.launcher_previous_digest }}\`"
+            echo ""
+            echo "### compose-manager-dashboard"
+            echo "- target digest: \`${{ steps.resolve.outputs.dashboard_target_digest }}\`"
+            echo "- previous digest: \`${{ steps.resolve.outputs.dashboard_previous_digest }}\`"
             echo ""
             echo "- audit tag: \`${{ steps.resolve.outputs.audit_tag }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
