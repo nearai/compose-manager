@@ -819,12 +819,16 @@ struct TagInfo {
 }
 
 async fn get_tag_info(state: &AppState, tag: &str) -> Result<TagInfo> {
-    let url = format!(
-        "https://api.github.com/repos/{}/{}/commits/{}",
-        state.github_owner, state.github_repo_name, tag
-    );
+    let mut url = url::Url::parse("https://api.github.com/repos/").expect("static url");
+    {
+        let mut seg = url.path_segments_mut().map_err(|_| anyhow!("cannot-be-a-base url"))?;
+        seg.pop_if_empty().push(&state.github_owner).push(&state.github_repo_name).push("commits");
+        for c in tag.split('/') {
+            seg.push(c);
+        }
+    }
 
-    let resp = state.http.get(&url)
+    let resp = state.http.get(url)
         .header("User-Agent", "compose-manager")
         .send().await
         .context("Failed to query GitHub API")?;
@@ -863,19 +867,202 @@ async fn validate_tag(state: &AppState, tag: &str) -> Result<TagInfo, (StatusCod
     Ok(tag_info)
 }
 
-async fn fetch_github_file(state: &AppState, tag: &str, path: &str) -> Result<String> {
-    let url = format!(
-        "https://raw.githubusercontent.com/{}/{}/{}/{}",
-        state.github_owner, state.github_repo_name, tag, path
-    );
+// --- Request path validation ---
 
-    let resp = state.http.get(&url)
+const MAX_COMPOSE_FILE_LEN: usize = 255;
+const MAX_TAG_LEN: usize = 200;
+
+/// Validates the `file` field: a relative path of `/`-separated components made
+/// only of `[A-Za-z0-9._-]`; no empty, `.` or `..` components.
+fn validate_compose_file(file: &str) -> Result<(), String> {
+    if file.is_empty() || file.len() > MAX_COMPOSE_FILE_LEN {
+        return Err("invalid file: must be 1-255 characters".into());
+    }
+    for comp in file.split('/') {
+        if comp.is_empty() || comp == "." || comp == ".."
+            || !comp.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        {
+            return Err("invalid file: must be a relative path of [A-Za-z0-9._-] components".into());
+        }
+    }
+    Ok(())
+}
+
+/// Validates the `tag` field: `[A-Za-z0-9._/-]`, no leading `/` or `-`, no
+/// empty, `.` or `..` components, and no `..` anywhere.
+fn validate_tag_name(tag: &str) -> Result<(), String> {
+    let bad = || Err("invalid tag: must match [A-Za-z0-9._/-], no '..', no leading '/' or '-'".to_string());
+    if tag.is_empty() || tag.len() > MAX_TAG_LEN || tag.starts_with('/') || tag.starts_with('-') || tag.contains("..") {
+        return bad();
+    }
+    if !tag.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'/')) {
+        return bad();
+    }
+    if tag.split('/').any(|c| c.is_empty() || c == ".") {
+        return bad();
+    }
+    Ok(())
+}
+
+/// Docker Compose service / container name: `[a-zA-Z0-9][a-zA-Z0-9_.-]*`,
+/// at most 255 characters (so it can never be parsed as a CLI flag).
+fn validate_service_name(name: &str) -> Result<(), String> {
+    let mut bytes = name.bytes();
+    let ok = !name.is_empty()
+        && name.len() <= 255
+        && bytes.next().is_some_and(|b| b.is_ascii_alphanumeric())
+        && bytes.all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'));
+    if ok {
+        Ok(())
+    } else {
+        Err("invalid service name: must match [a-zA-Z0-9][a-zA-Z0-9_.-]* (max 255)".into())
+    }
+}
+
+fn validate_service_names(names: &[String]) -> Result<(), (StatusCode, String)> {
+    names
+        .iter()
+        .try_for_each(|n| validate_service_name(n))
+        .map_err(|m| (StatusCode::BAD_REQUEST, m))
+}
+
+/// Single entry point for handlers that accept `file` and/or `tag`.
+fn validate_request_paths(tag: Option<&str>, file: Option<&str>) -> Result<(), (StatusCode, String)> {
+    if let Some(t) = tag {
+        validate_tag_name(t).map_err(|m| (StatusCode::BAD_REQUEST, m))?;
+    }
+    if let Some(f) = file {
+        validate_compose_file(f).map_err(|m| (StatusCode::BAD_REQUEST, m))?;
+    }
+    Ok(())
+}
+
+/// Builds the raw.githubusercontent.com URL from validated parts, pushing each
+/// segment individually so nothing can be re-normalized into another path.
+fn raw_file_url(owner: &str, repo: &str, reference: &str, file: &str) -> Result<url::Url> {
+    validate_tag_name(reference).map_err(|m| anyhow!(m))?;
+    validate_compose_file(file).map_err(|m| anyhow!(m))?;
+    push_raw_segments(owner, repo, reference, file)
+}
+
+/// Segment-pushing URL builder, without input validation (tested directly).
+fn push_raw_segments(owner: &str, repo: &str, reference: &str, file: &str) -> Result<url::Url> {
+    let mut u = url::Url::parse("https://raw.githubusercontent.com/").expect("static url");
+    {
+        let mut seg = u.path_segments_mut().map_err(|_| anyhow!("cannot-be-a-base url"))?;
+        seg.push(owner).push(repo);
+        for c in reference.split('/') {
+            seg.push(c);
+        }
+        for c in file.split('/') {
+            seg.push(c);
+        }
+    }
+    Ok(u)
+}
+
+/// Lexical join of a validated relative file under `work_dir`.
+fn safe_target_path(work_dir: &Path, file: &str) -> Result<PathBuf, String> {
+    validate_compose_file(file)?;
+    let rel = Path::new(file);
+    if !rel.components().all(|c| matches!(c, std::path::Component::Normal(_))) {
+        return Err("invalid file path".into());
+    }
+    Ok(work_dir.join(rel))
+}
+
+/// Creates the parent directory of `target` without ever creating anything
+/// outside `work_dir`: the deepest existing ancestor is resolved (following
+/// symlinks) and checked first, then the remainder is created and re-checked.
+async fn prepare_target_dir(work_dir: &Path, target: &Path) -> Result<(), String> {
+    let parent = target.parent().ok_or("invalid file path")?;
+    tokio::fs::create_dir_all(work_dir).await.map_err(|e| format!("Failed to create work dir: {}", e))?;
+    let root = tokio::fs::canonicalize(work_dir).await.map_err(|e| format!("Failed to resolve work dir: {}", e))?;
+    let outside = || "invalid file path: resolves outside work dir".to_string();
+
+    let mut existing = parent;
+    loop {
+        match tokio::fs::symlink_metadata(existing).await {
+            Ok(_) => break,
+            Err(_) => existing = existing.parent().ok_or("invalid file path")?,
+        }
+    }
+    let resolved = tokio::fs::canonicalize(existing).await.map_err(|e| format!("Failed to resolve file parent dir: {}", e))?;
+    if !resolved.starts_with(&root) {
+        return Err(outside());
+    }
+    tokio::fs::create_dir_all(parent).await.map_err(|e| format!("Failed to create file parent dir: {}", e))?;
+    let resolved = tokio::fs::canonicalize(parent).await.map_err(|e| format!("Failed to resolve file parent dir: {}", e))?;
+    if !resolved.starts_with(&root) {
+        return Err(outside());
+    }
+    Ok(())
+}
+
+/// Writes `content` to `target` (under `work_dir`) via a temp file in the same
+/// directory and an atomic rename, so a pre-existing symlink at the target is
+/// replaced rather than followed.
+async fn write_target_file(work_dir: &Path, target: &Path, content: &str) -> Result<(), String> {
+    prepare_target_dir(work_dir, target).await?;
+    if let Ok(md) = tokio::fs::symlink_metadata(target).await {
+        if md.file_type().is_symlink() {
+            return Err("invalid file path: target is a symlink".into());
+        }
+    }
+    let parent = target.parent().ok_or("invalid file path")?;
+    let name = target.file_name().ok_or("invalid file path")?.to_string_lossy().into_owned();
+    let tmp = parent.join(format!(".{}.{:016x}.tmp", name, rand::random::<u64>()));
+    let res = async {
+        use tokio::io::AsyncWriteExt;
+        let mut f = tokio::fs::OpenOptions::new().write(true).create_new(true).open(&tmp).await?;
+        f.write_all(content.as_bytes()).await?;
+        f.flush().await?;
+        f.sync_all().await?;
+        drop(f);
+        tokio::fs::rename(&tmp, target).await
+    }
+    .await;
+    if let Err(e) = res {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(format!("Failed to write file: {}", e));
+    }
+    // Best-effort: persist the rename itself by fsyncing the parent directory.
+    if let Ok(dir) = tokio::fs::File::open(parent).await {
+        let _ = dir.sync_all().await;
+    }
+    Ok(())
+}
+
+/// Maps a GitHub raw-content status to a result; anything non-2xx is an error.
+fn check_fetch_status(status: reqwest::StatusCode, path: &str, tag: &str) -> Result<()> {
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Err(anyhow!("file '{}' not found at tag '{}'", path, tag));
+    }
+    if !status.is_success() {
+        return Err(anyhow!("failed to fetch file '{}' at tag '{}': HTTP {}", path, tag, status));
+    }
+    Ok(())
+}
+
+/// A resolved commit SHA must be exactly 40 lowercase hex characters.
+fn ensure_commit_sha(sha: &str) -> Result<()> {
+    if sha.len() == 40 && sha.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        Ok(())
+    } else {
+        Err(anyhow!("unexpected commit identifier from GitHub"))
+    }
+}
+
+/// Fetches `path` at commit `sha`; `tag` is only used in user-facing messages.
+async fn fetch_github_file(state: &AppState, tag: &str, sha: &str, path: &str) -> Result<String> {
+    ensure_commit_sha(sha)?;
+    let url = raw_file_url(&state.github_owner, &state.github_repo_name, sha, path)?;
+
+    let resp = state.http.get(url)
         .send().await
         .context("Failed to fetch file from GitHub")?;
 
-    if resp.status() == reqwest::StatusCode::NOT_FOUND {
-        return Err(anyhow!("file '{}' not found at tag '{}'", path, tag));
-    }
+    check_fetch_status(resp.status(), path, tag)?;
 
     resp.text().await.context("Failed to read file content")
 }
@@ -1344,6 +1531,9 @@ fn staged_image_digests(meta: &StagedMeta) -> Vec<String> {
         }
     }
     cmd.args(["images", "-q"]);
+    if !meta.services.is_empty() {
+        cmd.arg("--");
+    }
     for service in &meta.services {
         cmd.arg(service);
     }
@@ -1835,6 +2025,9 @@ fn build_compose_cmd(
         cmd.args(["--env-file", tef.to_str().unwrap()]);
     }
     cmd.args(args);
+    if !services.is_empty() {
+        cmd.arg("--");
+    }
     for service in services {
         cmd.arg(service);
     }
@@ -1936,6 +2129,12 @@ async fn compose_up(
     }
 
     let file = payload.file.unwrap_or_else(|| "docker-compose.yml".into());
+    if let Err((code, msg)) = validate_request_paths(Some(&payload.tag), Some(&file)) {
+        return err_response(code, msg);
+    }
+    if let Err((code, msg)) = validate_service_names(&payload.services) {
+        return err_response(code, msg);
+    }
 
     // Acquire compose lock early (before GitHub fetch) to prevent parallel
     // operations from racing on the same compose file on disk.
@@ -1972,7 +2171,7 @@ async fn compose_up(
     };
 
     // Fetch compose file from GitHub and write to work directory
-    let content = match fetch_github_file(&state, &payload.tag, &file).await {
+    let content = match fetch_github_file(&state, &payload.tag, &tag_info.commit_sha, &file).await {
         Ok(c) => c,
         Err(e) => return err_response(StatusCode::BAD_REQUEST, e.to_string()),
     };
@@ -1982,14 +2181,13 @@ async fn compose_up(
     if let Err(e) = tokio::fs::create_dir_all(&state.work_dir).await {
         return err_response(StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create work dir: {}", e));
     }
-    let target_path = state.work_dir.join(&file);
-    if let Some(parent) = target_path.parent() {
-        if let Err(e) = tokio::fs::create_dir_all(parent).await {
-            return err_response(StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create file parent dir: {}", e));
-        }
-    }
-    if let Err(e) = tokio::fs::write(&target_path, &content).await {
-        return err_response(StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to write file: {}", e));
+    let target_path = match safe_target_path(&state.work_dir, &file) {
+        Ok(p) => p,
+        Err(msg) => return err_response(StatusCode::BAD_REQUEST, msg),
+    };
+    if let Err(msg) = write_target_file(&state.work_dir, &target_path, &content).await {
+        let code = if msg.starts_with("invalid file path") { StatusCode::BAD_REQUEST } else { StatusCode::INTERNAL_SERVER_ERROR };
+        return err_response(code, msg);
     }
 
     let temp_env_file = if !payload.env.is_empty() {
@@ -2185,6 +2383,12 @@ async fn compose_down(
     }
 
     let file = payload.file.unwrap_or_else(|| "docker-compose.yml".into());
+    if let Err((code, msg)) = validate_request_paths(Some(&payload.tag), Some(&file)) {
+        return err_response(code, msg);
+    }
+    if let Err((code, msg)) = validate_service_names(&payload.services) {
+        return err_response(code, msg);
+    }
 
     let guard = match state.try_acquire_compose_lock(
         "compose_down",
@@ -2300,6 +2504,12 @@ async fn compose_logs(
     };
 
     let file = file.unwrap_or_else(|| "docker-compose.yml".into());
+    if let Err((code, msg)) = validate_request_paths(None, Some(&file)) {
+        return err(code, msg);
+    }
+    if let Err((code, msg)) = validate_service_names(&services) {
+        return err(code, msg);
+    }
     let tail_str = tail.to_string();
 
     match run_docker_compose(&state.work_dir, &["logs", "--tail", &tail_str], &file, &state.env_files, &services, &project) {
@@ -2351,6 +2561,10 @@ async fn docker_restart(
 ) -> impl IntoResponse {
     if let Err(e) = verify_bearer_token(&headers, &state.bearer_tokens) {
         return e;
+    }
+
+    if let Err(m) = validate_service_name(&payload.container) {
+        return err(StatusCode::BAD_REQUEST, m.replace("service", "container"));
     }
 
     let _guard = match state.try_acquire_compose_lock(
@@ -3539,6 +3753,9 @@ fn docker_compose_command(work_dir: &Path, args: &[&str], file: &str, env_files:
         cmd.args(["--env-file", env_file]);
     }
     cmd.args(args);
+    if !services.is_empty() {
+        cmd.arg("--");
+    }
     for service in services {
         cmd.arg(service);
     }
@@ -4086,6 +4303,237 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
 
+    // --- request path / tag validation ---
+
+    #[test]
+    fn compose_file_validator_rejects_unsafe_names() {
+        for bad in [
+            "", ".", "..", "../x.yml", "a/../../b", "a/./b", "/etc/x", "%2e%2e/x", "a%2fb",
+            "a\\b", "a?b", "a#b", "a:b", "a\0b", "a//b", "a/", "a b", "a\n", "caf\u{e9}.yml",
+            &"a".repeat(300),
+        ] {
+            assert!(validate_compose_file(bad).is_err(), "should reject {:?}", bad);
+        }
+    }
+
+    #[test]
+    fn compose_file_validator_accepts_real_names() {
+        for good in [
+            "docker-compose.yml", "prod/GLM-5.3.yaml", "dir/sub/file.yml",
+            "prod/GLM-5.3-Flash-SGL-TP2x4-W4AFP8-Q8Canary.yaml", "prod/Qwen3.5-122B.yaml",
+            "scripts/fixtures/pre-v7/small-models.pre-v7.yaml", "a_b/c..d.yml",
+        ] {
+            assert!(validate_compose_file(good).is_ok(), "should accept {:?}", good);
+        }
+    }
+
+    #[test]
+    fn tag_validator_rules() {
+        for bad in ["", "..", "v1/../x", "/v1", "-v1", "a%2e%2e", "a b", "a?b", "a#b", "a\\b", "a//b", "v1/", "v1/./x", &"a".repeat(300)] {
+            assert!(validate_tag_name(bad).is_err(), "should reject {:?}", bad);
+        }
+        for good in ["v0.0.13", "main", "release/v1.2", "0123456789abcdef0123456789abcdef01234567", "v1_rc-2"] {
+            assert!(validate_tag_name(good).is_ok(), "should accept {:?}", good);
+        }
+    }
+
+    #[test]
+    fn raw_url_matches_expected_for_valid_input() {
+        let u = raw_file_url("nearai", "cvm-compose-files", "v1.2.3", "prod/GLM-5.3.yaml").unwrap();
+        assert_eq!(u.as_str(), "https://raw.githubusercontent.com/nearai/cvm-compose-files/v1.2.3/prod/GLM-5.3.yaml");
+        let u = raw_file_url("o", "r", "release/v1", "a/b.yml").unwrap();
+        assert_eq!(u.as_str(), "https://raw.githubusercontent.com/o/r/release/v1/a/b.yml");
+    }
+
+    #[test]
+    fn raw_url_never_leaves_pinned_repo() {
+        for (tag, file) in [
+            ("v1", "../x.yml"), ("v1", "a/../../b"), ("v1", "%2e%2e/%2e%2e/x"),
+            ("../other/repo", "a.yml"), ("v1/..", "a.yml"), ("v1", "/etc/x"), ("v1", "a?b=c"),
+        ] {
+            match raw_file_url("o", "r", tag, file) {
+                Err(_) => {}
+                Ok(u) => {
+                    assert_eq!(u.host_str(), Some("raw.githubusercontent.com"));
+                    assert!(u.path().starts_with("/o/r/"), "escaped: {}", u);
+                    assert!(u.query().is_none() && u.fragment().is_none());
+                    assert!(!u.path().split('/').any(|c| c == ".." || c == "."));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn push_raw_segments_cannot_change_owner_or_repo() {
+        for (reference, file) in [
+            ("v1", "../x.yml"), ("v1", "a/../../../b"), ("v1", "%2e%2e/%2e%2e/x"),
+            ("../../evil/repo", "a.yml"), ("v1/%2e%2e", "a.yml"), ("v1", "a?b#c"), ("v1", "a\\..\\b"),
+        ] {
+            let u = push_raw_segments("o", "r", reference, file).unwrap();
+            assert_eq!(u.host_str(), Some("raw.githubusercontent.com"), "{}", u);
+            assert!(u.path().starts_with("/o/r/"), "escaped: {}", u);
+            assert!(u.query().is_none() && u.fragment().is_none(), "{}", u);
+            assert!(!u.path().split('/').any(|c| c == ".." || c == "."), "{}", u);
+        }
+    }
+
+    #[test]
+    fn fetch_status_non_success_is_error() {
+        use reqwest::StatusCode as S;
+        assert!(check_fetch_status(S::OK, "f", "t").is_ok());
+        let nf = check_fetch_status(S::NOT_FOUND, "f.yml", "v1").unwrap_err().to_string();
+        assert!(nf.contains("not found at tag 'v1'"));
+        for st in [S::FORBIDDEN, S::TOO_MANY_REQUESTS, S::INTERNAL_SERVER_ERROR, S::BAD_GATEWAY] {
+            assert!(check_fetch_status(st, "f", "t").is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn leaf_symlink_is_not_followed() {
+        let base = std::env::temp_dir().join(format!("cm-leaf-{}", rand::random::<u64>()));
+        let work = base.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let victim = base.join("victim.txt");
+        std::fs::write(&victim, "orig").unwrap();
+        std::os::unix::fs::symlink(&victim, work.join("x.yaml")).unwrap();
+        let r = write_target_file(&work, &work.join("x.yaml"), "pwn").await;
+        assert!(r.is_err());
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "orig");
+        // normal write works and replaces content atomically
+        write_target_file(&work, &work.join("d/y.yaml"), "one").await.unwrap();
+        write_target_file(&work, &work.join("d/y.yaml"), "two").await.unwrap();
+        assert_eq!(std::fs::read_to_string(work.join("d/y.yaml")).unwrap(), "two");
+        let leftovers: Vec<_> = std::fs::read_dir(work.join("d")).unwrap().collect();
+        assert_eq!(leftovers.len(), 1);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn no_dirs_created_outside_work_dir_via_symlink() {
+        let base = std::env::temp_dir().join(format!("cm-mk-{}", rand::random::<u64>()));
+        let work = base.join("work");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, work.join("link")).unwrap();
+        let r = prepare_target_dir(&work, &work.join("link/new/deeper/x.yaml")).await;
+        assert!(r.is_err());
+        assert!(!outside.join("new").exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn service_name_validator() {
+        for bad in ["-v", "--volumes", "--project-name=x", "", "a b", "_a", ".a", "a/b", "a\0", &"a".repeat(256)] {
+            assert!(validate_service_name(bad).is_err(), "should reject {:?}", bad);
+        }
+        for good in ["vllm", "inference-proxy", "model_1.x", "0abc", &"a".repeat(255)] {
+            assert!(validate_service_name(good).is_ok(), "should accept {:?}", good);
+        }
+        assert!(validate_service_names(&["ok".into(), "-v".into()]).is_err());
+        assert!(validate_service_names(&[]).is_ok());
+    }
+
+    #[test]
+    fn services_follow_double_dash_in_built_commands() {
+        let wd = Path::new("/app/work");
+        let svcs = vec!["vllm".to_string(), "proxy".to_string()];
+        let cmd = build_compose_cmd(wd, "work", &["up", "-d"], "a.yaml", &[], &svcs, None, false);
+        let args: Vec<_> = cmd.as_std().get_args().map(|a| a.to_str().unwrap().to_string()).collect();
+        let tail: Vec<_> = args.iter().rev().take(3).rev().cloned().collect();
+        assert_eq!(tail, ["--", "vllm", "proxy"]);
+        let cmd = build_compose_cmd(wd, "work", &["down"], "a.yaml", &[], &[], None, false);
+        assert!(!cmd.as_std().get_args().any(|a| a == "--"));
+    }
+
+    #[test]
+    fn commit_sha_must_be_40_lowercase_hex() {
+        assert!(ensure_commit_sha("0123456789abcdef0123456789abcdef01234567").is_ok());
+        for bad in ["", "main", "../x", "0123456789ABCDEF0123456789ABCDEF01234567",
+            "0123456789abcdef0123456789abcdef0123456", "0123456789abcdef0123456789abcdef012345678",
+            "0123456789abcdef0123456789abcdef0123456g"] {
+            assert!(ensure_commit_sha(bad).is_err(), "should reject {:?}", bad);
+        }
+    }
+
+    #[tokio::test]
+    async fn temp_file_removed_when_rename_fails() {
+        let base = std::env::temp_dir().join(format!("cm-rn-{}", rand::random::<u64>()));
+        let work = base.join("work");
+        std::fs::create_dir_all(work.join("x.yaml")).unwrap(); // directory: rename over it fails
+        let r = write_target_file(&work, &work.join("x.yaml"), "data").await;
+        assert!(r.is_err());
+        let names: Vec<_> = std::fs::read_dir(&work).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(names.len(), 1, "temp file left behind: {:?}", names);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    async fn post_json(path: &str, body: &str) -> (StatusCode, String) {
+        use tower::ServiceExt;
+        let app = Router::new()
+            .route("/compose/up", post(compose_up))
+            .route("/compose/down", post(compose_down))
+            .route("/compose/logs", post(compose_logs))
+            .route("/docker/restart", post(docker_restart))
+            .with_state(make_test_state());
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("Authorization", "Bearer test-token")
+            .header("Content-Type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(5), app.oneshot(req))
+            .await
+            .expect("handler must reject before any network call")
+            .unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    #[tokio::test]
+    async fn compose_handlers_reject_bad_inputs_with_400() {
+        let cases = [
+            ("/compose/up", r#"{"tag":"v1","file":"../x.yml"}"#),
+            ("/compose/up", r#"{"tag":"../x","file":"a.yml"}"#),
+            ("/compose/up", r#"{"tag":"v1","file":"a.yml","services":["-v"]}"#),
+            ("/compose/up", r#"{"tag":"v1","file":"a.yml","materialize_only":true,"services":["--volumes"]}"#),
+            ("/compose/down", r#"{"tag":"v1","file":"/etc/x"}"#),
+            ("/compose/down", r#"{"tag":"-v1","file":"a.yml"}"#),
+            ("/compose/down", r#"{"tag":"v1","file":"a.yml","services":["--project-name=x"]}"#),
+            ("/compose/logs", r#"{"file":"a/../../b"}"#),
+            ("/compose/logs", r#"{"file":"a.yml","services":["a b"]}"#),
+            ("/docker/restart", r#"{"container":"--time=0"}"#),
+        ];
+        for (path, body) in cases {
+            let (status, msg) = post_json(path, body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{} {} -> {}", path, body, msg);
+        }
+    }
+
+    #[test]
+    fn target_path_stays_under_work_dir() {
+        let wd = Path::new("/app/work");
+        assert_eq!(safe_target_path(wd, "prod/x.yaml").unwrap(), Path::new("/app/work/prod/x.yaml"));
+        assert!(safe_target_path(wd, "../x").is_err());
+        assert!(safe_target_path(wd, "/etc/x").is_err());
+        assert!(safe_target_path(wd, "a/../../x").is_err());
+    }
+
+    #[tokio::test]
+    async fn symlinked_parent_escape_is_rejected() {
+        let base = std::env::temp_dir().join(format!("cm-path-{}", rand::random::<u64>()));
+        let work = base.join("work");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, work.join("link")).unwrap();
+        assert!(prepare_target_dir(&work, &work.join("link/x.yaml")).await.is_err());
+        assert!(prepare_target_dir(&work, &work.join("ok/x.yaml")).await.is_ok());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn logs_project_defaults_to_work_and_preserves_explicit_scope() {
         let work_dir = Path::new("/app/work");
@@ -4101,7 +4549,7 @@ mod tests {
                 "prod/preflight.yaml", &["runtime.env".into()], &["preflight".into()], &project);
             let args: Vec<_> = cmd.get_args().map(|arg| arg.to_str().unwrap()).collect();
             assert_eq!(args, ["compose", "-p", expected, "-f", "prod/preflight.yaml",
-                "--env-file", "runtime.env", "logs", "--tail", "15", "preflight"]);
+                "--env-file", "runtime.env", "logs", "--tail", "15", "--", "preflight"]);
             assert_eq!(cmd.get_current_dir(), Some(work_dir));
         }
     }
