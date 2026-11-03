@@ -1017,6 +1017,7 @@ async fn write_target_file(work_dir: &Path, target: &Path, content: &str) -> Res
         let mut f = tokio::fs::OpenOptions::new().write(true).create_new(true).open(&tmp).await?;
         f.write_all(content.as_bytes()).await?;
         f.flush().await?;
+        f.sync_all().await?;
         drop(f);
         tokio::fs::rename(&tmp, target).await
     }
@@ -1024,6 +1025,10 @@ async fn write_target_file(work_dir: &Path, target: &Path, content: &str) -> Res
     if let Err(e) = res {
         let _ = tokio::fs::remove_file(&tmp).await;
         return Err(format!("Failed to write file: {}", e));
+    }
+    // Best-effort: persist the rename itself by fsyncing the parent directory.
+    if let Ok(dir) = tokio::fs::File::open(parent).await {
+        let _ = dir.sync_all().await;
     }
     Ok(())
 }
@@ -1039,8 +1044,18 @@ fn check_fetch_status(status: reqwest::StatusCode, path: &str, tag: &str) -> Res
     Ok(())
 }
 
+/// A resolved commit SHA must be exactly 40 lowercase hex characters.
+fn ensure_commit_sha(sha: &str) -> Result<()> {
+    if sha.len() == 40 && sha.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        Ok(())
+    } else {
+        Err(anyhow!("unexpected commit identifier from GitHub"))
+    }
+}
+
 /// Fetches `path` at commit `sha`; `tag` is only used in user-facing messages.
 async fn fetch_github_file(state: &AppState, tag: &str, sha: &str, path: &str) -> Result<String> {
+    ensure_commit_sha(sha)?;
     let url = raw_file_url(&state.github_owner, &state.github_repo_name, sha, path)?;
 
     let resp = state.http.get(url)
@@ -4429,6 +4444,72 @@ mod tests {
         assert_eq!(tail, ["--", "vllm", "proxy"]);
         let cmd = build_compose_cmd(wd, "work", &["down"], "a.yaml", &[], &[], None, false);
         assert!(!cmd.as_std().get_args().any(|a| a == "--"));
+    }
+
+    #[test]
+    fn commit_sha_must_be_40_lowercase_hex() {
+        assert!(ensure_commit_sha("0123456789abcdef0123456789abcdef01234567").is_ok());
+        for bad in ["", "main", "../x", "0123456789ABCDEF0123456789ABCDEF01234567",
+            "0123456789abcdef0123456789abcdef0123456", "0123456789abcdef0123456789abcdef012345678",
+            "0123456789abcdef0123456789abcdef0123456g"] {
+            assert!(ensure_commit_sha(bad).is_err(), "should reject {:?}", bad);
+        }
+    }
+
+    #[tokio::test]
+    async fn temp_file_removed_when_rename_fails() {
+        let base = std::env::temp_dir().join(format!("cm-rn-{}", rand::random::<u64>()));
+        let work = base.join("work");
+        std::fs::create_dir_all(work.join("x.yaml")).unwrap(); // directory: rename over it fails
+        let r = write_target_file(&work, &work.join("x.yaml"), "data").await;
+        assert!(r.is_err());
+        let names: Vec<_> = std::fs::read_dir(&work).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(names.len(), 1, "temp file left behind: {:?}", names);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    async fn post_json(path: &str, body: &str) -> (StatusCode, String) {
+        use tower::ServiceExt;
+        let app = Router::new()
+            .route("/compose/up", post(compose_up))
+            .route("/compose/down", post(compose_down))
+            .route("/compose/logs", post(compose_logs))
+            .route("/docker/restart", post(docker_restart))
+            .with_state(make_test_state());
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("Authorization", "Bearer test-token")
+            .header("Content-Type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(5), app.oneshot(req))
+            .await
+            .expect("handler must reject before any network call")
+            .unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    #[tokio::test]
+    async fn compose_handlers_reject_bad_inputs_with_400() {
+        let cases = [
+            ("/compose/up", r#"{"tag":"v1","file":"../x.yml"}"#),
+            ("/compose/up", r#"{"tag":"../x","file":"a.yml"}"#),
+            ("/compose/up", r#"{"tag":"v1","file":"a.yml","services":["-v"]}"#),
+            ("/compose/up", r#"{"tag":"v1","file":"a.yml","materialize_only":true,"services":["--volumes"]}"#),
+            ("/compose/down", r#"{"tag":"v1","file":"/etc/x"}"#),
+            ("/compose/down", r#"{"tag":"-v1","file":"a.yml"}"#),
+            ("/compose/down", r#"{"tag":"v1","file":"a.yml","services":["--project-name=x"]}"#),
+            ("/compose/logs", r#"{"file":"a/../../b"}"#),
+            ("/compose/logs", r#"{"file":"a.yml","services":["a b"]}"#),
+            ("/docker/restart", r#"{"container":"--time=0"}"#),
+        ];
+        for (path, body) in cases {
+            let (status, msg) = post_json(path, body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{} {} -> {}", path, body, msg);
+        }
     }
 
     #[test]
