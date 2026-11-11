@@ -58,7 +58,8 @@ setup() {
     fi
     # Records each invocation plus the whole-file overrides hash at call time.
     #  - `inspect` pops a line from inspect.seq (default "true false 0")
-    #  - `config --services` prints $T/services (default: both services)
+    #  - `config --services` prints $T/services (default: both services) and
+    #    fails when $T/config_fail exists
     #  - `up` copies the otel temp env file (content, mode, path) for the
     #    assertions, may replace the overrides file once (hook_overwrite), and
     #    fails when docker_fail exists or its args contain docker_fail_on
@@ -71,6 +72,7 @@ setup() {
                 echo "${first:-true false 0}"
                 return 0 ;;
             *" config --services"*)
+                [ ! -f "$T/config_fail" ] || return 1
                 if [ -f "$T/services" ]; then cat "$T/services"; else printf 'compose-manager\notelcol-management\n'; fi
                 return 0 ;;
         esac
@@ -448,6 +450,21 @@ case_otel_service_missing_is_rejected() {
     grep -q 'config --services' "$T/docker.log" || fail "config --services not consulted"
 }
 
+case_otel_config_failure_is_not_reported_as_missing_service() {
+    setup
+    : > "$T/config_fail"
+    write_overrides "MONITORING_INGEST_TOKEN='${INGEST}'"
+    apply_env_overrides > /dev/null 2>&1
+    eq "$(docker_calls)" 0 "no compose up"
+    grep -q 'config --services' "$T/docker.log" || fail "config --services not consulted"
+    local err; err="$(state env_overrides_error_otelcol_management)"
+    case "$err" in
+        *"could not read services from app-compose at ${APP_COMPOSE_FILE} (docker compose config failed); check the mounted file"*) ;;
+        *) fail "error must say compose config failed, got: $err" ;;
+    esac
+    case "$err" in *"does not define"*) fail "must not claim the service is missing: $err" ;; esac
+}
+
 case_preflight_failure_recreates_nothing() {
     setup
     rm -f "$APP_COMPOSE_FILE"
@@ -620,6 +637,26 @@ case_poll_wait_checks_overrides_in_steps() {
     eq "$(tr '\n' ' ' < "$T/sleep.log")" "5 5 " "fallback interval"
 }
 
+case_poll_wait_survives_non_numeric_poll_interval() {
+    setup
+    : > "$T/apply.calls"
+    apply_env_overrides() { echo x >> "$T/apply.calls"; }
+    local warn_out
+    warn_out="$(POLL_INTERVAL=abc wait_with_env_watch)"
+    # 300s in 5s steps: it sleeps in steps and terminates, not an immediate return.
+    eq "$(wc -l < "$T/sleep.log" | tr -d ' ')" 60 "sleep steps for the 300s fallback"
+    eq "$(sort -u "$T/sleep.log" | tr '\n' ' ')" "5 " "every step is the watch interval"
+    eq "$(wc -l < "$T/apply.calls" | tr -d ' ')" 60 "apply calls"
+    case "$warn_out" in *"LAUNCHER_POLL_INTERVAL"*) ;; *) fail "expected a warning, got: $warn_out" ;; esac
+    # Zero and negative-looking values fall back too.
+    : > "$T/sleep.log"; POLL_INTERVAL=0 wait_with_env_watch > /dev/null
+    eq "$(wc -l < "$T/sleep.log" | tr -d ' ')" 60 "zero falls back"
+    : > "$T/sleep.log"; POLL_INTERVAL=-3 wait_with_env_watch > /dev/null
+    eq "$(wc -l < "$T/sleep.log" | tr -d ' ')" 60 "negative falls back"
+    # The global is not mutated.
+    eq "$POLL_INTERVAL" 12 "POLL_INTERVAL untouched"
+}
+
 # ── Parity ─────────────────────────────────────────────────────────────
 
 case_allowlist_and_target_parity() {
@@ -665,6 +702,7 @@ otel_only_gets_its_own_lines
 changing_one_target_does_not_recreate_the_other
 otel_app_compose_missing_is_rejected_without_up
 otel_service_missing_is_rejected
+otel_config_failure_is_not_reported_as_missing_service
 preflight_failure_recreates_nothing
 probe_rejects_401_and_403
 probe_200_and_network_error_proceed_and_token_stays_out_of_argv
@@ -675,6 +713,7 @@ temp_env_removed_when_compose_up_fails
 bootstrap_forces_apply_of_existing_file
 bootstrap_without_file_marks_launcher_as_reporting
 poll_wait_checks_overrides_in_steps
+poll_wait_survives_non_numeric_poll_interval
 allowlist_and_target_parity
 "
 

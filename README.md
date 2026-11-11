@@ -398,7 +398,9 @@ curl https://<host-name>:8080/admin/env -H "Authorization: Bearer <current-token
 #   "otelcol-management":{"keys":[...],"sha256":"<hex>","applied_sha256":"<hex>","pending":false,"error":null}}}
 ```
 
-`202` means the file was written, not that it is live. Poll `GET /admin/env`: a target's change is
+`202` means the file was written, not that it is live. The response's `targets` lists the targets
+this request affects: those that carry keys after the merge, plus any whose last key was just unset
+(the launcher still recreates that container to revert it to the CVM env). Poll `GET /admin/env`: a target's change is
 applied when its `pending` is `false` and `applied_sha256` equals `sha256`. The per-target `sha256`
 is a hash over that target's lines only. The compose-manager container restarts during its apply,
 so a request made at that moment may fail to connect; retry.

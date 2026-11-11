@@ -355,7 +355,12 @@ otel_preflight() {
         return 1
     fi
     [ -f "$BASE_ENV_FILE" ] && base_args+=(--env-file "$BASE_ENV_FILE")
-    out="$(docker compose -p "$COMPOSE_PROJECT" -f "$APP_COMPOSE_FILE" ${base_args[@]+"${base_args[@]}"} config --services 2>/dev/null)" || out=""
+    # A failing `config` (unreadable or invalid file, docker error) is reported
+    # separately from a readable file that lacks the service.
+    if ! out="$(docker compose -p "$COMPOSE_PROJECT" -f "$APP_COMPOSE_FILE" ${base_args[@]+"${base_args[@]}"} config --services 2>/dev/null)"; then
+        APPLY_REASON="could not read services from app-compose at ${APP_COMPOSE_FILE} (docker compose config failed); check the mounted file"
+        return 1
+    fi
     case $'\n'"${out}"$'\n' in
         *$'\n'otelcol-management$'\n'*) ;;
         *)
@@ -663,10 +668,17 @@ bootstrap_env_overrides() {
 # file after each step. Keeps the image-poll cadence at POLL_INTERVAL.
 wait_with_env_watch() {
     local waited=0 step remaining
-    local watch="$ENV_WATCH_INTERVAL"
+    local watch="$ENV_WATCH_INTERVAL" poll="$POLL_INTERVAL"
     [[ "$watch" =~ ^[0-9]+$ ]] && [ "$watch" -ge 1 ] || watch=5
-    while [ "$waited" -lt "$POLL_INTERVAL" ]; do
-        remaining=$((POLL_INTERVAL - waited))
+    if ! [[ "$poll" =~ ^[0-9]+$ ]] || [ "$poll" -lt 1 ]; then
+        if [ -z "${POLL_INTERVAL_WARNED:-}" ]; then
+            log "WARNING: LAUNCHER_POLL_INTERVAL is not a positive integer; using 300s"
+            POLL_INTERVAL_WARNED=1
+        fi
+        poll=300
+    fi
+    while [ "$waited" -lt "$poll" ]; do
+        remaining=$((poll - waited))
         step="$watch"
         [ "$step" -gt "$remaining" ] && step="$remaining"
         sleep "$step"

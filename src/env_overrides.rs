@@ -38,6 +38,7 @@ use sha2::Digest;
 use std::{
     collections::BTreeMap,
     io,
+    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -280,26 +281,36 @@ async fn write_overrides(work_dir: &Path, map: &BTreeMap<String, String>) -> io:
 
     let content = render(map);
     let tmp = work_dir.join(format!(".{}.{:016x}.tmp", OVERRIDES_FILE_NAME, rand::random::<u64>()));
-    let res = async {
-        let mut f = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&tmp)
-            .await?;
-        f.write_all(content.as_bytes()).await?;
-        f.flush().await?;
-        f.sync_all().await?;
-        drop(f);
-        tokio::fs::rename(&tmp, &target).await
-    }
-    .await;
-    if let Err(e) = res {
-        let _ = tokio::fs::remove_file(&tmp).await;
-        return Err(e);
-    }
+    // Created synchronously (one open(2) on the local work volume) so the file
+    // exists before the guard below does and before the first `.await`: with
+    // tokio's async open the blocking create could land after a cancellation
+    // had already run the guard, leaking the file anyway.
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    // Removes the tmp file however this scope exits: an error, or the future
+    // being dropped at an `.await` (client disconnect, shutdown). After a
+    // successful rename the remove is an ENOENT no-op.
+    let _remove_tmp = RemoveTmpOnDrop(&tmp);
+    let mut f = tokio::fs::File::from_std(file);
+    f.write_all(content.as_bytes()).await?;
+    f.flush().await?;
+    f.sync_all().await?;
+    drop(f);
+    tokio::fs::rename(&tmp, &target).await?;
     fsync_dir(work_dir).await;
     Ok(Some(sha256_hex(content.as_bytes())))
+}
+
+/// Deletes a path on drop (best-effort). See [`write_overrides`].
+struct RemoveTmpOnDrop<'a>(&'a Path);
+
+impl Drop for RemoveTmpOnDrop<'_> {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(self.0);
+    }
 }
 
 /// Best-effort: persist a rename/unlink by fsyncing the parent directory.
@@ -360,6 +371,12 @@ async fn read_launcher_view(work_dir: &Path) -> LauncherView {
 // --- Handlers ---
 
 /// `PUT /admin/env`: merge `set`/`unset` into the overrides file.
+///
+/// The response's `targets` lists, in launcher apply order, every target that
+/// carries keys after the merge or carried keys before it (a target whose last
+/// key was just unset is still recreated to revert to the CVM env). It says
+/// what the launcher will look at, not what is applied: `GET /admin/env`
+/// `pending` is the authoritative signal.
 pub(crate) async fn put_env(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -392,6 +409,13 @@ pub(crate) async fn put_env(
         return err(StatusCode::BAD_REQUEST, msg).into_response();
     }
 
+    let actor = extract_actor(&headers);
+
+    // The audit record and the notification are produced while the lock is
+    // still held, so the action log lists overlapping PUTs in the same order
+    // as the file versions they describe. `record_action` only takes the
+    // actions lock and writes the small action log, and `spawn_action` just
+    // spawns a task, so nothing here blocks for long.
     let (keys, sha256, targets) = {
         let _guard = ENV_OVERRIDES_LOCK.lock().await;
         let (mut current, _) = match read_overrides(&state.work_dir).await {
@@ -402,6 +426,13 @@ pub(crate) async fn put_env(
                     .into_response();
             }
         };
+        // Targets that carry keys before the merge: one whose last key is
+        // unset here still gets recreated by the launcher (revert to the CVM
+        // env), so it counts as affected.
+        let had_keys: Vec<bool> = TARGETS
+            .iter()
+            .map(|t| !target_subset(&current, t).is_empty())
+            .collect();
         apply_update(&mut current, &req.set, &req.unset);
         let sha256 = match write_overrides(&state.work_dir, &current).await {
             Ok(s) => s,
@@ -413,43 +444,44 @@ pub(crate) async fn put_env(
         };
         let targets: Vec<&str> = TARGETS
             .iter()
-            .copied()
-            .filter(|t| !target_subset(&current, t).is_empty())
+            .zip(had_keys)
+            .filter(|(t, had)| *had || !target_subset(&current, t).is_empty())
+            .map(|(t, _)| *t)
             .collect();
+
+        info!(
+            set_keys = ?req.set.keys().collect::<Vec<_>>(),
+            unset_keys = ?req.unset,
+            sha256_prefix = sha256.as_deref().map(|s| &s[..12]).unwrap_or("none"),
+            actor = %actor,
+            "Env overrides updated"
+        );
+        for (name, changed) in [
+            ("env_override_set", req.set.keys().cloned().collect::<Vec<_>>()),
+            ("env_override_unset", req.unset.clone()),
+        ] {
+            if changed.is_empty() {
+                continue;
+            }
+            // Key names only, never values. The audit record carries the
+            // changed keys in `services` and the resulting file hash. No
+            // `container`: which container is recreated depends on the keys.
+            let action = DeploymentAction {
+                timestamp: Utc::now().to_rfc3339(),
+                action: name.into(),
+                file: Some(OVERRIDES_FILE_NAME.into()),
+                file_sha256: sha256.clone(),
+                services: changed,
+                container: None,
+                ..Default::default()
+            };
+            // Persist failures are logged inside record_action; the file is
+            // already written, so the request still succeeds.
+            let _ = record_action(&state, &action).await;
+            notify::spawn_action(&state, &action, &actor, Some(true));
+        }
         (current.keys().cloned().collect::<Vec<_>>(), sha256, targets)
     };
-
-    let actor = extract_actor(&headers);
-    info!(
-        set_keys = ?req.set.keys().collect::<Vec<_>>(),
-        unset_keys = ?req.unset,
-        sha256_prefix = sha256.as_deref().map(|s| &s[..12]).unwrap_or("none"),
-        actor = %actor,
-        "Env overrides updated"
-    );
-    for (name, changed) in [
-        ("env_override_set", req.set.keys().cloned().collect::<Vec<_>>()),
-        ("env_override_unset", req.unset.clone()),
-    ] {
-        if changed.is_empty() {
-            continue;
-        }
-        // Key names only, never values. The audit record carries the changed
-        // keys in `services` and the resulting file hash.
-        let action = DeploymentAction {
-            timestamp: Utc::now().to_rfc3339(),
-            action: name.into(),
-            file: Some(OVERRIDES_FILE_NAME.into()),
-            file_sha256: sha256.clone(),
-            services: changed,
-            container: Some("compose-manager".into()),
-            ..Default::default()
-        };
-        // Persist failures are logged inside record_action; the file is
-        // already written, so the request still succeeds.
-        let _ = record_action(&state, &action).await;
-        notify::spawn_action(&state, &action, &actor, Some(true));
-    }
 
     (
         StatusCode::ACCEPTED,
@@ -737,6 +769,44 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn tmp_files(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".env-overrides.") && n.ends_with(".tmp"))
+            .collect()
+    }
+
+    #[test]
+    fn remove_tmp_guard_removes_on_drop_and_tolerates_a_missing_file() {
+        let dir = temp_work_dir();
+        let tmp = dir.join(".env-overrides.0000000000000001.tmp");
+        std::fs::write(&tmp, "x").unwrap();
+        {
+            let _g = RemoveTmpOnDrop(&tmp);
+            assert!(tmp.exists());
+        }
+        assert!(!tmp.exists(), "guard must remove the tmp file");
+        // After a successful rename the path is gone; dropping must not panic.
+        drop(RemoveTmpOnDrop(&tmp));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn cancelled_write_leaves_no_temp_file() {
+        let dir = temp_work_dir();
+        // A zero timeout polls the write once and then drops it while it waits
+        // on file IO, which is what a cancelled request handler does.
+        let r = tokio::time::timeout(
+            std::time::Duration::ZERO,
+            write_overrides(&dir, &map(&[("BEARER_TOKEN", "tok")])),
+        )
+        .await;
+        assert!(r.is_err(), "write must still be pending after the first poll");
+        assert_eq!(tmp_files(&dir), Vec::<String>::new(), "temp file left behind");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn read_missing_or_empty_file_is_no_overrides() {
         let dir = temp_work_dir();
@@ -885,7 +955,9 @@ mod tests {
         let v = json(&resp);
         assert_eq!(v["keys"], serde_json::json!([]));
         assert!(v["sha256"].is_null());
-        assert_eq!(v["targets"], serde_json::json!([]));
+        // The last key is gone, but compose-manager is still recreated to
+        // revert to its CVM env, so it is reported.
+        assert_eq!(v["targets"], serde_json::json!([CM]));
         assert!(!overrides_path(&dir).exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -927,6 +999,7 @@ mod tests {
         assert_eq!(names, vec!["env_override_set", "env_override_unset"]);
         assert_eq!(actions[0].services, vec!["BEARER_TOKEN", "CM_MIN_TAG_AGE_HOURS"]);
         assert_eq!(actions[1].services, vec!["CM_MIN_TAG_AGE_HOURS"]);
+        assert!(actions.iter().all(|a| a.container.is_none()), "env audit records name no container");
         let on_disk = std::fs::read_to_string(dir.join("actions.json")).unwrap();
         assert!(!on_disk.contains(SECRET), "action log leaked a value");
         let _ = std::fs::remove_dir_all(&dir);
@@ -1053,8 +1126,12 @@ mod tests {
             std::fs::read_to_string(overrides_path(&dir)).unwrap(),
             format!("CM_MIN_TAG_AGE_HOURS='1'\nMONITORING_INGEST_TOKEN='{INGEST}'\n")
         );
-        // Drop the compose-manager key: only the otelcol target remains.
+        // Drop the compose-manager key: it is still affected (reverts to the
+        // CVM env) and the otelcol target keeps its key.
         let (_, resp) = call(&state, "PUT", Some(TOKEN), r#"{"unset":["CM_MIN_TAG_AGE_HOURS"]}"#).await;
+        assert_eq!(json(&resp)["targets"], serde_json::json!([CM, OTEL]));
+        // A request that touches neither leaves the compose-manager target out.
+        let (_, resp) = call(&state, "PUT", Some(TOKEN), r#"{"unset":["BEARER_TOKEN"]}"#).await;
         assert_eq!(json(&resp)["targets"], serde_json::json!([OTEL]));
         // Invalid ingest tokens are 400 and never echoed.
         for bad in ["short", "has space 0123456789", "quote'0123456789abcdef", "comma,0123456789abcdef"] {
@@ -1063,6 +1140,50 @@ mod tests {
             assert_eq!(s, StatusCode::BAD_REQUEST, "{bad}");
             assert!(!msg.contains(bad), "{msg}");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn put_unsetting_the_last_key_of_a_target_still_reports_it() {
+        let dir = temp_work_dir();
+        let state = test_state(&dir);
+        let body = serde_json::json!({"set": {"MONITORING_INGEST_TOKEN": INGEST}}).to_string();
+        let (s, resp) = call(&state, "PUT", Some(TOKEN), &body).await;
+        assert_eq!(s, StatusCode::ACCEPTED, "{resp}");
+        assert_eq!(json(&resp)["targets"], serde_json::json!([OTEL]));
+        // The file is now gone, but the launcher still recreates the
+        // collector to revert it, so the response must not say "nothing".
+        let (s, resp) = call(&state, "PUT", Some(TOKEN), r#"{"unset":["MONITORING_INGEST_TOKEN"]}"#).await;
+        assert_eq!(s, StatusCode::ACCEPTED, "{resp}");
+        let v = json(&resp);
+        assert_eq!(v["keys"], serde_json::json!([]));
+        assert!(v["sha256"].is_null());
+        assert_eq!(v["targets"], serde_json::json!([OTEL]));
+        assert!(!overrides_path(&dir).exists());
+        // Unsetting a key that was never there affects nothing.
+        let (_, resp) = call(&state, "PUT", Some(TOKEN), r#"{"unset":["MONITORING_INGEST_TOKEN"]}"#).await;
+        assert_eq!(json(&resp)["targets"], serde_json::json!([]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn audit_records_have_no_container_and_carry_file_hashes() {
+        let dir = temp_work_dir();
+        let state = test_state(&dir);
+        let set = serde_json::json!({"set": {"MONITORING_INGEST_TOKEN": INGEST}}).to_string();
+        let (_, resp) = call(&state, "PUT", Some(TOKEN), &set).await;
+        let sha_set = json(&resp)["sha256"].as_str().unwrap().to_string();
+        let (_, resp) = call(&state, "PUT", Some(TOKEN), r#"{"unset":["MONITORING_INGEST_TOKEN"]}"#).await;
+        assert!(json(&resp)["sha256"].is_null());
+        let actions = state.actions.read().await;
+        assert_eq!(actions.len(), 2);
+        assert_eq!(actions[0].action, "env_override_set");
+        assert_eq!(actions[0].services, vec!["MONITORING_INGEST_TOKEN"]);
+        assert_eq!(actions[0].file_sha256.as_deref(), Some(sha_set.as_str()));
+        assert_eq!(actions[0].container, None);
+        assert_eq!(actions[1].action, "env_override_unset");
+        assert_eq!(actions[1].file_sha256, None);
+        assert_eq!(actions[1].container, None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
