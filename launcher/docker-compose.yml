@@ -26,6 +26,7 @@ services:
       - WORK_DIR=/app/work
       - MIN_TAG_AGE_HOURS=${CM_MIN_TAG_AGE_HOURS:-2}
       - ENV_FILES=/app/.env
+      - COMPOSE_MANAGER_METRICS_ADDR=${COMPOSE_MANAGER_METRICS_ADDR:-}
     labels:
       com.datadoghq.ad.logs: '[{"source": "compose-manager", "service": "compose-manager"}]'
 

@@ -286,10 +286,18 @@ Checkout a specific git tag.
 | `BEARER_TOKEN` | Yes | - | Bearer token(s) for authenticating requests. Comma-separated to accept more than one at once (see [Authentication & token rotation](#authentication--token-rotation)) |
 | `WORK_DIR` | No | `/app/work` | Directory for downloaded compose files |
 | `MIN_TAG_AGE_HOURS` | No | `48` | Minimum tag age in hours before checkout is allowed |
+| `COMPOSE_MANAGER_METRICS_ADDR` | No | - | Listen address for the optional inventory metrics endpoint |
 | `TLS_MODE` | No | `container` | Where the TLS certificate comes from: `container`, `files` or `off` (see [TLS](#tls)) |
 | `TLS_CERT_SERVICE` | No | `dstack/certbot` | `container` mode: compose `<project>/<service>` whose container holds the certificate |
 | `TLS_CERT_DIR` | No | `/etc/letsencrypt/live/completions.near.ai` | `container` mode: directory with `fullchain.pem` and `privkey.pem` |
 | `TLS_CERT_FILE`, `TLS_KEY_FILE` | `files` mode | - | PEM certificate chain and private key |
+
+## Inventory metrics
+
+Set `COMPOSE_MANAGER_METRICS_ADDR` to enable a dedicated HTTP listener for
+`GET /metrics`. The Prometheus response includes the last successful revision
+per Compose project, current Docker container state and image identity, and
+availability for each source. Restrict the listener to trusted scrapers.
 
 ## TLS
 

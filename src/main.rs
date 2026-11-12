@@ -29,6 +29,7 @@ use tokio::{
 };
 use tracing::{error, info, warn};
 
+mod inventory;
 mod tls;
 
 // --- Vendored dstack client (lightweight, avoids pulling in alloy) ---
@@ -222,7 +223,7 @@ fn load_deployed_state(work_dir: &Path) -> DeployedState {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return DeployedState::default(),
         Err(e) => {
-            error!(error = %e, "Failed to read deployed.json, ignoring");
+            error!(error_kind = ?e.kind(), "Failed to read deployed.json, ignoring");
             return DeployedState::default();
         }
     };
@@ -1791,7 +1792,7 @@ impl Stream for NdjsonStream {
                                 *state.deployed_file.write().expect("deployed_file lock poisoned") = new_current.file.clone();
                                 *state.deployed_file_sha256.write().expect("deployed_file_sha256 lock poisoned") = new_current.file_sha256.clone();
                                 if let Err(e) = persist_deployed_state(&state.work_dir, &snapshot) {
-                                    error!(error = %e, "Failed to persist deployed.json");
+                                    error!(error_kind = ?e.kind(), "Failed to persist deployed.json");
                                 }
                             }
                         }
@@ -4198,7 +4199,7 @@ async fn main() -> Result<()> {
         }
     }
     if !restored.projects.is_empty() {
-        info!(projects = ?restored.projects.keys().collect::<Vec<_>>(), "Restored last-deployed per-project state");
+        info!(project_count = restored.projects.len(), "Restored last-deployed per-project state");
     }
     // Mirror the most-recently-written project's `current` into the legacy
     // top-level fields so /version's top-level tuple is byte-identical to the
@@ -4263,6 +4264,8 @@ async fn main() -> Result<()> {
         ..Default::default()
     })
     .await;
+
+    inventory::start(state.clone()).await;
 
     let app = Router::new()
         .route("/compose/up", post(compose_up))
