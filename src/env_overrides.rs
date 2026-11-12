@@ -47,7 +47,7 @@ use tracing::{info, warn};
 
 /// Environment variables that may be overridden. Keep identical to the
 /// launcher's `ALLOWED_OVERRIDE_KEYS` and the README table.
-pub(crate) const ALLOWED_KEYS: &[&str] = &["BEARER_TOKEN", "CM_MIN_TAG_AGE_HOURS", "MONITORING_INGEST_TOKEN"];
+pub(crate) const ALLOWED_KEYS: &[&str] = &["BEARER_TOKEN", "CM_MIN_TAG_AGE_HOURS", "MONITORING_INGEST_TOKEN", "SLACK_WEBHOOK_URL"];
 
 const TARGET_COMPOSE_MANAGER: &str = "compose-manager";
 const TARGET_OTELCOL: &str = "otelcol-management";
@@ -58,6 +58,7 @@ const KEY_TARGETS: &[(&str, &str)] = &[
     ("BEARER_TOKEN", TARGET_COMPOSE_MANAGER),
     ("CM_MIN_TAG_AGE_HOURS", TARGET_COMPOSE_MANAGER),
     ("MONITORING_INGEST_TOKEN", TARGET_OTELCOL),
+    ("SLACK_WEBHOOK_URL", TARGET_COMPOSE_MANAGER),
 ];
 
 const OVERRIDES_FILE_NAME: &str = "env-overrides";
@@ -154,6 +155,28 @@ fn validate_value(key: &str, value: &str) -> Result<(), String> {
                 return Err(format!(
                     "{key}: value must be 16..=512 characters from [A-Za-z0-9+/=_.~-]"
                 ));
+            }
+        }
+        "SLACK_WEBHOOK_URL" => {
+            let valid = value.starts_with("https://")
+                && !value.contains([' ', '\\'])
+                && url::Url::parse(value).is_ok_and(|url| {
+                    matches!(url.host_str(), Some("hooks.slack.com" | "hooks.slack-gov.com"))
+                        && url.username().is_empty()
+                        && url.password().is_none()
+                        && url.port().is_none()
+                        && url.query().is_none()
+                        && url.fragment().is_none()
+                        && url
+                            .path()
+                            .strip_prefix("/services/")
+                            .is_some_and(|path| !path.is_empty())
+                });
+            if !valid {
+                return Err(
+                    "SLACK_WEBHOOK_URL: expected an HTTPS Slack or GovSlack incoming webhook URL"
+                        .into(),
+                );
             }
         }
         _ => {}
@@ -421,7 +444,7 @@ pub(crate) async fn put_env(
         let (mut current, _) = match read_overrides(&state.work_dir).await {
             Ok(r) => r,
             Err(e) => {
-                warn!(error = %e, "Failed to read env overrides file");
+                warn!(error_kind = ?e.kind(), "Failed to read env overrides file");
                 return err(StatusCode::INTERNAL_SERVER_ERROR, "failed to read env overrides file")
                     .into_response();
             }
@@ -437,7 +460,7 @@ pub(crate) async fn put_env(
         let sha256 = match write_overrides(&state.work_dir, &current).await {
             Ok(s) => s,
             Err(e) => {
-                warn!(error = %e, "Failed to write env overrides file");
+                warn!(error_kind = ?e.kind(), "Failed to write env overrides file");
                 return err(StatusCode::INTERNAL_SERVER_ERROR, "failed to write env overrides file")
                     .into_response();
             }
@@ -453,7 +476,6 @@ pub(crate) async fn put_env(
             set_keys = ?req.set.keys().collect::<Vec<_>>(),
             unset_keys = ?req.unset,
             sha256_prefix = sha256.as_deref().map(|s| &s[..12]).unwrap_or("none"),
-            actor = %actor,
             "Env overrides updated"
         );
         for (name, changed) in [
@@ -507,7 +529,7 @@ pub(crate) async fn get_env(
     let (map, _) = match read_overrides(&state.work_dir).await {
         Ok(r) => r,
         Err(e) => {
-            warn!(error = %e, "Failed to read env overrides file");
+            warn!(error_kind = ?e.kind(), "Failed to read env overrides file");
             return err(StatusCode::INTERNAL_SERVER_ERROR, "failed to read env overrides file")
                 .into_response();
         }
@@ -960,6 +982,49 @@ mod tests {
         assert_eq!(v["targets"], serde_json::json!([CM]));
         assert!(!overrides_path(&dir).exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn slack_webhook_override_can_be_rotated_and_unset() {
+        let dir = temp_work_dir();
+        let state = test_state(&dir);
+        let key = "SLACK_WEBHOOK_URL";
+        for host in ["hooks.slack.com", "hooks.slack-gov.com"] {
+            let webhook = format!("https://{host}/services/{SECRET}");
+            let body = serde_json::json!({"set": {key: &webhook}}).to_string();
+            let (status, response) = call(&state, "PUT", Some(TOKEN), &body).await;
+            assert_eq!(status, StatusCode::ACCEPTED);
+            assert_eq!(json(&response)["targets"], serde_json::json!([CM]));
+            assert!(!response.contains(SECRET));
+            assert!(read_overrides(&dir).await.unwrap().0.get(key) == Some(&webhook));
+
+            let (status, response) = call(&state, "GET", Some(TOKEN), "").await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(json(&response)["targets"][CM]["keys"], serde_json::json!([key]));
+            assert!(!response.contains(SECRET));
+        }
+
+        let body = serde_json::json!({"unset": [key]}).to_string();
+        let (status, response) = call(&state, "PUT", Some(TOKEN), &body).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(json(&response)["targets"], serde_json::json!([CM]));
+        assert!(!overrides_path(&dir).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn slack_webhook_override_rejects_invalid_destinations() {
+        for (origin, path) in [
+            ("http://hooks.slack.com", "/services/"),
+            ("https://example.test", "/services/"),
+            ("https://hooks.slack.com.example.test", "/services/"),
+            ("https://hooks.slack.com:8080", "/services/"),
+            ("https://hooks.slack.com", "/other/"),
+        ] {
+            let webhook = format!("{origin}{path}{SECRET}");
+            let error = validate_value("SLACK_WEBHOOK_URL", &webhook).unwrap_err();
+            assert!(!error.contains(SECRET));
+        }
     }
 
     #[tokio::test]

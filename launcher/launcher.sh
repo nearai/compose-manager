@@ -57,9 +57,9 @@ OTEL_STABLE_SECONDS="${LAUNCHER_OTEL_STABLE_SECONDS:-15}"
 # launcher/docker-compose.yml. launcher/test/env_overrides_test.sh checks the
 # parity.
 OVERRIDE_TARGETS=(compose-manager otelcol-management)
-TARGET_COMPOSE_MANAGER_KEYS=(BEARER_TOKEN CM_MIN_TAG_AGE_HOURS)
+TARGET_COMPOSE_MANAGER_KEYS=(BEARER_TOKEN CM_MIN_TAG_AGE_HOURS SLACK_WEBHOOK_URL)
 TARGET_OTELCOL_MANAGEMENT_KEYS=(MONITORING_INGEST_TOKEN)
-ALLOWED_OVERRIDE_KEYS=(BEARER_TOKEN CM_MIN_TAG_AGE_HOURS MONITORING_INGEST_TOKEN)
+ALLOWED_OVERRIDE_KEYS=(BEARER_TOKEN CM_MIN_TAG_AGE_HOURS MONITORING_INGEST_TOKEN SLACK_WEBHOOK_URL)
 
 # Scratch state for the current apply (reason text never contains a value).
 APPLY_REASON=""
@@ -238,7 +238,7 @@ compose_up() {
             log_error "Env overrides file is invalid — starting without it"
         fi
     fi
-    docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" ${env_file_args[@]+"${env_file_args[@]}"} up "$@"
+    docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" ${env_file_args[@]+"${env_file_args[@]}"} up "$@" > /dev/null 2>&1
 }
 
 # ── Env overrides ─────────────────────────────────────────────────────
@@ -442,7 +442,7 @@ apply_otelcol_target() {
     [ -f "$BASE_ENV_FILE" ] && args+=(--env-file "$BASE_ENV_FILE")
     args+=(--env-file "$envtmp")
     APPLY_TOUCHED=1
-    docker compose -p "$COMPOSE_PROJECT" -f "$APP_COMPOSE_FILE" "${args[@]}" up -d --no-deps otelcol-management && rc=0 || rc=$?
+    docker compose -p "$COMPOSE_PROJECT" -f "$APP_COMPOSE_FILE" "${args[@]}" up -d --no-deps otelcol-management > /dev/null 2>&1 && rc=0 || rc=$?
     cleanup_otel_tmp
     if [ "$rc" -ne 0 ]; then
         APPLY_REASON="docker compose up failed for otelcol-management"

@@ -10,7 +10,7 @@ A minimalistic Rust HTTP service that manages Docker Compose deployments from a 
 - **Docker cleanup**: Prune unused volumes and images to save disk space
 - **Bearer token authentication**: Secure all endpoints with one or more shared secrets, supporting
   gradual rotation (see [Authentication & token rotation](#authentication--token-rotation))
-- **Runtime env overrides**: change `BEARER_TOKEN`, `CM_MIN_TAG_AGE_HOURS` and the telemetry
+- **Runtime env overrides**: change `BEARER_TOKEN`, `CM_MIN_TAG_AGE_HOURS`, `SLACK_WEBHOOK_URL`, and
   `MONITORING_INGEST_TOKEN` through the launcher without a CVM restart (see
   [Changing compose-manager env without a CVM restart](#changing-compose-manager-env-without-a-cvm-restart))
 
@@ -360,6 +360,7 @@ the container that consumes the changed variable. No CVM restart, no model resta
 | `BEARER_TOKEN` | `compose-manager` | Comma-separated token list, no whitespace, no empty entries (same format as the env var) |
 | `CM_MIN_TAG_AGE_HOURS` | `compose-manager` | Non-negative integer (maps to `MIN_TAG_AGE_HOURS` in the container) |
 | `MONITORING_INGEST_TOKEN` | `otelcol-management` | 16 to 512 characters from `A-Za-z0-9+/=_.~-` (no whitespace, quotes or commas) |
+| `SLACK_WEBHOOK_URL` | `compose-manager` | HTTPS incoming webhook URL from Slack or GovSlack |
 <!-- allowed-keys:end -->
 
 Every value is also 1 to 4096 bytes of printable ASCII without a single quote. Values are never
@@ -404,6 +405,11 @@ this request affects: those that carry keys after the merge, plus any whose last
 applied when its `pending` is `false` and `applied_sha256` equals `sha256`. The per-target `sha256`
 is a hash over that target's lines only. The compose-manager container restarts during its apply,
 so a request made at that moment may fail to connect; retry.
+
+To rotate the Slack webhook, set `SLACK_WEBHOOK_URL` through `PUT /admin/env` and wait for the
+`compose-manager` target to apply it. Unset the override to restore the base URL. If no base URL is
+configured, Slack notifications are disabled. The health check verifies that compose-manager is
+running. Confirm delivery with a notification after the change is applied.
 
 **Failure and rollback.** If a target fails (not healthy, not stable, preflight rejected), the
 launcher restores the **whole** overrides file from the last known good copy (or deletes it if there

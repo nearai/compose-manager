@@ -29,6 +29,7 @@ services:
     environment:
       - GITHUB_REPO=${CM_GITHUB_REPO:-https://github.com/nearai/cvm-compose-files}
       - BEARER_TOKEN=${BEARER_TOKEN}
+      - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL:-}
       - WORK_DIR=/app/work
       - MIN_TAG_AGE_HOURS=${CM_MIN_TAG_AGE_HOURS:-2}
       - ENV_FILES=/app/.env

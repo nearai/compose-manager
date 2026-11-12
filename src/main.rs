@@ -1162,7 +1162,7 @@ async fn record_action(state: &Arc<AppState>, action: &DeploymentAction) -> Resu
     let mut actions = state.actions.write().await;
     actions.push(action.clone());
     if let Err(e) = persist_actions_to_disk(&state.work_dir, &actions).await {
-        error!(error = %e, "Failed to persist action log to disk");
+        error!(error_kind = ?e.kind(), "Failed to persist action log to disk");
         return Err(());
     }
     Ok(())
@@ -1332,7 +1332,18 @@ mod notify {
         match http.post(webhook).json(&body).send().await {
             Ok(resp) if resp.status().is_success() => {}
             Ok(resp) => warn!(status = %resp.status(), "Slack notification returned non-success status"),
-            Err(e) => warn!(error = %e, "Failed to send Slack notification"),
+            Err(e) => {
+                let error_kind = if e.is_timeout() {
+                    "timeout"
+                } else if e.is_connect() {
+                    "connect"
+                } else if e.is_builder() {
+                    "build"
+                } else {
+                    "request"
+                };
+                warn!(error_kind, "Failed to send Slack notification");
+            }
         }
     }
 }
@@ -5808,6 +5819,37 @@ Build cache usage: 0B
         assert!(!sizes.contains_key("foo"));
     }
 
+    #[tokio::test]
+    async fn slack_notification_posts_to_configured_webhook() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let app = Router::new().route(
+            "/webhook",
+            post(move |Json(body): Json<serde_json::Value>| async move {
+                let _ = tx.send(body).await;
+                StatusCode::OK
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let webhook = format!("http://{}/webhook", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut state = make_test_state();
+        let state_config = Arc::get_mut(&mut state).unwrap();
+        state_config.slack_webhook_url = Some(webhook);
+        state_config.http = reqwest::Client::builder().no_proxy().build().unwrap();
+
+        let action = sample_action("docker_clean");
+        notify::spawn_action(&state, &action, "test", Some(true));
+        let body = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        server.abort();
+        let expected = notify::format_message(&action, &state.instance_label, "test", Some(true));
+        assert_eq!(body["text"], expected);
+    }
+
     /// Live end-to-end delivery against a real Slack incoming webhook. Ignored
     /// by default (needs network + a webhook); run with:
     ///   SLACK_TEST_WEBHOOK_URL=<url> cargo test slack_live_delivery -- --ignored --nocapture
@@ -5833,7 +5875,7 @@ Build cache usage: 0B
             .json(&serde_json::json!({ "text": text }))
             .send()
             .await
-            .expect("request to Slack failed");
+            .unwrap_or_else(|_| panic!("request to Slack failed"));
         assert!(resp.status().is_success(), "slack returned {}", resp.status());
     }
 
