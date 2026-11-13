@@ -10,6 +10,9 @@ A minimalistic Rust HTTP service that manages Docker Compose deployments from a 
 - **Docker cleanup**: Prune unused volumes and images to save disk space
 - **Bearer token authentication**: Secure all endpoints with one or more shared secrets, supporting
   gradual rotation (see [Authentication & token rotation](#authentication--token-rotation))
+- **Runtime env overrides**: change `BEARER_TOKEN`, `CM_MIN_TAG_AGE_HOURS`, `SLACK_WEBHOOK_URL`, and
+  `MONITORING_INGEST_TOKEN` through the launcher without a CVM restart (see
+  [Changing compose-manager env without a CVM restart](#changing-compose-manager-env-without-a-cvm-restart))
 
 ## API Endpoints
 
@@ -342,6 +345,143 @@ field is unaffected by this rotation mechanism and still takes exactly one token
 > built from this change. An older compose-manager/dashboard image has no comma-splitting logic and
 > would treat `"old,new"` as one literal token, rejecting every client until it is rolled back or
 > upgraded. Roll the new image out first, then start rotating tokens.
+
+## Changing compose-manager env without a CVM restart
+
+Container environments on the CVM are normally fixed when the CVM boots, so changing one used to
+need a CVM upgrade (hours of model downtime). With the launcher, a few variables can instead be
+changed at runtime: an authenticated API call writes an overrides file on the shared `work` volume,
+and the launcher (`launcher/launcher.sh`) notices it within about 5 seconds and recreates **only**
+the container that consumes the changed variable. No CVM restart, no model restart.
+
+**Allowed keys** (anything else is rejected with `400`). Each key belongs to one target container:
+
+<!-- allowed-keys:start -->
+| Key | Target | Value rules |
+|-----|--------|-------------|
+| `BEARER_TOKEN` | `compose-manager` | Comma-separated token list, no whitespace, no empty entries (same format as the env var) |
+| `CM_MIN_TAG_AGE_HOURS` | `compose-manager` | Non-negative integer (maps to `MIN_TAG_AGE_HOURS` in the container) |
+| `MONITORING_INGEST_TOKEN` | `otelcol-management` | 16 to 512 characters from `A-Za-z0-9+/=_.~-` (no whitespace, quotes or commas) |
+| `SLACK_WEBHOOK_URL` | `compose-manager` | HTTPS incoming webhook URL from Slack or GovSlack |
+<!-- allowed-keys:end -->
+
+Every value is also 1 to 4096 bytes of printable ASCII without a single quote. Values are never
+logged, never returned by the API, and never written to the action log; only key names and sha256
+hashes are.
+
+| Target | Compose file | Health check after the recreate |
+|--------|--------------|---------------------------------|
+| `compose-manager` | the launcher's bundled `docker-compose.yml` (base env, then `.env.launcher`, then the overrides last) | `GET /version` answers within `LAUNCHER_HEALTH_TIMEOUT` |
+| `otelcol-management` | the CVM app-compose, mounted at `LAUNCHER_APP_COMPOSE_FILE` (default `/dstack-app/docker-compose.yaml`); the base env plus a temporary `0600` env file holding only this target's lines | the container stays running and does not restart for `LAUNCHER_OTEL_STABLE_SECONDS` (default 15) |
+
+```bash
+# Set (keys merge into the existing overrides; "unset" removes keys)
+curl -X PUT https://<host-name>:8080/admin/env \
+  -H "Authorization: Bearer <current-token>" \
+  -H "Content-Type: application/json" \
+  -d '{"set": {"CM_MIN_TAG_AGE_HOURS": "0"}, "unset": []}'
+# 202 {"status":"accepted","keys":["CM_MIN_TAG_AGE_HOURS"],"sha256":"<hex>","targets":["compose-manager"]}
+
+# Rotate the telemetry ingest token (recreates only otelcol-management)
+curl -X PUT https://<host-name>:8080/admin/env \
+  -H "Authorization: Bearer <current-token>" \
+  -H "Content-Type: application/json" \
+  -d '{"set": {"MONITORING_INGEST_TOKEN": "<new-ingest-token>"}}'
+
+# Revert a key to the value from the CVM env
+curl -X PUT https://<host-name>:8080/admin/env \
+  -H "Authorization: Bearer <current-token>" \
+  -H "Content-Type: application/json" \
+  -d '{"unset": ["MONITORING_INGEST_TOKEN"]}'
+
+# Confirm it was applied
+curl https://<host-name>:8080/admin/env -H "Authorization: Bearer <current-token>"
+# {"status":"ok","launcher_reported":true,"targets":{
+#   "compose-manager":{"keys":[...],"sha256":"<hex>","applied_sha256":"<hex>","pending":false,"error":null},
+#   "otelcol-management":{"keys":[...],"sha256":"<hex>","applied_sha256":"<hex>","pending":false,"error":null}}}
+```
+
+`202` means the file was written, not that it is live. The response's `targets` lists the targets
+this request affects: those that carry keys after the merge, plus any whose last key was just unset
+(the launcher still recreates that container to revert it to the CVM env). Poll `GET /admin/env`: a target's change is
+applied when its `pending` is `false` and `applied_sha256` equals `sha256`. The per-target `sha256`
+is a hash over that target's lines only. The compose-manager container restarts during its apply,
+so a request made at that moment may fail to connect; retry.
+
+To rotate the Slack webhook, set `SLACK_WEBHOOK_URL` through `PUT /admin/env` and wait for the
+`compose-manager` target to apply it. Unset the override to restore the base URL. If no base URL is
+configured, Slack notifications are disabled. The health check verifies that compose-manager is
+running. Confirm delivery with a notification after the change is applied.
+
+**Failure and rollback.** If a target fails (not healthy, not stable, preflight rejected), the
+launcher restores the **whole** overrides file from the last known good copy (or deletes it if there
+is none), re-applies every container it had already recreated, and reports the reason in that
+target's `error`. Because the rollback covers the whole file, send changes for one target per
+request if they must succeed or fail independently. Preflight checks for every target run before
+any container is recreated.
+
+**Telemetry token caveats.** The collector keeps running when the ingest token is wrong (it only
+logs 401s), so the stability check proves the container is up, not that the token is valid. Set
+`LAUNCHER_TELEMETRY_PROBE_URL` to an ingest endpoint: before recreating, the launcher POSTs `{}` with
+the new token (sent via a header file, never on a command line or in logs) and rejects the change on
+HTTP 401 or 403. Any other result, including a network error, proceeds with a warning, so the probe
+is a typo guard and not a connectivity gate.
+
+`GET /admin/env` never returns values. Both endpoints require the bearer token and are audited as
+`env_override_set` / `env_override_unset` entries (key names only). The overrides file is not
+covered by the dstack app-compose attestation. The telemetry token is write-only ingest, and
+`BEARER_TOKEN` changes require the current token.
+
+### Rotating `BEARER_TOKEN` (two steps)
+
+A request that sets `BEARER_TOKEN` must keep the token it was authenticated with in the new list,
+otherwise it is rejected with `400` (it would lock you out). Rotation is therefore two calls:
+
+```bash
+# 1. Add the new token next to the current one, authenticated with the current token.
+curl -X PUT https://<host-name>:8080/admin/env -H "Authorization: Bearer <current-token>" \
+  -H "Content-Type: application/json" \
+  -d '{"set": {"BEARER_TOKEN": "<current-token>,<new-token>"}}'
+# wait until the compose-manager target shows pending=false, then move clients to <new-token>
+
+# 2. Drop the old token, authenticated with the NEW token.
+curl -X PUT https://<host-name>:8080/admin/env -H "Authorization: Bearer <new-token>" \
+  -H "Content-Type: application/json" \
+  -d '{"set": {"BEARER_TOKEN": "<new-token>"}}'
+```
+
+Unsetting `BEARER_TOKEN` is allowed and reverts to the CVM-env value. Do it only if the token you
+are authenticating with is also valid there, or you lose access until you can use a CVM-env token.
+
+### Rollout requirements and limits
+
+- **Launcher image:** the launcher image is pinned in the CVM app-compose, so a host only gains this
+  after a normal compose-manager CVM upgrade that bumps the launcher digest. Until then
+  `GET /admin/env` reports `launcher_reported: false` and nothing is applied.
+- **Telemetry target:** `otelcol-management` is not in the launcher's bundled compose; it lives in
+  the CVM app-compose that dstack writes at `/dstack/docker-compose.yaml` (compose project
+  `dstack`). The CVM template (cvm-ansible-playbooks, a separate change) must bind-mount that file
+  read-only into the launcher at `/dstack-app/docker-compose.yaml` and set
+  `LAUNCHER_TELEMETRY_PROBE_URL`; both reach a host with the same one-time compose-manager CVM
+  upgrade. Until the mount exists the `otelcol-management` target reports an error ("app-compose is
+  not mounted") and nothing is changed. The launcher recreates the container with
+  `docker compose -p dstack -f <app-compose> --env-file <decrypted env> --env-file <temp file>
+  up -d --no-deps otelcol-management`.
+- **Reboot:** after a CVM reboot dstack recreates both containers from the app-compose without the
+  overrides; the launcher re-applies the file once at startup (a no-op when nothing differs).
+  Overrides also survive image updates and rollbacks of compose-manager, because the file is passed
+  on every recreate.
+- **Only substituted variables are overridable:** for the compose-manager target, exactly the
+  variables substituted in `launcher/docker-compose.yml` (other than the image and repo plumbing).
+  Adding a key means editing, together: that compose file or the app-compose consumer, the target
+  arrays and `ALLOWED_OVERRIDE_KEYS` in `launcher/launcher.sh`, `ALLOWED_KEYS` and `KEY_TARGETS` in
+  `src/env_overrides.rs`, the table above, and the tests; the parity tests fail if they drift.
+- **Launcher tunables:** `LAUNCHER_ENV_OVERRIDES_FILE` (default `/app/work/env-overrides`),
+  `LAUNCHER_ENV_WATCH_INTERVAL` (seconds between file checks, default `5`),
+  `LAUNCHER_APP_COMPOSE_FILE`, `LAUNCHER_TELEMETRY_PROBE_URL`, `LAUNCHER_OTEL_STABLE_SECONDS`.
+  Per-target state keys in `launcher-state.json` (suffix `_compose_manager` or
+  `_otelcol_management`): `env_overrides_applied_sha256_*`, `env_overrides_applied_at_*`,
+  `env_overrides_error_*`, `env_overrides_rejected_sha256_*`.
 
 ## Usage
 

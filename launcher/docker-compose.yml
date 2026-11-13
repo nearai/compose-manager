@@ -20,9 +20,16 @@ services:
       - /var/run/dstack.sock:/var/run/dstack.sock
       - /dstack/.host-shared/.decrypted-env:/app/.env:ro
       - work:/app/work
+    # The dollar-brace substitutions below define which variables can be
+    # changed at runtime (launcher env overrides, PUT /admin/env). Except for
+    # the image/repo plumbing (COMPOSE_MANAGER_IMAGE, CM_GITHUB_REPO) they MUST
+    # stay in sync with ALLOWED_OVERRIDE_KEYS in launcher/launcher.sh and
+    # ALLOWED_KEYS in src/env_overrides.rs; launcher/test/env_overrides_test.sh
+    # and a Rust unit test check the parity.
     environment:
       - GITHUB_REPO=${CM_GITHUB_REPO:-https://github.com/nearai/cvm-compose-files}
       - BEARER_TOKEN=${BEARER_TOKEN}
+      - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL:-}
       - WORK_DIR=/app/work
       - MIN_TAG_AGE_HOURS=${CM_MIN_TAG_AGE_HOURS:-2}
       - ENV_FILES=/app/.env
