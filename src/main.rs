@@ -5326,6 +5326,34 @@ mod tests {
     }
 
     #[test]
+    fn prune_keeps_anchor_per_deployed_project() {
+        let mut down = up("2026-11-04T00:00:00+00:00", "a.yaml", "c1");
+        down.action = "compose_down".into();
+        let mut v = vec![
+            up("2026-10-24T00:00:00+00:00", "c.yaml", "cc"),
+            up("2026-11-03T00:00:00+00:00", "a.yaml", "c1"),
+            down,
+            act("2026-11-04T00:00:00+00:00", "docker_restart"),
+            up("2026-10-20T00:00:00+00:00", "b.yaml", "b0"),
+            up("2026-11-12T00:00:00+00:00", "b.yaml", "b1"),
+        ];
+        let deployed = [rec(Some("a.yaml"), "c1"), rec(Some("b.yaml"), "b1")];
+        assert_eq!(prune_actions(&mut v, fixed_now(), &deployed), 3);
+        let kept: Vec<_> = v
+            .iter()
+            .map(|a| (a.action.as_str(), a.file.as_deref(), a.commit.as_deref()))
+            .collect();
+        assert_eq!(
+            kept,
+            vec![
+                ("compose_up", Some("a.yaml"), Some("c1")),
+                ("compose_down", Some("a.yaml"), Some("c1")),
+                ("compose_up", Some("b.yaml"), Some("b1")),
+            ]
+        );
+    }
+
+    #[test]
     fn prune_keeps_later_same_file_up_and_down_after_anchor() {
         let mut down = up("2026-11-04T00:00:00+00:00", "a.yaml", "c1");
         down.action = "compose_down".into();
