@@ -1152,14 +1152,110 @@ fn extract_actor(headers: &HeaderMap) -> String {
         .unwrap_or_else(|| "automation".to_string())
 }
 
+/// Days of deployment history kept in the action log.
+const ACTION_LOG_RETENTION_DAYS: i64 = 7;
+
+/// Drop actions that are no longer needed; returns how many were removed.
+/// Kept: entries inside the retention window (or with unparseable timestamps),
+/// the last `compose_manager_started` entry so the running image stays
+/// attested, and, for each deployed record with a file, the `compose_up` that
+/// deployed it plus later `compose_up`/`compose_down` entries for that file
+/// (they can change what is running). Order of kept entries is preserved.
+fn prune_actions(
+    actions: &mut Vec<DeploymentAction>,
+    now: DateTime<Utc>,
+    deployed: &[DeployedRecord],
+) -> usize {
+    let cutoff = now - chrono::Duration::days(ACTION_LOG_RETENTION_DAYS);
+    let last_started = actions
+        .iter()
+        .rposition(|a| a.action == "compose_manager_started");
+
+    // (file, anchor index) for each deployed record that has an anchor.
+    let mut anchors: Vec<(&str, usize)> = Vec::new();
+    for d in deployed {
+        let Some(f) = d.file.as_deref() else { continue };
+        let is_up = |a: &DeploymentAction| a.action == "compose_up" && a.file.as_deref() == Some(f);
+        let exact = actions.iter().rposition(|a| {
+            is_up(a)
+                && d.commit.as_ref().is_none_or(|c| a.commit.as_ref() == Some(c))
+                && d.file_sha256.as_ref().is_none_or(|h| a.file_sha256.as_ref() == Some(h))
+        });
+        if let Some(i) = exact.or_else(|| actions.iter().rposition(is_up)) {
+            anchors.push((f, i));
+        }
+    }
+
+    let before = actions.len();
+    let mut idx = 0usize;
+    actions.retain(|a| {
+        let i = idx;
+        idx += 1;
+        if Some(i) == last_started {
+            return true;
+        }
+        if match DateTime::parse_from_rfc3339(&a.timestamp) {
+            Ok(t) => t >= cutoff,
+            Err(_) => true,
+        } {
+            return true;
+        }
+        anchors.iter().any(|(f, anchor)| {
+            i == *anchor
+                || (i > *anchor
+                    && (a.action == "compose_up" || a.action == "compose_down")
+                    && a.file.as_deref() == Some(*f))
+        })
+    });
+    before - actions.len()
+}
+
+/// Current deployed record of every project (cloned, lock released).
+fn deployed_snapshot(state: &AppState) -> Vec<DeployedRecord> {
+    state
+        .deployed_projects
+        .read()
+        .expect("deployed_projects lock poisoned")
+        .values()
+        .map(|p| p.current.clone())
+        .collect()
+}
+
+/// The action list as served in the attestation report: a pruned copy of the
+/// stored log. Pure; takes no lock and never writes.
+fn report_actions(
+    actions: &[DeploymentAction],
+    now: DateTime<Utc>,
+    deployed: &[DeployedRecord],
+) -> Vec<DeploymentAction> {
+    let mut v = actions.to_vec();
+    prune_actions(&mut v, now, deployed);
+    v
+}
+
+/// Returns `(actions_hash_hex, report_data)`: report_data is 64 bytes,
+/// `sha256(canonicalize_actions(actions))` followed by the nonce.
+fn attestation_binding(actions: &[DeploymentAction], nonce: &[u8; 32]) -> (String, Vec<u8>) {
+    let actions_hash: [u8; 32] = sha2::Sha256::digest(canonicalize_actions(actions).as_bytes()).into();
+    let mut report_data = vec![0u8; 64];
+    report_data[..32].copy_from_slice(&actions_hash);
+    report_data[32..64].copy_from_slice(nonce);
+    (hex::encode(actions_hash), report_data)
+}
+
 /// Append a deployment action to the in-memory log and persist it to disk.
 /// Returns `Err(())` if the disk write failed (the error is already logged);
 /// callers map this to a 500. Slack notification is fired separately by the
 /// caller, since streaming ops (compose up/down) only learn their outcome when
 /// the NDJSON stream terminates.
 async fn record_action(state: &Arc<AppState>, action: &DeploymentAction) -> Result<(), ()> {
+    let deployed = deployed_snapshot(state);
     let mut actions = state.actions.write().await;
     actions.push(action.clone());
+    let removed = prune_actions(&mut actions, Utc::now(), &deployed);
+    if removed > 0 {
+        info!(removed, kept = actions.len(), "Pruned action log");
+    }
     if let Err(e) = persist_actions_to_disk(&state.work_dir, &actions).await {
         error!(error = %e, "Failed to persist action log to disk");
         return Err(());
@@ -2910,15 +3006,13 @@ async fn attestation_report(
     };
     let nonce_hex = hex::encode(nonce_bytes);
 
-    let actions = state.actions.read().await.clone();
+    let deployed = deployed_snapshot(&state);
+    let actions = {
+        let guard = state.actions.read().await;
+        report_actions(&guard, Utc::now(), &deployed)
+    };
 
-    let actions_json = canonicalize_actions(&actions);
-    let actions_hash: [u8; 32] = sha2::Sha256::digest(actions_json.as_bytes()).into();
-    let actions_hash_hex = hex::encode(actions_hash);
-
-    let mut report_data = vec![0u8; 64];
-    report_data[..32].copy_from_slice(&actions_hash);
-    report_data[32..64].copy_from_slice(&nonce_bytes);
+    let (actions_hash_hex, report_data) = attestation_binding(&actions, &nonce_bytes);
 
     let client = dstack::DstackClient::new();
     let quote_response = match client.get_quote(report_data).await {
@@ -5114,6 +5208,246 @@ mod tests {
         assert_eq!(loaded[0].action, "compose_up");
         assert_eq!(loaded[0].tag.as_deref(), Some("v1.0"));
         assert_eq!(loaded[0].services, vec!["nginx"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn act(ts: &str, action: &str) -> DeploymentAction {
+        DeploymentAction {
+            timestamp: ts.into(),
+            action: action.into(),
+            image: None,
+            tag: None,
+            commit: None,
+            file: None,
+            file_sha256: None,
+            services: vec![],
+            container: None,
+        }
+    }
+
+    fn fixed_now() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-11-13T12:00:00+00:00")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn prune_actions_drops_old_keeps_new_in_order() {
+        let mut v = vec![
+            act("2026-10-01T00:00:00+00:00", "old1"),
+            act("2026-11-12T00:00:00+00:00", "new1"),
+            act("2026-10-02T00:00:00+00:00", "old2"),
+            act("2026-11-13T00:00:00+00:00", "new2"),
+        ];
+        assert_eq!(prune_actions(&mut v, fixed_now(), &[]), 2);
+        let names: Vec<_> = v.iter().map(|a| a.action.as_str()).collect();
+        assert_eq!(names, vec!["new1", "new2"]);
+    }
+
+    #[test]
+    fn prune_actions_cutoff_boundary() {
+        let mut v = vec![
+            act("2026-11-06T11:59:59+00:00", "older"),
+            act("2026-11-06T12:00:00+00:00", "exact"),
+        ];
+        assert_eq!(prune_actions(&mut v, fixed_now(), &[]), 1);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].action, "exact");
+    }
+
+    #[test]
+    fn prune_actions_keeps_latest_started_only() {
+        let mut v = vec![
+            act("2026-08-01T00:00:00+00:00", "compose_manager_started"),
+            act("2026-09-01T00:00:00+00:00", "compose_manager_started"),
+            act("2026-09-02T00:00:00+00:00", "compose_up"),
+        ];
+        assert_eq!(prune_actions(&mut v, fixed_now(), &[]), 2);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].timestamp, "2026-09-01T00:00:00+00:00");
+        assert_eq!(v[0].action, "compose_manager_started");
+    }
+
+    #[test]
+    fn prune_actions_keeps_unparseable_timestamp() {
+        let mut v = vec![act("not-a-date", "compose_up"), act("2020-01-01T00:00:00+00:00", "x")];
+        assert_eq!(prune_actions(&mut v, fixed_now(), &[]), 1);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].timestamp, "not-a-date");
+    }
+
+    #[test]
+    fn prune_actions_noop_on_empty_and_recent() {
+        let mut empty: Vec<DeploymentAction> = vec![];
+        assert_eq!(prune_actions(&mut empty, fixed_now(), &[]), 0);
+        assert!(empty.is_empty());
+        let mut v = vec![
+            act("2026-11-12T00:00:00+00:00", "a"),
+            act("2026-11-13T00:00:00+00:00", "b"),
+        ];
+        assert_eq!(prune_actions(&mut v, fixed_now(), &[]), 0);
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].action, "a");
+        assert_eq!(v[1].action, "b");
+    }
+
+    fn up(ts: &str, file: &str, commit: &str) -> DeploymentAction {
+        DeploymentAction {
+            file: Some(file.into()),
+            commit: Some(commit.into()),
+            file_sha256: Some("s1".into()),
+            ..act(ts, "compose_up")
+        }
+    }
+
+    fn rec(file: Option<&str>, commit: &str) -> DeployedRecord {
+        DeployedRecord {
+            file: file.map(Into::into),
+            commit: Some(commit.into()),
+            file_sha256: Some("s1".into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn prune_keeps_last_deploy_older_than_window() {
+        let mut v = vec![
+            up("2026-10-14T00:00:00+00:00", "a.yaml", "c0"),
+            up("2026-11-03T00:00:00+00:00", "a.yaml", "c1"),
+            up("2026-10-24T00:00:00+00:00", "b.yaml", "cb"),
+            act("2026-11-03T00:00:00+00:00", "docker_restart"),
+            act("2026-11-13T00:00:00+00:00", "recent"),
+        ];
+        assert_eq!(prune_actions(&mut v, fixed_now(), &[rec(Some("a.yaml"), "c1")]), 3);
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].action, "compose_up");
+        assert_eq!(v[0].commit.as_deref(), Some("c1"));
+        assert_eq!(v[1].action, "recent");
+    }
+
+    #[test]
+    fn prune_keeps_anchor_per_deployed_project() {
+        let mut down = up("2026-11-04T00:00:00+00:00", "a.yaml", "c1");
+        down.action = "compose_down".into();
+        let mut v = vec![
+            up("2026-10-24T00:00:00+00:00", "c.yaml", "cc"),
+            up("2026-11-03T00:00:00+00:00", "a.yaml", "c1"),
+            down,
+            act("2026-11-04T00:00:00+00:00", "docker_restart"),
+            up("2026-10-20T00:00:00+00:00", "b.yaml", "b0"),
+            up("2026-11-12T00:00:00+00:00", "b.yaml", "b1"),
+        ];
+        let deployed = [rec(Some("a.yaml"), "c1"), rec(Some("b.yaml"), "b1")];
+        assert_eq!(prune_actions(&mut v, fixed_now(), &deployed), 3);
+        let kept: Vec<_> = v
+            .iter()
+            .map(|a| (a.action.as_str(), a.file.as_deref(), a.commit.as_deref()))
+            .collect();
+        assert_eq!(
+            kept,
+            vec![
+                ("compose_up", Some("a.yaml"), Some("c1")),
+                ("compose_down", Some("a.yaml"), Some("c1")),
+                ("compose_up", Some("b.yaml"), Some("b1")),
+            ]
+        );
+    }
+
+    #[test]
+    fn prune_keeps_later_same_file_up_and_down_after_anchor() {
+        let mut down = up("2026-11-04T00:00:00+00:00", "a.yaml", "c1");
+        down.action = "compose_down".into();
+        let mut v = vec![
+            up("2026-11-03T00:00:00+00:00", "a.yaml", "c1"),
+            down,
+            up("2026-11-05T00:00:00+00:00", "a.yaml", "c2"),
+            up("2026-11-05T00:00:00+00:00", "b.yaml", "cb"),
+            act("2026-11-05T00:00:00+00:00", "docker_restart"),
+        ];
+        assert_eq!(prune_actions(&mut v, fixed_now(), &[rec(Some("a.yaml"), "c1")]), 2);
+        let names: Vec<_> = v.iter().map(|a| (a.action.as_str(), a.commit.as_deref())).collect();
+        assert_eq!(
+            names,
+            vec![("compose_up", Some("c1")), ("compose_down", Some("c1")), ("compose_up", Some("c2"))]
+        );
+    }
+
+    #[test]
+    fn prune_falls_back_to_last_up_of_file_when_commit_unmatched() {
+        let mut v = vec![
+            up("2026-10-01T00:00:00+00:00", "a.yaml", "c0"),
+            up("2026-10-02T00:00:00+00:00", "a.yaml", "c1"),
+        ];
+        assert_eq!(prune_actions(&mut v, fixed_now(), &[rec(Some("a.yaml"), "zz")]), 1);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].commit.as_deref(), Some("c1"));
+    }
+
+    #[test]
+    fn prune_deployed_record_without_file_keeps_nothing_extra() {
+        let mut v = vec![up("2026-10-01T00:00:00+00:00", "a.yaml", "c1")];
+        assert_eq!(prune_actions(&mut v, fixed_now(), &[rec(None, "c1")]), 1);
+        assert!(v.is_empty());
+    }
+
+    #[test]
+    fn report_actions_filters_and_leaves_input_unchanged() {
+        let input = vec![
+            act("2020-01-01T00:00:00+00:00", "ancient"),
+            act("2026-11-13T00:00:00+00:00", "recent"),
+        ];
+        let out = report_actions(&input, fixed_now(), &[]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].action, "recent");
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0].action, "ancient");
+    }
+
+    #[test]
+    fn attestation_binding_covers_pruned_list() {
+        let all = vec![
+            act("2020-01-01T00:00:00+00:00", "ancient"),
+            act("2026-11-13T00:00:00+00:00", "recent"),
+        ];
+        let pruned = report_actions(&all, fixed_now(), &[]);
+        let nonce = [7u8; 32];
+        let (hash, rd) = attestation_binding(&pruned, &nonce);
+        let expected: [u8; 32] = sha2::Sha256::digest(canonicalize_actions(&pruned).as_bytes()).into();
+        assert_eq!(hash, hex::encode(expected));
+        assert_eq!(rd.len(), 64);
+        assert_eq!(&rd[..32], &expected[..]);
+        assert_eq!(&rd[32..], &nonce[..]);
+        let full: [u8; 32] = sha2::Sha256::digest(canonicalize_actions(&all).as_bytes()).into();
+        assert_ne!(hash, hex::encode(full));
+    }
+
+    #[tokio::test]
+    async fn record_action_prunes_and_persists() {
+        let dir = temp_work_dir();
+        let mut inner = Arc::try_unwrap(make_test_state()).ok().expect("unique Arc");
+        inner.work_dir = dir.clone();
+        let anchor = up("2026-10-01T00:00:00+00:00", "a.yaml", "c1");
+        inner.actions = RwLock::new(vec![
+            act("2020-01-01T00:00:00+00:00", "ancient"),
+            anchor,
+        ]);
+        inner.deployed_projects = StdRwLock::new(
+            [(
+                "p".to_string(),
+                ProjectDeployed { current: rec(Some("a.yaml"), "c1"), previous: None },
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let state = Arc::new(inner);
+        let new = act(&Utc::now().to_rfc3339(), "docker_restart");
+        record_action(&state, &new).await.unwrap();
+        let mem = state.actions.read().await.clone();
+        let names: Vec<_> = mem.iter().map(|a| a.action.as_str()).collect();
+        assert_eq!(names, vec!["compose_up", "docker_restart"]);
+        let loaded = load_actions_from_disk(&dir);
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].action, "compose_up");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
