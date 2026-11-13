@@ -1152,6 +1152,53 @@ fn extract_actor(headers: &HeaderMap) -> String {
         .unwrap_or_else(|| "automation".to_string())
 }
 
+/// Days of deployment history kept in the action log.
+const ACTION_LOG_RETENTION_DAYS: i64 = 7;
+
+/// Drop actions older than the retention window; returns how many were removed.
+/// The last `compose_manager_started` entry is always kept so the running
+/// image stays attested. Entries with unparseable timestamps are kept, and
+/// the order of kept entries is preserved.
+fn prune_actions(actions: &mut Vec<DeploymentAction>, now: DateTime<Utc>) -> usize {
+    let cutoff = now - chrono::Duration::days(ACTION_LOG_RETENTION_DAYS);
+    let last_started = actions
+        .iter()
+        .rposition(|a| a.action == "compose_manager_started");
+    let before = actions.len();
+    let mut idx = 0usize;
+    actions.retain(|a| {
+        let i = idx;
+        idx += 1;
+        if Some(i) == last_started {
+            return true;
+        }
+        match DateTime::parse_from_rfc3339(&a.timestamp) {
+            Ok(t) => t >= cutoff,
+            Err(_) => true,
+        }
+    });
+    let removed = before - actions.len();
+    if removed > 0 {
+        info!(removed, kept = actions.len(), "Pruned action log");
+    }
+    removed
+}
+
+/// Prune the action log, persist it if anything was removed (best-effort),
+/// and return a snapshot of the pruned list.
+async fn pruned_actions_snapshot(
+    actions: &tokio::sync::RwLock<Vec<DeploymentAction>>,
+    work_dir: &Path,
+) -> Vec<DeploymentAction> {
+    let mut guard = actions.write().await;
+    if prune_actions(&mut guard, Utc::now()) > 0 {
+        if let Err(e) = persist_actions_to_disk(work_dir, &guard).await {
+            error!(error = %e, "Failed to persist pruned action log");
+        }
+    }
+    guard.clone()
+}
+
 /// Append a deployment action to the in-memory log and persist it to disk.
 /// Returns `Err(())` if the disk write failed (the error is already logged);
 /// callers map this to a 500. Slack notification is fired separately by the
@@ -1160,6 +1207,7 @@ fn extract_actor(headers: &HeaderMap) -> String {
 async fn record_action(state: &Arc<AppState>, action: &DeploymentAction) -> Result<(), ()> {
     let mut actions = state.actions.write().await;
     actions.push(action.clone());
+    prune_actions(&mut actions, Utc::now());
     if let Err(e) = persist_actions_to_disk(&state.work_dir, &actions).await {
         error!(error = %e, "Failed to persist action log to disk");
         return Err(());
@@ -2910,7 +2958,7 @@ async fn attestation_report(
     };
     let nonce_hex = hex::encode(nonce_bytes);
 
-    let actions = state.actions.read().await.clone();
+    let actions = pruned_actions_snapshot(&state.actions, &state.work_dir).await;
 
     let actions_json = canonicalize_actions(&actions);
     let actions_hash: [u8; 32] = sha2::Sha256::digest(actions_json.as_bytes()).into();
@@ -5114,6 +5162,104 @@ mod tests {
         assert_eq!(loaded[0].action, "compose_up");
         assert_eq!(loaded[0].tag.as_deref(), Some("v1.0"));
         assert_eq!(loaded[0].services, vec!["nginx"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn act(ts: &str, action: &str) -> DeploymentAction {
+        DeploymentAction {
+            timestamp: ts.into(),
+            action: action.into(),
+            image: None,
+            tag: None,
+            commit: None,
+            file: None,
+            file_sha256: None,
+            services: vec![],
+            container: None,
+        }
+    }
+
+    fn fixed_now() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-11-13T12:00:00+00:00")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn prune_actions_drops_old_keeps_new_in_order() {
+        let mut v = vec![
+            act("2026-10-01T00:00:00+00:00", "old1"),
+            act("2026-11-12T00:00:00+00:00", "new1"),
+            act("2026-10-02T00:00:00+00:00", "old2"),
+            act("2026-11-13T00:00:00+00:00", "new2"),
+        ];
+        assert_eq!(prune_actions(&mut v, fixed_now()), 2);
+        let names: Vec<_> = v.iter().map(|a| a.action.as_str()).collect();
+        assert_eq!(names, vec!["new1", "new2"]);
+    }
+
+    #[test]
+    fn prune_actions_cutoff_boundary() {
+        let mut v = vec![
+            act("2026-11-06T11:59:59+00:00", "older"),
+            act("2026-11-06T12:00:00+00:00", "exact"),
+        ];
+        assert_eq!(prune_actions(&mut v, fixed_now()), 1);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].action, "exact");
+    }
+
+    #[test]
+    fn prune_actions_keeps_latest_started_only() {
+        let mut v = vec![
+            act("2026-08-01T00:00:00+00:00", "compose_manager_started"),
+            act("2026-09-01T00:00:00+00:00", "compose_manager_started"),
+            act("2026-09-02T00:00:00+00:00", "compose_up"),
+        ];
+        assert_eq!(prune_actions(&mut v, fixed_now()), 2);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].timestamp, "2026-09-01T00:00:00+00:00");
+        assert_eq!(v[0].action, "compose_manager_started");
+    }
+
+    #[test]
+    fn prune_actions_keeps_unparseable_timestamp() {
+        let mut v = vec![act("not-a-date", "compose_up"), act("2020-01-01T00:00:00+00:00", "x")];
+        assert_eq!(prune_actions(&mut v, fixed_now()), 1);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].timestamp, "not-a-date");
+    }
+
+    #[test]
+    fn prune_actions_noop_on_empty_and_recent() {
+        let mut empty: Vec<DeploymentAction> = vec![];
+        assert_eq!(prune_actions(&mut empty, fixed_now()), 0);
+        assert!(empty.is_empty());
+        let mut v = vec![
+            act("2026-11-12T00:00:00+00:00", "a"),
+            act("2026-11-13T00:00:00+00:00", "b"),
+        ];
+        assert_eq!(prune_actions(&mut v, fixed_now()), 0);
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].action, "a");
+        assert_eq!(v[1].action, "b");
+    }
+
+    #[tokio::test]
+    async fn pruned_actions_snapshot_prunes_and_persists() {
+        let dir = temp_work_dir();
+        let now = Utc::now();
+        let lock = tokio::sync::RwLock::new(vec![
+            act("2020-01-01T00:00:00+00:00", "ancient"),
+            act(&now.to_rfc3339(), "recent"),
+        ]);
+        let snap = pruned_actions_snapshot(&lock, &dir).await;
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].action, "recent");
+        assert_eq!(lock.read().await.len(), 1);
+        let loaded = load_actions_from_disk(&dir);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].action, "recent");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

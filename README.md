@@ -266,6 +266,8 @@ curl -X POST http://localhost:8080/dstack-agent/status \
 
 **Side effects on attestation:** `start`/`stop`/`restart` (whether successful or not) append a `dstack_agent_<action>` entry to the deployment action log included in `/v1/attestation/report`. `status` is read-only and is not logged.
 
+**Retention:** the action log keeps entries from the last 7 days, plus the most recent `compose_manager_started` entry so the running image stays attested.
+
 **Caveat — self-attestation gap:** restart briefly takes the dstack guest agent offline. While the agent is down, `/v1/attestation/report` will fail with `dstack unavailable: Connection refused` because compose-manager fetches its TDX quote from the same agent. The window is typically 1–10s; clients should retry attestation after a restart.
 
 ### POST /git/checkout
