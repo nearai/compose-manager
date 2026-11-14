@@ -11,7 +11,6 @@ services:
       GITHUB_REPO: "https://github.com/owner/repo"
       BEARER_TOKEN: "${BEARER_TOKEN}"
       WORK_DIR: "/app/work"
-      MIN_TAG_AGE_HOURS: "48"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - work:/app/work

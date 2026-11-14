@@ -7,6 +7,11 @@
 //! without a CVM redeploy use it (the launcher's `LAUNCHER_HEALTH_URL`, the
 //! attestation fetch from the model proxies). Remote clients should use TLS.
 //!
+//! Once a certificate is loaded, plain HTTP is limited to [`PLAIN_HTTP_PATHS`]
+//! (the unauthenticated `/version` and `/v1/attestation/report`); every other
+//! route is refused over plain HTTP, so credentials never cross the
+//! network in clear. Until a certificate loads, nothing changes.
+//!
 //! The certificate is the one the CVM already maintains for itself (certbot
 //! in the app compose writes it to the `certs` volume). By default it is
 //! copied out of the certbot container with `docker cp -L`, so no extra
@@ -29,6 +34,7 @@ use hyper_util::{
     server::conn::auto,
 };
 use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
+use sha2::Digest;
 use std::{
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
@@ -48,6 +54,27 @@ const RELOAD_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 /// Retry interval while no certificate could be loaded yet (on a fresh CVM,
 /// certbot issues the certificate shortly after compose-manager starts).
 const RETRY_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Routes still served over plain HTTP when TLS is available: the health
+/// check (`/version`) and the attestation fetch. Both are unauthenticated.
+/// Exact, case-sensitive match on the request path.
+pub const PLAIN_HTTP_PATHS: [&str; 2] = ["/version", "/v1/attestation/report"];
+
+fn plain_http_allowed(path: &str) -> bool {
+    PLAIN_HTTP_PATHS.contains(&path)
+}
+
+/// Response for a refused plain-HTTP request. Fixed body: nothing from the
+/// request is echoed.
+fn tls_required_response() -> axum::response::Response {
+    axum::response::Response::builder()
+        .status(hyper::StatusCode::FORBIDDEN)
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .body(axum::body::Body::from(
+            r#"{"status":"error","error":"TLS required: use https"}"#,
+        ))
+        .expect("static response")
+}
 
 const DEFAULT_CERT_SERVICE: &str = "dstack/certbot";
 const DEFAULT_CERT_DIR: &str = "/etc/letsencrypt/live/completions.near.ai";
@@ -130,25 +157,109 @@ pub fn server_config_from_pem(
     Ok(Arc::new(config))
 }
 
+/// SHA-256 of the DER `SubjectPublicKeyInfo` of the leaf (first) certificate
+/// in a PEM chain: the value a client can compare with the key it sees in the
+/// TLS handshake.
+pub fn leaf_spki_sha256(chain_pem: &[u8]) -> Result<[u8; 32]> {
+    let leaf = CertificateDer::pem_slice_iter(chain_pem)
+        .next()
+        .ok_or_else(|| anyhow!("certificate PEM contains no certificate"))?
+        .map_err(|_| anyhow!("invalid certificate PEM"))?;
+    let spki = spki_der(&leaf)?;
+    Ok(sha2::Sha256::digest(spki).into())
+}
+
+/// One DER element: `(tag, content, rest-after-element)`.
+fn der_element(buf: &[u8]) -> Result<(u8, &[u8], &[u8])> {
+    let (&tag, rest) = buf.split_first().ok_or_else(|| anyhow!("truncated DER"))?;
+    let (&len0, rest) = rest.split_first().ok_or_else(|| anyhow!("truncated DER"))?;
+    let (len, rest) = if len0 < 0x80 {
+        (len0 as usize, rest)
+    } else {
+        let n = (len0 & 0x7f) as usize;
+        if n == 0 || n > 4 || rest.len() < n {
+            bail!("unsupported DER length");
+        }
+        let len = rest[..n].iter().fold(0usize, |acc, b| (acc << 8) | *b as usize);
+        (len, &rest[n..])
+    };
+    if rest.len() < len {
+        bail!("truncated DER");
+    }
+    Ok((tag, &rest[..len], &rest[len..]))
+}
+
+/// The full DER encoding (tag, length, content) of the certificate's
+/// `subjectPublicKeyInfo`. Certificate and TBSCertificate are SEQUENCEs; the
+/// SPKI is the 7th TBS field, or the 6th when the optional `[0]` version is
+/// absent.
+fn spki_der(cert: &[u8]) -> Result<&[u8]> {
+    const SEQUENCE: u8 = 0x30;
+    const VERSION: u8 = 0xa0;
+    let (tag, cert_body, _) = der_element(cert)?;
+    if tag != SEQUENCE {
+        bail!("certificate is not a DER SEQUENCE");
+    }
+    let (tag, mut tbs, _) = der_element(cert_body)?;
+    if tag != SEQUENCE {
+        bail!("tbsCertificate is not a DER SEQUENCE");
+    }
+    // Fields before the SPKI: serial, signature, issuer, validity, subject.
+    let mut skip = 5;
+    if tbs.first() == Some(&VERSION) {
+        skip += 1;
+    }
+    for _ in 0..skip {
+        tbs = der_element(tbs)?.2;
+    }
+    let (tag, content, _) = der_element(tbs)?;
+    if tag != SEQUENCE {
+        bail!("subjectPublicKeyInfo is not a DER SEQUENCE");
+    }
+    // Header length = total length of this element minus its content.
+    let header = tbs.len() - der_element(tbs)?.2.len() - content.len();
+    Ok(&tbs[..header + content.len()])
+}
+
+/// A loaded certificate: the acceptor and the SPKI hash of its leaf, swapped
+/// together so they never disagree.
+#[derive(Clone)]
+struct Loaded {
+    acceptor: TlsAcceptor,
+    spki_sha256: [u8; 32],
+}
+
 /// The acceptor currently in use; `None` means plain HTTP only.
 #[derive(Clone, Default)]
-pub struct SharedAcceptor(Arc<RwLock<Option<TlsAcceptor>>>);
+pub struct SharedAcceptor(Arc<RwLock<Option<Loaded>>>);
 
 impl SharedAcceptor {
-    pub fn set(&self, config: Arc<rustls::ServerConfig>) {
-        *self.0.write().unwrap_or_else(|e| e.into_inner()) = Some(TlsAcceptor::from(config));
+    pub fn set(&self, config: Arc<rustls::ServerConfig>, spki_sha256: [u8; 32]) {
+        *self.0.write().unwrap_or_else(|e| e.into_inner()) = Some(Loaded {
+            acceptor: TlsAcceptor::from(config),
+            spki_sha256,
+        });
     }
 
-    pub fn get(&self) -> Option<TlsAcceptor> {
+    fn snapshot(&self) -> Option<Loaded> {
         self.0.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
+    pub fn get(&self) -> Option<TlsAcceptor> {
+        self.snapshot().map(|l| l.acceptor)
+    }
+
+    /// SHA-256 of the served leaf certificate's SPKI; `None` without TLS.
+    pub fn spki_sha256(&self) -> Option<[u8; 32]> {
+        self.snapshot().map(|l| l.spki_sha256)
+    }
+
     pub fn is_loaded(&self) -> bool {
-        self.get().is_some()
+        self.snapshot().is_some()
     }
 }
 
-async fn load(source: &Source) -> Result<Arc<rustls::ServerConfig>> {
+async fn load(source: &Source) -> Result<(Arc<rustls::ServerConfig>, [u8; 32])> {
     let (chain, key) = match source {
         Source::Off => bail!("TLS is off"),
         Source::Files { cert, key } => (
@@ -165,7 +276,8 @@ async fn load(source: &Source) -> Result<Arc<rustls::ServerConfig>> {
             dir,
         } => copy_from_container(project, service, dir).await?,
     };
-    server_config_from_pem(&chain, &key)
+    let config = server_config_from_pem(&chain, &key)?;
+    Ok((config, leaf_spki_sha256(&chain)?))
 }
 
 /// Copy `fullchain.pem` and `privkey.pem` out of the container of a compose
@@ -247,15 +359,23 @@ async fn run_docker(args: &[&str]) -> Result<String> {
 
 /// Load the certificate once, then keep re-reading it in the background.
 /// Never fails: without a certificate the port serves plain HTTP only.
+#[cfg(test)]
 pub async fn start(source: Source) -> SharedAcceptor {
     let shared = SharedAcceptor::default();
+    start_with(shared.clone(), source).await;
+    shared
+}
+
+/// Like [`start`], loading into an existing handle (so other components can
+/// hold it before the first load).
+pub async fn start_with(shared: SharedAcceptor, source: Source) {
     if source == Source::Off {
         info!("TLS disabled (TLS_MODE=off); serving plain HTTP only");
-        return shared;
+        return;
     }
     match load(&source).await {
-        Ok(config) => {
-            shared.set(config);
+        Ok((config, spki)) => {
+            shared.set(config, spki);
             info!("TLS certificate loaded");
         }
         Err(e) => {
@@ -272,9 +392,9 @@ pub async fn start(source: Source) -> SharedAcceptor {
             };
             tokio::time::sleep(wait).await;
             match load(&source).await {
-                Ok(config) => {
+                Ok((config, spki)) => {
                     let first = !bg.is_loaded();
-                    bg.set(config);
+                    bg.set(config, spki);
                     if first {
                         info!("TLS certificate loaded");
                     }
@@ -285,13 +405,12 @@ pub async fn start(source: Source) -> SharedAcceptor {
             }
         }
     });
-    shared
 }
 
 /// Serve `app` on `listener`, TLS or plain HTTP per connection.
 pub async fn serve(listener: TcpListener, app: Router, acceptor: SharedAcceptor) -> Result<()> {
     loop {
-        let (tcp, peer) = match listener.accept().await {
+        let (tcp, _) = match listener.accept().await {
             Ok(conn) => conn,
             Err(e) => {
                 // Transient (e.g. EMFILE): back off briefly instead of exiting.
@@ -303,8 +422,8 @@ pub async fn serve(listener: TcpListener, app: Router, acceptor: SharedAcceptor)
         let app = app.clone();
         let acceptor = acceptor.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle(tcp, peer, app, acceptor).await {
-                tracing::debug!(%peer, error = %e, "connection ended with error");
+            if let Err(e) = handle(tcp, app, acceptor).await {
+                tracing::debug!(error = %e, "connection ended with error");
             }
         });
     }
@@ -312,7 +431,6 @@ pub async fn serve(listener: TcpListener, app: Router, acceptor: SharedAcceptor)
 
 async fn handle(
     tcp: TcpStream,
-    peer: std::net::SocketAddr,
     app: Router,
     acceptor: SharedAcceptor,
 ) -> Result<()> {
@@ -321,16 +439,22 @@ async fn handle(
         Ok(Ok(n)) if n > 0 => {}
         _ => return Ok(()),
     }
-    let tls_acceptor = (first[0] == TLS_HANDSHAKE_RECORD)
-        .then(|| acceptor.get())
-        .flatten();
+    let current = acceptor.get();
+    // TLS is "configured" once a certificate is loaded; only then is plain
+    // HTTP restricted to the unauthenticated routes.
+    let tls_configured = current.is_some();
+    let tls_acceptor = (first[0] == TLS_HANDSHAKE_RECORD).then_some(current).flatten();
     let is_tls = tls_acceptor.is_some();
 
     let service = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
-        if !is_tls && req.headers().contains_key(hyper::header::AUTHORIZATION) {
-            warn!(%peer, path = %req.uri().path(), "plain-http authenticated request");
+        let app = app.clone();
+        async move {
+            if !is_tls && tls_configured && !plain_http_allowed(req.uri().path()) {
+                warn!("plain-http request refused: TLS required");
+                return Ok(tls_required_response());
+            }
+            app.oneshot(req).await
         }
-        app.clone().oneshot(req)
     });
     let builder = auto::Builder::new(TokioExecutor::new());
     match tls_acceptor {
@@ -386,8 +510,21 @@ mod tests {
         }
     }
 
+    /// `/ping` and `/docker/ps` stand in for authenticated routes; `/version` and
+    /// `/v1/attestation/report` are the plain-HTTP exceptions.
+    /// SPKI hash computed independently of the DER walker: rcgen serializes
+    /// the key pair's SubjectPublicKeyInfo directly.
+    fn spki_of(cert: &TestCert) -> [u8; 32] {
+        let kp = rcgen::KeyPair::from_pem(&cert.key_pem).unwrap();
+        sha2::Sha256::digest(kp.public_key_der()).into()
+    }
+
     fn app() -> Router {
-        Router::new().route("/ping", get(|| async { "pong" }))
+        Router::new()
+            .route("/ping", get(|| async { "pong" }))
+            .route("/docker/ps", get(|| async { "secret-rows" }))
+            .route("/version", get(|| async { "pong" }))
+            .route("/v1/attestation/report", get(|| async { "pong" }))
     }
 
     async fn start_server(acceptor: SharedAcceptor) -> std::net::SocketAddr {
@@ -397,19 +534,34 @@ mod tests {
         addr
     }
 
-    const REQUEST: &[u8] = b"GET /ping HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    fn request(path: &str) -> Vec<u8> {
+        format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer x\r\nConnection: close\r\n\r\n")
+            .into_bytes()
+    }
 
-    async fn plain_get(addr: std::net::SocketAddr) -> String {
+    async fn plain_get_path(addr: std::net::SocketAddr, path: &str) -> String {
         let mut s = TcpStream::connect(addr).await.unwrap();
-        s.write_all(REQUEST).await.unwrap();
+        s.write_all(&request(path)).await.unwrap();
         let mut out = String::new();
         s.read_to_string(&mut out).await.unwrap();
         out
     }
 
+    async fn plain_get(addr: std::net::SocketAddr) -> String {
+        plain_get_path(addr, "/ping").await
+    }
+
     async fn tls_get(
         addr: std::net::SocketAddr,
         trust: &CertificateDer<'static>,
+    ) -> Result<String> {
+        tls_get_path(addr, trust, "/ping").await
+    }
+
+    async fn tls_get_path(
+        addr: std::net::SocketAddr,
+        trust: &CertificateDer<'static>,
+        path: &str,
     ) -> Result<String> {
         let mut roots = rustls::RootCertStore::empty();
         roots.add(trust.clone())?;
@@ -424,18 +576,23 @@ mod tests {
         let mut s = connector
             .connect(ServerName::try_from("localhost")?, tcp)
             .await?;
-        s.write_all(REQUEST).await?;
+        s.write_all(&request(path)).await?;
         let mut out = Vec::new();
         // The server may close without close_notify; keep what was read.
         let _ = s.read_to_end(&mut out).await;
         Ok(String::from_utf8_lossy(&out).into_owned())
     }
 
-    fn loaded(cert: &TestCert) -> SharedAcceptor {
-        let acceptor = SharedAcceptor::default();
+    fn set_cert(acceptor: &SharedAcceptor, cert: &TestCert) {
         acceptor.set(
             server_config_from_pem(cert.chain_pem.as_bytes(), cert.key_pem.as_bytes()).unwrap(),
+            leaf_spki_sha256(cert.chain_pem.as_bytes()).unwrap(),
         );
+    }
+
+    fn loaded(cert: &TestCert) -> SharedAcceptor {
+        let acceptor = SharedAcceptor::default();
+        set_cert(&acceptor, cert);
         acceptor
     }
 
@@ -444,13 +601,51 @@ mod tests {
         let cert = test_cert();
         let addr = start_server(loaded(&cert)).await;
 
-        let plain = plain_get(addr).await;
+        let plain = plain_get_path(addr, "/version").await;
         assert!(plain.starts_with("HTTP/1.1 200"), "{plain}");
         assert!(plain.ends_with("pong"), "{plain}");
 
         let tls = tls_get(addr, &cert.der).await.unwrap();
         assert!(tls.starts_with("HTTP/1.1 200"), "{tls}");
         assert!(tls.ends_with("pong"), "{tls}");
+    }
+
+    #[tokio::test]
+    async fn plain_http_refuses_authenticated_routes_when_tls_is_loaded() {
+        let cert = test_cert();
+        let addr = start_server(loaded(&cert)).await;
+
+        for path in ["/ping", "/docker/ps", "/version/", "/Version", "/version?x=1/../docker/ps", "/%76ersion"] {
+            let resp = plain_get_path(addr, path).await;
+            if path == "/version?x=1/../docker/ps" {
+                // Query strings do not change the route: still /version.
+                assert!(resp.starts_with("HTTP/1.1 200"), "{path}: {resp}");
+                continue;
+            }
+            assert!(resp.starts_with("HTTP/1.1 403"), "{path}: {resp}");
+            // Fixed body: nothing from the request, and nothing from the app.
+            assert!(resp.contains("TLS required"), "{resp}");
+            assert!(!resp.contains(path.trim_start_matches('/')), "{path}: {resp}");
+            assert!(!resp.contains("secret-rows") && !resp.contains("Bearer"), "{resp}");
+        }
+        for path in PLAIN_HTTP_PATHS {
+            let resp = plain_get_path(addr, path).await;
+            assert!(resp.starts_with("HTTP/1.1 200"), "{path}: {resp}");
+        }
+        // The same routes work over TLS.
+        let tls = tls_get_path(addr, &cert.der, "/docker/ps").await.unwrap();
+        assert!(tls.starts_with("HTTP/1.1 200") && tls.ends_with("secret-rows"), "{tls}");
+    }
+
+    #[tokio::test]
+    async fn plain_http_is_unrestricted_until_a_certificate_loads() {
+        let cert = test_cert();
+        let acceptor = SharedAcceptor::default();
+        let addr = start_server(acceptor.clone()).await;
+        assert!(plain_get_path(addr, "/docker/ps").await.starts_with("HTTP/1.1 200"));
+
+        set_cert(&acceptor, &cert);
+        assert!(plain_get_path(addr, "/docker/ps").await.starts_with("HTTP/1.1 403"));
     }
 
     #[tokio::test]
@@ -469,8 +664,9 @@ mod tests {
         let addr = start_server(acceptor.clone()).await;
         assert!(tls_get(addr, &old.der).await.unwrap().ends_with("pong"));
 
-        acceptor
-            .set(server_config_from_pem(new.chain_pem.as_bytes(), new.key_pem.as_bytes()).unwrap());
+        set_cert(&acceptor, &new);
+        assert_eq!(acceptor.spki_sha256(), Some(spki_of(&new)));
+        assert_ne!(spki_of(&old), spki_of(&new));
         assert!(tls_get(addr, &new.der).await.unwrap().ends_with("pong"));
         assert!(tls_get(addr, &old.der).await.is_err());
     }
@@ -546,6 +742,48 @@ mod tests {
         .await;
         let _ = run_docker(&["rm", "-f", id]).await;
         assert!(acceptor.is_loaded());
+    }
+
+    #[test]
+    fn leaf_spki_matches_the_key_pair_spki() {
+        let cert = test_cert();
+        assert_eq!(leaf_spki_sha256(cert.chain_pem.as_bytes()).unwrap(), spki_of(&cert));
+        // Only the leaf (first certificate) counts, not later chain entries.
+        let other = test_cert();
+        let chain = format!("{}{}", cert.chain_pem, other.chain_pem);
+        assert_eq!(leaf_spki_sha256(chain.as_bytes()).unwrap(), spki_of(&cert));
+        assert_ne!(spki_of(&cert), spki_of(&other));
+    }
+
+    #[test]
+    fn leaf_spki_rejects_garbage() {
+        assert!(leaf_spki_sha256(b"").is_err());
+        assert!(leaf_spki_sha256(b"not pem").is_err());
+        assert!(spki_der(&[]).is_err());
+        assert!(spki_der(&[0x30, 0x03, 0x30, 0x01]).is_err());
+        assert!(spki_der(&[0x31, 0x00]).is_err());
+    }
+
+    #[tokio::test]
+    async fn loaded_certificate_publishes_its_spki_and_hot_swaps_it() {
+        let cert = test_cert();
+        let acceptor = SharedAcceptor::default();
+        assert_eq!(acceptor.spki_sha256(), None);
+        let dir = scratch_dir().unwrap();
+        let (c, k) = (dir.join("fullchain.pem"), dir.join("privkey.pem"));
+        std::fs::write(&c, &cert.chain_pem).unwrap();
+        std::fs::write(&k, &cert.key_pem).unwrap();
+        start_with(acceptor.clone(), Source::Files { cert: c.clone(), key: k.clone() }).await;
+        assert_eq!(acceptor.spki_sha256(), Some(spki_of(&cert)));
+
+        // A renewal with a new key replaces the hash together with the acceptor.
+        let renewed = test_cert();
+        let (config, spki) = load(&Source::Files { cert: c, key: k }).await.unwrap();
+        assert_eq!(spki, spki_of(&cert));
+        std::fs::remove_dir_all(&dir).unwrap();
+        acceptor.set(config, spki);
+        set_cert(&acceptor, &renewed);
+        assert_eq!(acceptor.spki_sha256(), Some(spki_of(&renewed)));
     }
 
     #[test]
