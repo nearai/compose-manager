@@ -501,6 +501,9 @@ struct AppState {
     /// resolved once at startup. Surfaced by /version and recorded as the
     /// `compose_manager_started` action so it is bound into attestation.
     running_image: Option<String>,
+    /// TLS certificate handle shared with the listener; its SPKI hash is bound
+    /// into the attestation report.
+    tls: tls::SharedAcceptor,
 }
 
 impl AppState {
@@ -1365,12 +1368,30 @@ fn report_actions(
     v
 }
 
-/// Returns `(actions_hash_hex, report_data)`: report_data is 64 bytes,
-/// `sha256(canonicalize_actions(actions))` followed by the nonce.
-fn attestation_binding(actions: &[DeploymentAction], nonce: &[u8; 32]) -> (String, Vec<u8>) {
+/// Returns `(actions_hash_hex, report_data)`. `actions_hash` is always
+/// `sha256(canonicalize_actions(actions))`. report_data is 64 bytes:
+/// - with a served certificate: `sha256(actions_hash || tls_spki_sha256)`
+///   followed by the nonce (32 raw bytes each), which ties the quote to the
+///   TLS key a client sees in the handshake;
+/// - without one (plain HTTP only): `actions_hash` followed by the nonce, as
+///   before.
+fn attestation_binding(
+    actions: &[DeploymentAction],
+    tls_spki_sha256: Option<&[u8; 32]>,
+    nonce: &[u8; 32],
+) -> (String, Vec<u8>) {
     let actions_hash: [u8; 32] = sha2::Sha256::digest(canonicalize_actions(actions).as_bytes()).into();
+    let first: [u8; 32] = match tls_spki_sha256 {
+        Some(spki) => {
+            let mut h = sha2::Sha256::new();
+            h.update(actions_hash);
+            h.update(spki);
+            h.finalize().into()
+        }
+        None => actions_hash,
+    };
     let mut report_data = vec![0u8; 64];
-    report_data[..32].copy_from_slice(&actions_hash);
+    report_data[..32].copy_from_slice(&first);
     report_data[32..64].copy_from_slice(nonce);
     (hex::encode(actions_hash), report_data)
 }
@@ -3101,6 +3122,11 @@ struct AttestationResponse {
     report_data: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     vm_config: String,
+    /// Hex SHA-256 of the served leaf certificate's SPKI, present only when a
+    /// certificate is loaded. When present, `report_data[..32]` is
+    /// `sha256(actions_hash || spki)`; when absent it is `actions_hash`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tls_spki_sha256: Option<String>,
 }
 
 fn parse_nonce(nonce: Option<&str>) -> Result<([u8; 32], &'static str), (StatusCode, String)> {
@@ -3144,7 +3170,8 @@ async fn attestation_report(
         report_actions(&guard, Utc::now(), &deployed)
     };
 
-    let (actions_hash_hex, report_data) = attestation_binding(&actions, &nonce_bytes);
+    let spki = state.tls.spki_sha256();
+    let (actions_hash_hex, report_data) = attestation_binding(&actions, spki.as_ref(), &nonce_bytes);
 
     let client = dstack::DstackClient::new();
     let quote_response = match client.get_quote(report_data).await {
@@ -3166,6 +3193,7 @@ async fn attestation_report(
         event_log: quote_response.event_log,
         report_data: quote_response.report_data,
         vm_config: quote_response.vm_config,
+        tls_spki_sha256: spki.map(hex::encode),
     };
 
     Response::builder()
@@ -4443,6 +4471,7 @@ async fn main() -> Result<()> {
         None => warn!("Could not resolve running compose-manager image digest (continuing)"),
     }
 
+    let tls_shared = tls::SharedAcceptor::default();
     let state = Arc::new(AppState {
         bearer_tokens,
         github_owner,
@@ -4468,6 +4497,7 @@ async fn main() -> Result<()> {
         compose_lock: Arc::new(Mutex::new(())),
         in_flight: Arc::new(StdMutex::new(None)),
         running_image: running_image.clone(),
+        tls: tls_shared.clone(),
     });
 
     // Record the running image into the action log so /v1/attestation/report
@@ -4508,7 +4538,8 @@ async fn main() -> Result<()> {
         error!(error = %format!("{e:#}"), "invalid TLS configuration; serving plain HTTP only");
         tls::Source::Off
     });
-    let acceptor = tls::start(tls_source.clone()).await;
+    tls::start_with(tls_shared.clone(), tls_source.clone()).await;
+    let acceptor = tls_shared;
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
     info!(
         tls_source = %tls::describe(&tls_source),
@@ -5642,7 +5673,7 @@ mod tests {
         ];
         let pruned = report_actions(&all, fixed_now(), &[]);
         let nonce = [7u8; 32];
-        let (hash, rd) = attestation_binding(&pruned, &nonce);
+        let (hash, rd) = attestation_binding(&pruned, None, &nonce);
         let expected: [u8; 32] = sha2::Sha256::digest(canonicalize_actions(&pruned).as_bytes()).into();
         assert_eq!(hash, hex::encode(expected));
         assert_eq!(rd.len(), 64);
@@ -5650,6 +5681,56 @@ mod tests {
         assert_eq!(&rd[32..], &nonce[..]);
         let full: [u8; 32] = sha2::Sha256::digest(canonicalize_actions(&all).as_bytes()).into();
         assert_ne!(hash, hex::encode(full));
+    }
+
+    #[test]
+    fn attestation_binding_folds_in_tls_spki() {
+        let actions = vec![act("2026-11-13T00:00:00+00:00", "recent")];
+        let nonce = [7u8; 32];
+        let spki_a = [0xaau8; 32];
+        let spki_b = [0xbbu8; 32];
+
+        let (hash, legacy) = attestation_binding(&actions, None, &nonce);
+        let actions_hash: [u8; 32] = sha2::Sha256::digest(canonicalize_actions(&actions).as_bytes()).into();
+        assert_eq!(hash, hex::encode(actions_hash));
+        assert_eq!(&legacy[..32], &actions_hash[..]);
+
+        let (hash_a, rd_a) = attestation_binding(&actions, Some(&spki_a), &nonce);
+        let mut pre = actions_hash.to_vec();
+        pre.extend_from_slice(&spki_a);
+        let expected: [u8; 32] = sha2::Sha256::digest(&pre).into();
+        assert_eq!(rd_a.len(), 64);
+        assert_eq!(&rd_a[..32], &expected[..]);
+        assert_eq!(&rd_a[32..], &nonce[..]);
+        // actions_hash is unchanged by the binding; report_data differs.
+        assert_eq!(hash_a, hash);
+        assert_ne!(rd_a[..32], legacy[..32]);
+        // A different served key gives a different report_data.
+        let (_, rd_b) = attestation_binding(&actions, Some(&spki_b), &nonce);
+        assert_ne!(rd_a[..32], rd_b[..32]);
+    }
+
+    #[test]
+    fn attestation_response_adds_spki_field_only_when_tls_is_loaded() {
+        let mk = |spki: Option<String>| AttestationResponse {
+            actions: vec![],
+            actions_hash: "h".into(),
+            nonce: "n".into(),
+            nonce_source: "client".into(),
+            quote: "q".into(),
+            event_log: "e".into(),
+            report_data: "r".into(),
+            vm_config: String::new(),
+            tls_spki_sha256: spki,
+        };
+        let without: serde_json::Value = serde_json::to_value(mk(None)).unwrap();
+        assert!(without.get("tls_spki_sha256").is_none());
+        let with: serde_json::Value = serde_json::to_value(mk(Some("ab".into()))).unwrap();
+        assert_eq!(with["tls_spki_sha256"], "ab");
+        // Existing fields are unchanged.
+        for k in ["actions", "actions_hash", "nonce", "nonce_source", "quote", "event_log", "report_data"] {
+            assert_eq!(without.get(k), with.get(k), "{k}");
+        }
     }
 
     #[tokio::test]
@@ -6074,6 +6155,7 @@ mod tests {
             compose_lock: Arc::new(Mutex::new(())),
             in_flight: Arc::new(StdMutex::new(None)),
             running_image: None,
+            tls: tls::SharedAcceptor::default(),
         })
     }
 

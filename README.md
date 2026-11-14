@@ -333,6 +333,25 @@ Refused requests are logged.
 curl https://<host-name>:8080/version
 ```
 
+### Attestation binding to the TLS key
+
+`GET /v1/attestation/report` binds the key the server presents in the TLS handshake to the TDX
+quote. While a certificate is loaded the report carries one extra field and a changed
+`report_data`; all existing fields keep their names and meaning.
+
+- `tls_spki_sha256`: hex SHA-256 of the DER `SubjectPublicKeyInfo` of the served leaf
+  (first) certificate. Absent when no certificate is loaded.
+- `report_data` (64 bytes): the first 32 bytes are `sha256(actions_hash || spki)`, the last 32
+  are the nonce. `actions_hash` and `spki` are the raw 32-byte digests (hex-decode the response
+  fields). Without a certificate the first 32 bytes are `actions_hash`, as before.
+
+A verifier checks the quote, recomputes the first 32 bytes of `report_data` from `actions_hash`
+and `tls_spki_sha256`, requires the nonce it sent, and compares `tls_spki_sha256` with the SHA-256
+of the SPKI of the certificate on its TLS connection
+(`openssl x509 -pubkey -noout | openssl pkey -pubin -outform der | openssl dgst -sha256`).
+The hash follows certificate renewals: it is swapped together with the certificate (re-read
+periodically), so a verifier must read it from the same report it checks, not pin it.
+
 ## Authentication & token rotation
 
 Every endpoint (except where noted) requires an `Authorization: Bearer <token>` header. The
