@@ -315,18 +315,19 @@ Error messages never echo the submitted value. There is no tag-age gate; the for
 
 Port 8080 serves both TLS and plain HTTP. Each connection is routed by its first byte: a TLS
 ClientHello starts with `0x16`, which no HTTP request does. Remote clients should use
-`https://`. Plain HTTP remains for local callers inside the CVM (the launcher health check, the
-attestation fetch from the model proxies).
+`https://`. While a certificate is loaded, plain HTTP serves only `/version` and
+`/v1/attestation/report` (health checks and attestation clients; both are unauthenticated). Every other route is
+refused over plain HTTP with `403` and a fixed body, before any handler or token check runs, so
+credentials never cross the network in clear. Until a certificate loads (or with `TLS_MODE=off`)
+plain HTTP is unrestricted, so a server without a working certificate stays reachable.
 
 The certificate is the one the CVM already maintains: by default compose-manager copies
 `fullchain.pem` and `privkey.pem` out of the certbot container with `docker cp -L`, so no extra
-volume mount is needed. It is re-read every 6 hours to pick up renewals (every minute until the
+volume mount is needed. It is re-read periodically to pick up renewals (every minute until the
 first successful load). If no certificate can be loaded, or `TLS_MODE` is invalid, the port serves
 plain HTTP only and logs an error; startup never fails because of TLS.
 
-Requests that carry an `Authorization` header over plain HTTP are logged as
-`plain-http authenticated request` with the peer address, so callers that still need to move to
-`https://` show up in the logs.
+Refused requests are logged.
 
 ```bash
 curl https://<host-name>:8080/version
@@ -467,6 +468,7 @@ docker run -d \
 | 200 | Success |
 | 400 | Bad request (invalid ref, ref not found, ref not on the default branch) |
 | 401 | Unauthorized (missing or invalid token) |
+| 403 | Plain HTTP on a route that requires TLS |
 | 500 | Internal server error (git/docker command failed) |
 
 ## License

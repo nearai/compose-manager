@@ -7,6 +7,11 @@
 //! without a CVM redeploy use it (the launcher's `LAUNCHER_HEALTH_URL`, the
 //! attestation fetch from the model proxies). Remote clients should use TLS.
 //!
+//! Once a certificate is loaded, plain HTTP is limited to [`PLAIN_HTTP_PATHS`]
+//! (the unauthenticated `/version` and `/v1/attestation/report`); every other
+//! route is refused over plain HTTP, so credentials never cross the
+//! network in clear. Until a certificate loads, nothing changes.
+//!
 //! The certificate is the one the CVM already maintains for itself (certbot
 //! in the app compose writes it to the `certs` volume). By default it is
 //! copied out of the certbot container with `docker cp -L`, so no extra
@@ -48,6 +53,27 @@ const RELOAD_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 /// Retry interval while no certificate could be loaded yet (on a fresh CVM,
 /// certbot issues the certificate shortly after compose-manager starts).
 const RETRY_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Routes still served over plain HTTP when TLS is available: the health
+/// check (`/version`) and the attestation fetch. Both are unauthenticated.
+/// Exact, case-sensitive match on the request path.
+pub const PLAIN_HTTP_PATHS: [&str; 2] = ["/version", "/v1/attestation/report"];
+
+fn plain_http_allowed(path: &str) -> bool {
+    PLAIN_HTTP_PATHS.contains(&path)
+}
+
+/// Response for a refused plain-HTTP request. Fixed body: nothing from the
+/// request is echoed.
+fn tls_required_response() -> axum::response::Response {
+    axum::response::Response::builder()
+        .status(hyper::StatusCode::FORBIDDEN)
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .body(axum::body::Body::from(
+            r#"{"status":"error","error":"TLS required: use https"}"#,
+        ))
+        .expect("static response")
+}
 
 const DEFAULT_CERT_SERVICE: &str = "dstack/certbot";
 const DEFAULT_CERT_DIR: &str = "/etc/letsencrypt/live/completions.near.ai";
@@ -291,7 +317,7 @@ pub async fn start(source: Source) -> SharedAcceptor {
 /// Serve `app` on `listener`, TLS or plain HTTP per connection.
 pub async fn serve(listener: TcpListener, app: Router, acceptor: SharedAcceptor) -> Result<()> {
     loop {
-        let (tcp, peer) = match listener.accept().await {
+        let (tcp, _) = match listener.accept().await {
             Ok(conn) => conn,
             Err(e) => {
                 // Transient (e.g. EMFILE): back off briefly instead of exiting.
@@ -303,8 +329,8 @@ pub async fn serve(listener: TcpListener, app: Router, acceptor: SharedAcceptor)
         let app = app.clone();
         let acceptor = acceptor.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle(tcp, peer, app, acceptor).await {
-                tracing::debug!(%peer, error = %e, "connection ended with error");
+            if let Err(e) = handle(tcp, app, acceptor).await {
+                tracing::debug!(error = %e, "connection ended with error");
             }
         });
     }
@@ -312,7 +338,6 @@ pub async fn serve(listener: TcpListener, app: Router, acceptor: SharedAcceptor)
 
 async fn handle(
     tcp: TcpStream,
-    peer: std::net::SocketAddr,
     app: Router,
     acceptor: SharedAcceptor,
 ) -> Result<()> {
@@ -321,16 +346,22 @@ async fn handle(
         Ok(Ok(n)) if n > 0 => {}
         _ => return Ok(()),
     }
-    let tls_acceptor = (first[0] == TLS_HANDSHAKE_RECORD)
-        .then(|| acceptor.get())
-        .flatten();
+    let current = acceptor.get();
+    // TLS is "configured" once a certificate is loaded; only then is plain
+    // HTTP restricted to the unauthenticated routes.
+    let tls_configured = current.is_some();
+    let tls_acceptor = (first[0] == TLS_HANDSHAKE_RECORD).then_some(current).flatten();
     let is_tls = tls_acceptor.is_some();
 
     let service = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
-        if !is_tls && req.headers().contains_key(hyper::header::AUTHORIZATION) {
-            warn!(%peer, path = %req.uri().path(), "plain-http authenticated request");
+        let app = app.clone();
+        async move {
+            if !is_tls && tls_configured && !plain_http_allowed(req.uri().path()) {
+                warn!("plain-http request refused: TLS required");
+                return Ok(tls_required_response());
+            }
+            app.oneshot(req).await
         }
-        app.clone().oneshot(req)
     });
     let builder = auto::Builder::new(TokioExecutor::new());
     match tls_acceptor {
@@ -386,8 +417,14 @@ mod tests {
         }
     }
 
+    /// `/ping` and `/docker/ps` stand in for authenticated routes; `/version` and
+    /// `/v1/attestation/report` are the plain-HTTP exceptions.
     fn app() -> Router {
-        Router::new().route("/ping", get(|| async { "pong" }))
+        Router::new()
+            .route("/ping", get(|| async { "pong" }))
+            .route("/docker/ps", get(|| async { "secret-rows" }))
+            .route("/version", get(|| async { "pong" }))
+            .route("/v1/attestation/report", get(|| async { "pong" }))
     }
 
     async fn start_server(acceptor: SharedAcceptor) -> std::net::SocketAddr {
@@ -397,19 +434,34 @@ mod tests {
         addr
     }
 
-    const REQUEST: &[u8] = b"GET /ping HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    fn request(path: &str) -> Vec<u8> {
+        format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer x\r\nConnection: close\r\n\r\n")
+            .into_bytes()
+    }
 
-    async fn plain_get(addr: std::net::SocketAddr) -> String {
+    async fn plain_get_path(addr: std::net::SocketAddr, path: &str) -> String {
         let mut s = TcpStream::connect(addr).await.unwrap();
-        s.write_all(REQUEST).await.unwrap();
+        s.write_all(&request(path)).await.unwrap();
         let mut out = String::new();
         s.read_to_string(&mut out).await.unwrap();
         out
     }
 
+    async fn plain_get(addr: std::net::SocketAddr) -> String {
+        plain_get_path(addr, "/ping").await
+    }
+
     async fn tls_get(
         addr: std::net::SocketAddr,
         trust: &CertificateDer<'static>,
+    ) -> Result<String> {
+        tls_get_path(addr, trust, "/ping").await
+    }
+
+    async fn tls_get_path(
+        addr: std::net::SocketAddr,
+        trust: &CertificateDer<'static>,
+        path: &str,
     ) -> Result<String> {
         let mut roots = rustls::RootCertStore::empty();
         roots.add(trust.clone())?;
@@ -424,7 +476,7 @@ mod tests {
         let mut s = connector
             .connect(ServerName::try_from("localhost")?, tcp)
             .await?;
-        s.write_all(REQUEST).await?;
+        s.write_all(&request(path)).await?;
         let mut out = Vec::new();
         // The server may close without close_notify; keep what was read.
         let _ = s.read_to_end(&mut out).await;
@@ -444,13 +496,51 @@ mod tests {
         let cert = test_cert();
         let addr = start_server(loaded(&cert)).await;
 
-        let plain = plain_get(addr).await;
+        let plain = plain_get_path(addr, "/version").await;
         assert!(plain.starts_with("HTTP/1.1 200"), "{plain}");
         assert!(plain.ends_with("pong"), "{plain}");
 
         let tls = tls_get(addr, &cert.der).await.unwrap();
         assert!(tls.starts_with("HTTP/1.1 200"), "{tls}");
         assert!(tls.ends_with("pong"), "{tls}");
+    }
+
+    #[tokio::test]
+    async fn plain_http_refuses_authenticated_routes_when_tls_is_loaded() {
+        let cert = test_cert();
+        let addr = start_server(loaded(&cert)).await;
+
+        for path in ["/ping", "/docker/ps", "/version/", "/Version", "/version?x=1/../docker/ps", "/%76ersion"] {
+            let resp = plain_get_path(addr, path).await;
+            if path == "/version?x=1/../docker/ps" {
+                // Query strings do not change the route: still /version.
+                assert!(resp.starts_with("HTTP/1.1 200"), "{path}: {resp}");
+                continue;
+            }
+            assert!(resp.starts_with("HTTP/1.1 403"), "{path}: {resp}");
+            // Fixed body: nothing from the request, and nothing from the app.
+            assert!(resp.contains("TLS required"), "{resp}");
+            assert!(!resp.contains(path.trim_start_matches('/')), "{path}: {resp}");
+            assert!(!resp.contains("secret-rows") && !resp.contains("Bearer"), "{resp}");
+        }
+        for path in PLAIN_HTTP_PATHS {
+            let resp = plain_get_path(addr, path).await;
+            assert!(resp.starts_with("HTTP/1.1 200"), "{path}: {resp}");
+        }
+        // The same routes work over TLS.
+        let tls = tls_get_path(addr, &cert.der, "/docker/ps").await.unwrap();
+        assert!(tls.starts_with("HTTP/1.1 200") && tls.ends_with("secret-rows"), "{tls}");
+    }
+
+    #[tokio::test]
+    async fn plain_http_is_unrestricted_until_a_certificate_loads() {
+        let cert = test_cert();
+        let acceptor = SharedAcceptor::default();
+        let addr = start_server(acceptor.clone()).await;
+        assert!(plain_get_path(addr, "/docker/ps").await.starts_with("HTTP/1.1 200"));
+
+        acceptor.set(server_config_from_pem(cert.chain_pem.as_bytes(), cert.key_pem.as_bytes()).unwrap());
+        assert!(plain_get_path(addr, "/docker/ps").await.starts_with("HTTP/1.1 403"));
     }
 
     #[tokio::test]
