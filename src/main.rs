@@ -467,7 +467,6 @@ struct AppState {
     bearer_tokens: Vec<String>,
     github_owner: String,
     github_repo_name: String,
-    min_tag_age_hours: i64,
     work_dir: PathBuf,
     env_files: Vec<String>,
     /// Slack incoming-webhook URL for ops notifications. `None` disables
@@ -797,80 +796,205 @@ fn write_temp_env_file(work_dir: &Path, env: &HashMap<String, String>) -> Result
 
 // --- GitHub ---
 
-#[derive(Deserialize)]
+/// A commit as listed by the GitHub commits API (only what the walk needs).
+#[derive(Deserialize, Clone, Debug)]
 struct GitHubCommit {
     sha: String,
-    commit: GitHubCommitDetail,
+    #[serde(default)]
+    parents: Vec<GitHubParent>,
+}
+
+#[derive(Deserialize, Clone, Debug)]
+struct GitHubParent {
+    sha: String,
 }
 
 #[derive(Deserialize)]
-struct GitHubCommitDetail {
-    committer: GitHubCommitter,
-}
-
-#[derive(Deserialize)]
-struct GitHubCommitter {
-    date: DateTime<Utc>,
+struct GitHubRepo {
+    default_branch: String,
 }
 
 struct TagInfo {
-    commit_date: DateTime<Utc>,
     commit_sha: String,
 }
 
-async fn get_tag_info(state: &AppState, tag: &str) -> Result<TagInfo> {
-    let mut url = url::Url::parse("https://api.github.com/repos/").expect("static url");
-    {
-        let mut seg = url.path_segments_mut().map_err(|_| anyhow!("cannot-be-a-base url"))?;
-        seg.pop_if_empty().push(&state.github_owner).push(&state.github_repo_name).push("commits");
-        for c in tag.split('/') {
-            seg.push(c);
+/// Why a ref was not accepted. Messages never echo request data.
+#[derive(Debug, PartialEq)]
+enum RefError {
+    /// GitHub does not know the ref.
+    NotFound,
+    /// The commit is not on the first-parent history of the default branch.
+    NotOnDefaultBranch,
+    /// The first-parent walk hit its page bound before finding the commit.
+    TooDeep,
+    /// GitHub could not be queried or answered unexpectedly. Fails closed.
+    Upstream,
+}
+
+impl RefError {
+    fn into_response_parts(self) -> (StatusCode, String) {
+        match self {
+            RefError::NotFound => (StatusCode::BAD_REQUEST, "ref not found".into()),
+            RefError::NotOnDefaultBranch => (
+                StatusCode::BAD_REQUEST,
+                "ref is not on the default branch of the compose repository".into(),
+            ),
+            RefError::TooDeep => (
+                StatusCode::BAD_REQUEST,
+                "ref is too old to verify against the default branch".into(),
+            ),
+            RefError::Upstream => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not verify ref against GitHub".into(),
+            ),
         }
     }
+}
 
+/// Page size and page bound of the first-parent walk.
+const ANCESTRY_PAGE_SIZE: usize = 100;
+const ANCESTRY_MAX_PAGES: usize = 10;
+
+fn github_api_url(state: &AppState, segments: &[&str]) -> Result<url::Url, RefError> {
+    let mut url = url::Url::parse("https://api.github.com/repos/").expect("static url");
+    {
+        let mut seg = url.path_segments_mut().map_err(|_| RefError::Upstream)?;
+        seg.pop_if_empty().push(&state.github_owner).push(&state.github_repo_name);
+        for s in segments {
+            seg.push(s);
+        }
+    }
+    Ok(url)
+}
+
+/// GET against the GitHub API through the same client and headers as the file
+/// fetch; any transport or HTTP failure other than 404/422 is `Upstream`.
+async fn github_get<T: serde::de::DeserializeOwned>(
+    state: &AppState,
+    url: url::Url,
+) -> Result<T, RefError> {
     let resp = state.http.get(url)
         .header("User-Agent", "compose-manager")
         .send().await
-        .context("Failed to query GitHub API")?;
-
-    if !resp.status().is_success() {
-        return Err(anyhow!("tag not found: {}", tag));
+        .map_err(|_| RefError::Upstream)?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
+        return Err(RefError::NotFound);
     }
-
-    let commit: GitHubCommit = resp.json().await
-        .context("Failed to parse GitHub response")?;
-
-    Ok(TagInfo {
-        commit_date: commit.commit.committer.date,
-        commit_sha: commit.sha,
-    })
+    if !status.is_success() {
+        return Err(RefError::Upstream);
+    }
+    resp.json().await.map_err(|_| RefError::Upstream)
 }
 
-async fn validate_tag(state: &AppState, tag: &str) -> Result<TagInfo, (StatusCode, String)> {
-    let tag_info = get_tag_info(state, tag).await.map_err(|e| {
-        let code = if e.to_string().contains("not found") {
-            StatusCode::BAD_REQUEST
-        } else {
-            StatusCode::INTERNAL_SERVER_ERROR
-        };
-        (code, e.to_string())
-    })?;
-
-    let min_age = Utc::now() - chrono::Duration::hours(state.min_tag_age_hours);
-    if tag_info.commit_date > min_age {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!("tag too recent: {} is less than {} hours old", tag_info.commit_date, state.min_tag_age_hours),
-        ));
+/// Resolves the (already syntactically validated) ref to a commit SHA.
+async fn get_tag_info(state: &AppState, tag: &str) -> Result<TagInfo, RefError> {
+    let url = github_api_url(state, &["commits", tag])?;
+    let commit: GitHubCommit = github_get(state, url).await?;
+    ensure_commit_sha(&commit.sha).map_err(|_| RefError::Upstream)?;
+    // A 40-hex ref must resolve to exactly itself (not to a tag or branch
+    // that merely has that name).
+    if is_commit_sha(tag) && commit.sha != tag {
+        return Err(RefError::NotFound);
     }
+    Ok(TagInfo { commit_sha: commit.sha })
+}
 
+async fn fetch_default_branch(state: &AppState) -> Result<String, RefError> {
+    let repo: GitHubRepo = github_get(state, github_api_url(state, &[])?).await?;
+    if repo.default_branch.is_empty() {
+        return Err(RefError::Upstream);
+    }
+    Ok(repo.default_branch)
+}
+
+async fn fetch_branch_commits(
+    state: &AppState,
+    branch: &str,
+    page: usize,
+) -> Result<Vec<GitHubCommit>, RefError> {
+    let mut url = github_api_url(state, &["commits"])?;
+    url.query_pairs_mut()
+        .append_pair("sha", branch)
+        .append_pair("per_page", &ANCESTRY_PAGE_SIZE.to_string())
+        .append_pair("page", &page.to_string());
+    github_get(state, url).await
+}
+
+/// True if `target` is on the first-parent chain starting at the head of the
+/// listing that `fetch_page` returns (1-based pages, newest first, as the
+/// GitHub commits API does). The listing contains every reachable commit, so
+/// the chain is rebuilt from each commit's first parent; pages are fetched
+/// only until the chain reaches `target` or the root. Bounded by `max_pages`;
+/// any inconsistency or fetch error fails closed.
+async fn first_parent_contains<F, Fut>(
+    target: &str,
+    page_size: usize,
+    max_pages: usize,
+    mut fetch_page: F,
+) -> Result<bool, RefError>
+where
+    F: FnMut(usize) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<GitHubCommit>, RefError>>,
+{
+    use std::collections::HashMap;
+    let mut first_parent: HashMap<String, Option<String>> = HashMap::new();
+    let mut cursor: Option<String> = None;
+    for page in 1..=max_pages {
+        let commits = fetch_page(page).await?;
+        if page == 1 {
+            cursor = Some(commits.first().ok_or(RefError::Upstream)?.sha.clone());
+        }
+        let exhausted = commits.len() < page_size;
+        for c in commits {
+            first_parent.insert(c.sha, c.parents.into_iter().next().map(|p| p.sha));
+        }
+        let mut cur = cursor.take().ok_or(RefError::Upstream)?;
+        loop {
+            if cur == target {
+                return Ok(true);
+            }
+            match first_parent.get(&cur) {
+                Some(Some(parent)) => cur = parent.clone(),
+                Some(None) => return Ok(false),
+                None => break,
+            }
+        }
+        // The next commit on the chain is not listed yet. With no more pages,
+        // the listing is inconsistent: refuse.
+        if exhausted {
+            return Err(RefError::Upstream);
+        }
+        cursor = Some(cur);
+    }
+    Err(RefError::TooDeep)
+}
+
+/// Resolves `tag` and requires its commit to be a first-parent ancestor of the
+/// compose repository's default branch. Applies to every use of a ref,
+/// including dry-run plans.
+async fn validate_tag(state: &AppState, tag: &str) -> Result<TagInfo, (StatusCode, String)> {
+    resolve_policy_ref(state, tag).await.map_err(RefError::into_response_parts)
+}
+
+async fn resolve_policy_ref(state: &AppState, tag: &str) -> Result<TagInfo, RefError> {
+    let tag_info = get_tag_info(state, tag).await?;
+    let branch = fetch_default_branch(state).await?;
+    let on_branch = first_parent_contains(
+        &tag_info.commit_sha,
+        ANCESTRY_PAGE_SIZE,
+        ANCESTRY_MAX_PAGES,
+        |page| fetch_branch_commits(state, &branch, page),
+    ).await?;
+    if !on_branch {
+        return Err(RefError::NotOnDefaultBranch);
+    }
     Ok(tag_info)
 }
 
 // --- Request path validation ---
 
 const MAX_COMPOSE_FILE_LEN: usize = 255;
-const MAX_TAG_LEN: usize = 200;
 
 /// Validates the `file` field: a relative path of `/`-separated components made
 /// only of `[A-Za-z0-9._-]`; no empty, `.` or `..` components.
@@ -888,20 +1012,28 @@ fn validate_compose_file(file: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Validates the `tag` field: `[A-Za-z0-9._/-]`, no leading `/` or `-`, no
-/// empty, `.` or `..` components, and no `..` anywhere.
+/// A release tag: `v` followed by three dot-separated numbers (`vX.Y.Z`).
+fn is_release_tag(tag: &str) -> bool {
+    let Some(rest) = tag.strip_prefix('v') else { return false };
+    let parts: Vec<&str> = rest.split('.').collect();
+    parts.len() == 3
+        && parts.iter().all(|p| (1..=9).contains(&p.len()) && p.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// A full commit SHA: exactly 40 lowercase hex characters.
+fn is_commit_sha(s: &str) -> bool {
+    s.len() == 40 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Validates the `tag` field: only `vX.Y.Z` or a 40-hex commit SHA. Branch
+/// names and other refs are refused. Whether the commit is on the default
+/// branch is checked separately, against GitHub (`validate_tag`).
 fn validate_tag_name(tag: &str) -> Result<(), String> {
-    let bad = || Err("invalid tag: must match [A-Za-z0-9._/-], no '..', no leading '/' or '-'".to_string());
-    if tag.is_empty() || tag.len() > MAX_TAG_LEN || tag.starts_with('/') || tag.starts_with('-') || tag.contains("..") {
-        return bad();
+    if is_release_tag(tag) || is_commit_sha(tag) {
+        Ok(())
+    } else {
+        Err("invalid ref: must be vX.Y.Z or a 40-character lowercase commit SHA".to_string())
     }
-    if !tag.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'/')) {
-        return bad();
-    }
-    if tag.split('/').any(|c| c.is_empty() || c == ".") {
-        return bad();
-    }
-    Ok(())
 }
 
 /// Docker Compose service / container name: `[a-zA-Z0-9][a-zA-Z0-9_.-]*`,
@@ -1046,7 +1178,7 @@ fn check_fetch_status(status: reqwest::StatusCode, path: &str, tag: &str) -> Res
 
 /// A resolved commit SHA must be exactly 40 lowercase hex characters.
 fn ensure_commit_sha(sha: &str) -> Result<()> {
-    if sha.len() == 40 && sha.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+    if is_commit_sha(sha) {
         Ok(())
     } else {
         Err(anyhow!("unexpected commit identifier from GitHub"))
@@ -4212,10 +4344,6 @@ async fn main() -> Result<()> {
     info!(token_count = bearer_tokens.len(), "Loaded bearer token(s)");
     let work_dir = std::env::var("WORK_DIR")
         .unwrap_or_else(|_| "/app/work".to_string());
-    let min_tag_age_hours: i64 = std::env::var("MIN_TAG_AGE_HOURS")
-        .unwrap_or_else(|_| "48".to_string())
-        .parse()
-        .context("MIN_TAG_AGE_HOURS must be a valid integer")?;
 
     let env_files: Vec<String> = std::env::var("ENV_FILES")
         .unwrap_or_default()
@@ -4319,7 +4447,6 @@ async fn main() -> Result<()> {
         bearer_tokens,
         github_owner,
         github_repo_name,
-        min_tag_age_hours,
         work_dir,
         env_files,
         slack_webhook_url,
@@ -4422,21 +4549,125 @@ mod tests {
     }
 
     #[test]
-    fn tag_validator_rules() {
-        for bad in ["", "..", "v1/../x", "/v1", "-v1", "a%2e%2e", "a b", "a?b", "a#b", "a\\b", "a//b", "v1/", "v1/./x", &"a".repeat(300)] {
+    fn tag_validator_accepts_only_release_tags_and_full_shas() {
+        for bad in [
+            "", "..", "v1/../x", "/v1", "-v1", "a%2e%2e", "a b", "a?b", "a#b", "a\\b", "a//b", "v1/", "v1/./x",
+            &"a".repeat(300),
+            // branches and other refs
+            "main", "master", "release/v1.2", "v1_rc-2", "refs/heads/main", "refs/tags/v1.2.3", "HEAD",
+            // near-misses of vX.Y.Z
+            "v1", "v1.2", "v1.2.3.4", "1.2.3", "V1.2.3", "v1.2.3-rc1", "v1.2.3+b", "v1..3", "v.1.2", "v1.2.", "v1.2.3 ",
+            "v1.2.3\n", "v-1.2.3", "v1.2.x", "v1234567890.0.0", "v\u{0661}.0.0",
+            // SHA near-misses
+            "0123456789abcdef0123456789abcdef0123456", "0123456789abcdef0123456789abcdef012345678",
+            "0123456789ABCDEF0123456789ABCDEF01234567", "0123456789abcdef0123456789abcdef0123456g",
+            "abcdef", "0123456789abcdef0123456789abcdef01234567/",
+        ] {
             assert!(validate_tag_name(bad).is_err(), "should reject {:?}", bad);
         }
-        for good in ["v0.0.13", "main", "release/v1.2", "0123456789abcdef0123456789abcdef01234567", "v1_rc-2"] {
+        for good in [
+            "v0.0.13", "v0.0.211", "v1.2.3", "v10.20.30", "v001.002.003",
+            "0123456789abcdef0123456789abcdef01234567", "ffffffffffffffffffffffffffffffffffffffff",
+        ] {
             assert!(validate_tag_name(good).is_ok(), "should accept {:?}", good);
         }
+    }
+
+    #[test]
+    fn ref_error_messages_do_not_echo_input() {
+        for e in [RefError::NotFound, RefError::NotOnDefaultBranch, RefError::TooDeep, RefError::Upstream] {
+            let (code, msg) = e.into_response_parts();
+            assert!(code.is_client_error() || code.is_server_error());
+            assert!(!msg.contains("v1.2.3"));
+        }
+        assert_eq!(RefError::Upstream.into_response_parts().0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(RefError::NotOnDefaultBranch.into_response_parts().0, StatusCode::BAD_REQUEST);
+    }
+
+    // --- first-parent ancestry walk (GitHub listing mocked) ---
+
+    fn commit(sha: &str, parents: &[&str]) -> GitHubCommit {
+        GitHubCommit {
+            sha: sha.into(),
+            parents: parents.iter().map(|p| GitHubParent { sha: (*p).into() }).collect(),
+        }
+    }
+
+    /// Serves `listing` in pages of `size` (1-based), counting fetches.
+    async fn walk(
+        listing: Vec<GitHubCommit>,
+        target: &str,
+        size: usize,
+        max_pages: usize,
+    ) -> (Result<bool, RefError>, usize) {
+        let calls = std::cell::Cell::new(0usize);
+        let r = first_parent_contains(target, size, max_pages, |page| {
+            calls.set(calls.get() + 1);
+            let chunk: Vec<GitHubCommit> = listing.iter().skip((page - 1) * size).take(size).cloned().collect();
+            async move { Ok(chunk) }
+        })
+        .await;
+        (r, calls.get())
+    }
+
+    /// c5 (head) -> c4 -> c3 -> c2 -> c1, linear.
+    fn linear() -> Vec<GitHubCommit> {
+        vec![commit("c5", &["c4"]), commit("c4", &["c3"]), commit("c3", &["c2"]), commit("c2", &["c1"]), commit("c1", &[])]
+    }
+
+    #[tokio::test]
+    async fn walk_accepts_head_and_ancestors_and_stops_early() {
+        assert_eq!(walk(linear(), "c5", 100, 10).await, (Ok(true), 1));
+        assert_eq!(walk(linear(), "c1", 100, 10).await, (Ok(true), 1));
+        // Head found on the first of three pages: no further fetches.
+        assert_eq!(walk(linear(), "c4", 2, 10).await, (Ok(true), 1));
+        // The oldest commit is named as c2's parent, so two pages suffice.
+        assert_eq!(walk(linear(), "c1", 2, 10).await, (Ok(true), 2));
+    }
+
+    #[tokio::test]
+    async fn walk_refuses_unrelated_commit_after_reaching_root() {
+        assert_eq!(walk(linear(), "other", 100, 10).await.0, Ok(false));
+        assert_eq!(walk(linear(), "other", 2, 10).await.0, Ok(false));
+    }
+
+    #[tokio::test]
+    async fn walk_follows_first_parent_only() {
+        // M merges side branch S (second parent) into main: M -> [B, S]; B -> A; S -> A.
+        let listing = vec![commit("m", &["b", "s"]), commit("s", &["a"]), commit("b", &["a"]), commit("a", &[])];
+        assert_eq!(walk(listing.clone(), "b", 100, 10).await.0, Ok(true));
+        assert_eq!(walk(listing.clone(), "a", 100, 10).await.0, Ok(true));
+        assert_eq!(walk(listing.clone(), "m", 100, 10).await.0, Ok(true));
+        // S is reachable from main, but not on the first-parent chain.
+        assert_eq!(walk(listing.clone(), "s", 100, 10).await.0, Ok(false));
+        assert_eq!(walk(listing, "s", 1, 10).await.0, Ok(false));
+    }
+
+    #[tokio::test]
+    async fn walk_is_bounded_and_fails_closed() {
+        // Target is deeper than the page bound: refuse, never loop.
+        let (r, calls) = walk(linear(), "c1", 1, 3).await;
+        assert_eq!(r, Err(RefError::TooDeep));
+        assert_eq!(calls, 3);
+        // Upstream error on any page.
+        let r = first_parent_contains("c1", 2, 10, |page| async move {
+            if page == 1 { Ok(vec![commit("c5", &["c4"]), commit("c4", &["c3"])]) } else { Err(RefError::Upstream) }
+        })
+        .await;
+        assert_eq!(r, Err(RefError::Upstream));
+        // Empty first page: nothing to compare against.
+        assert_eq!(walk(vec![], "c1", 100, 10).await.0, Err(RefError::Upstream));
+        // Listing ends before the chain does (missing parent): inconsistent.
+        let broken = vec![commit("c5", &["c4"]), commit("c4", &["gone"])];
+        assert_eq!(walk(broken, "c1", 100, 10).await.0, Err(RefError::Upstream));
     }
 
     #[test]
     fn raw_url_matches_expected_for_valid_input() {
         let u = raw_file_url("nearai", "cvm-compose-files", "v1.2.3", "prod/GLM-5.3.yaml").unwrap();
         assert_eq!(u.as_str(), "https://raw.githubusercontent.com/nearai/cvm-compose-files/v1.2.3/prod/GLM-5.3.yaml");
-        let u = raw_file_url("o", "r", "release/v1", "a/b.yml").unwrap();
-        assert_eq!(u.as_str(), "https://raw.githubusercontent.com/o/r/release/v1/a/b.yml");
+        let u = raw_file_url("o", "r", "0123456789abcdef0123456789abcdef01234567", "a/b.yml").unwrap();
+        assert_eq!(u.as_str(), "https://raw.githubusercontent.com/o/r/0123456789abcdef0123456789abcdef01234567/a/b.yml");
     }
 
     #[test]
@@ -5829,7 +6060,6 @@ mod tests {
             bearer_tokens: vec!["test-token".into()],
             github_owner: "test".into(),
             github_repo_name: "test".into(),
-            min_tag_age_hours: 0,
             work_dir: PathBuf::from("/tmp/compose-manager-test"),
             env_files: vec![],
             slack_webhook_url: None,
