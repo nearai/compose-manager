@@ -3,16 +3,19 @@
 //! compose-manager keeps listening on a single port and serves both TLS and
 //! plain HTTP there: the first byte of each connection decides (a TLS
 //! ClientHello always starts with 0x16, an HTTP request never does). Plain
-//! HTTP stays available because in-CVM callers that cannot be reconfigured
-//! without a CVM redeploy use it (the launcher's `LAUNCHER_HEALTH_URL`, the
-//! attestation fetch from the model proxies). Remote clients should use TLS.
+//! HTTP is restricted: by default it serves only `GET /version` and
+//! `GET /v1/attestation/report`, and only when the request carries no
+//! `Authorization` header (an in-host health check and attestation clients
+//! use these). Every other plain-HTTP request is refused with 403 before any
+//! handler runs, so bearer tokens are never accepted in the clear. See
+//! [`PlainHttp`] and `TLS_PLAIN_HTTP`.
 //!
 //! The certificate is the one the CVM already maintains for itself (certbot
 //! in the app compose writes it to the `certs` volume). By default it is
 //! copied out of the certbot container with `docker cp -L`, so no extra
 //! volume mount is needed, and re-read periodically to pick up renewals. If no
-//! certificate can be loaded, the port serves plain HTTP only and loading is
-//! retried.
+//! certificate can be loaded, only the unauthenticated plain-HTTP routes are
+//! served (unless `TLS_PLAIN_HTTP=allow`) and loading is retried.
 //!
 //! Configuration:
 //! - `TLS_MODE`: `container` (default), `files`, or `off`.
@@ -21,9 +24,10 @@
 //!   `/etc/letsencrypt/live/completions.near.ai`, which must contain
 //!   `fullchain.pem` and `privkey.pem`).
 //! - `files` mode: `TLS_CERT_FILE` and `TLS_KEY_FILE` (PEM).
+//! - `TLS_PLAIN_HTTP`: `enforce` (default), `log` or `allow`.
 
 use anyhow::{anyhow, bail, Context, Result};
-use axum::Router;
+use axum::{body::Body, http::StatusCode, response::Response, Router};
 use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto,
@@ -31,13 +35,18 @@ use hyper_util::{
 use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 use std::{
     path::{Path, PathBuf},
-    sync::{Arc, RwLock},
-    time::Duration,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, RwLock,
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 use tower::ServiceExt;
 use tracing::{error, info, warn};
+
+use hyper::{header::AUTHORIZATION, Method};
 
 const TLS_HANDSHAKE_RECORD: u8 = 0x16;
 /// How long a new connection may stay silent before its first byte arrives.
@@ -105,6 +114,118 @@ impl Source {
             other => bail!("TLS_MODE must be container, files or off, got {other:?}"),
         }
     }
+}
+
+/// What to do with plain-HTTP requests that are not on the allow-list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlainHttp {
+    /// Refuse them with 403 (default).
+    Enforce,
+    /// Serve them, but log what would have been refused.
+    Log,
+    /// Serve everything over plain HTTP (local development only).
+    Allow,
+}
+
+impl PlainHttp {
+    /// Read `TLS_PLAIN_HTTP`. Never fails: unset, empty or unknown means `Enforce`.
+    pub fn from_env() -> Self {
+        Self::from_vars(|k| std::env::var(k).ok())
+    }
+
+    fn from_vars(var: impl Fn(&str) -> Option<String>) -> Self {
+        match var("TLS_PLAIN_HTTP").as_deref().map(str::trim) {
+            None | Some("") | Some("enforce") => PlainHttp::Enforce,
+            Some("log") => PlainHttp::Log,
+            Some("allow") => PlainHttp::Allow,
+            Some(_) => {
+                warn!("TLS_PLAIN_HTTP is not enforce, log or allow; using enforce");
+                PlainHttp::Enforce
+            }
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            PlainHttp::Enforce => "enforce",
+            PlainHttp::Log => "log",
+            PlainHttp::Allow => "allow",
+        }
+    }
+}
+
+const ROUTE_VERSION: &str = "/version";
+const ROUTE_ATTESTATION: &str = "/v1/attestation/report";
+
+/// Whether a plain-HTTP request may be served: `GET` on one of the two
+/// unauthenticated routes, with no `Authorization` header. The path is
+/// matched exactly (no normalisation); the query string is not part of it.
+fn plain_http_allowed(method: &Method, path: &str, has_auth: bool) -> bool {
+    method == Method::GET && !has_auth && (path == ROUTE_VERSION || path == ROUTE_ATTESTATION)
+}
+
+/// Fixed log label for a request path; never the raw path.
+fn route_label(path: &str) -> &'static str {
+    match path {
+        ROUTE_VERSION => "version",
+        ROUTE_ATTESTATION => "attestation",
+        _ => "other",
+    }
+}
+
+/// Coarse, content-free error category for logs.
+pub fn error_kind(e: &anyhow::Error) -> &'static str {
+    if e.downcast_ref::<std::io::Error>().is_some() {
+        "io"
+    } else {
+        "other"
+    }
+}
+
+static LAST_REFUSAL_LOG: AtomicU64 = AtomicU64::new(0);
+static SUPPRESSED_REFUSALS: AtomicU64 = AtomicU64::new(0);
+
+/// At most one log line per second: `Some(suppressed)` when the caller should
+/// log now (with the number of lines skipped since the last one), else `None`.
+fn refusal_log_slot(last: &AtomicU64, suppressed: &AtomicU64, now_secs: u64) -> Option<u64> {
+    let prev = last.load(Ordering::Relaxed);
+    if prev != now_secs
+        && last
+            .compare_exchange(prev, now_secs, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        Some(suppressed.swap(0, Ordering::Relaxed))
+    } else {
+        suppressed.fetch_add(1, Ordering::Relaxed);
+        None
+    }
+}
+
+fn log_plain_http(mode: PlainHttp, method: &Method, path: &str, has_auth: bool, status: u16) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    if let Some(suppressed) = refusal_log_slot(&LAST_REFUSAL_LOG, &SUPPRESSED_REFUSALS, now) {
+        warn!(
+            method = %method,
+            route = route_label(path),
+            status,
+            has_auth,
+            mode = mode.label(),
+            suppressed,
+            "plain-http request not allowed"
+        );
+    }
+}
+
+fn refusal() -> Response {
+    let mut resp = Response::new(Body::from("https required\n"));
+    *resp.status_mut() = StatusCode::FORBIDDEN;
+    resp.headers_mut().insert(
+        hyper::header::CONTENT_TYPE,
+        hyper::header::HeaderValue::from_static("text/plain"),
+    );
+    resp
 }
 
 /// Build a server config from a PEM certificate chain and private key.
@@ -259,7 +380,7 @@ pub async fn start(source: Source) -> SharedAcceptor {
             info!("TLS certificate loaded");
         }
         Err(e) => {
-            error!(error = %format!("{e:#}"), "TLS certificate not loaded; serving plain HTTP only until it is")
+            error!(error_kind = error_kind(&e), "TLS certificate not loaded; only unauthenticated plain HTTP routes are served until it is")
         }
     }
     let bg = shared.clone();
@@ -280,7 +401,10 @@ pub async fn start(source: Source) -> SharedAcceptor {
                     }
                 }
                 Err(e) => {
-                    warn!(error = %format!("{e:#}"), "TLS certificate reload failed; keeping the current one")
+                    warn!(
+                        error_kind = error_kind(&e),
+                        "TLS certificate reload failed; keeping the current one"
+                    )
                 }
             }
         }
@@ -289,9 +413,14 @@ pub async fn start(source: Source) -> SharedAcceptor {
 }
 
 /// Serve `app` on `listener`, TLS or plain HTTP per connection.
-pub async fn serve(listener: TcpListener, app: Router, acceptor: SharedAcceptor) -> Result<()> {
+pub async fn serve(
+    listener: TcpListener,
+    app: Router,
+    acceptor: SharedAcceptor,
+    policy: PlainHttp,
+) -> Result<()> {
     loop {
-        let (tcp, peer) = match listener.accept().await {
+        let (tcp, _) = match listener.accept().await {
             Ok(conn) => conn,
             Err(e) => {
                 // Transient (e.g. EMFILE): back off briefly instead of exiting.
@@ -303,8 +432,8 @@ pub async fn serve(listener: TcpListener, app: Router, acceptor: SharedAcceptor)
         let app = app.clone();
         let acceptor = acceptor.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle(tcp, peer, app, acceptor).await {
-                tracing::debug!(%peer, error = %e, "connection ended with error");
+            if let Err(e) = handle(tcp, app, acceptor, policy).await {
+                tracing::debug!(error_kind = error_kind(&e), "connection ended with error");
             }
         });
     }
@@ -312,9 +441,9 @@ pub async fn serve(listener: TcpListener, app: Router, acceptor: SharedAcceptor)
 
 async fn handle(
     tcp: TcpStream,
-    peer: std::net::SocketAddr,
     app: Router,
     acceptor: SharedAcceptor,
+    policy: PlainHttp,
 ) -> Result<()> {
     let mut first = [0u8; 1];
     match tokio::time::timeout(FIRST_BYTE_TIMEOUT, tcp.peek(&mut first)).await {
@@ -327,10 +456,20 @@ async fn handle(
     let is_tls = tls_acceptor.is_some();
 
     let service = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
-        if !is_tls && req.headers().contains_key(hyper::header::AUTHORIZATION) {
-            warn!(%peer, path = %req.uri().path(), "plain-http authenticated request");
+        let app = app.clone();
+        async move {
+            if !is_tls && policy != PlainHttp::Allow {
+                let has_auth = req.headers().contains_key(AUTHORIZATION);
+                if !plain_http_allowed(req.method(), req.uri().path(), has_auth) {
+                    if policy == PlainHttp::Enforce {
+                        log_plain_http(policy, req.method(), req.uri().path(), has_auth, 403);
+                        return Ok(refusal());
+                    }
+                    log_plain_http(policy, req.method(), req.uri().path(), has_auth, 200);
+                }
+            }
+            app.oneshot(req).await
         }
-        app.clone().oneshot(req)
     });
     let builder = auto::Builder::new(TokioExecutor::new());
     match tls_acceptor {
@@ -387,14 +526,53 @@ mod tests {
     }
 
     fn app() -> Router {
-        Router::new().route("/ping", get(|| async { "pong" }))
+        Router::new()
+            .route("/ping", get(|| async { "pong" }))
+            .route("/version", get(|| async { "version-body" }))
+            .route(
+                "/v1/attestation/report",
+                get(|| async { "attestation-body" }),
+            )
+            .route("/secret", get(|| async { "secret-body" }))
+    }
+
+    async fn start_server_with(
+        acceptor: SharedAcceptor,
+        policy: PlainHttp,
+    ) -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve(listener, app(), acceptor, policy));
+        addr
     }
 
     async fn start_server(acceptor: SharedAcceptor) -> std::net::SocketAddr {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(serve(listener, app(), acceptor));
-        addr
+        start_server_with(acceptor, PlainHttp::Allow).await
+    }
+
+    async fn plain_req(
+        addr: std::net::SocketAddr,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+    ) -> String {
+        let mut req =
+            format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n");
+        for (k, v) in headers {
+            req.push_str(&format!("{k}: {v}\r\n"));
+        }
+        req.push_str("\r\n");
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        s.write_all(req.as_bytes()).await.unwrap();
+        let mut out = String::new();
+        s.read_to_string(&mut out).await.unwrap();
+        out
+    }
+
+    fn assert_refused(resp: &str) {
+        assert!(resp.starts_with("HTTP/1.1 403"), "{resp}");
+        assert!(resp.ends_with("https required\n"), "{resp}");
+        assert!(!resp.contains("-body"), "{resp}");
     }
 
     const REQUEST: &[u8] = b"GET /ping HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
@@ -411,6 +589,15 @@ mod tests {
         addr: std::net::SocketAddr,
         trust: &CertificateDer<'static>,
     ) -> Result<String> {
+        tls_req(addr, trust, "/ping", &[]).await
+    }
+
+    async fn tls_req(
+        addr: std::net::SocketAddr,
+        trust: &CertificateDer<'static>,
+        path: &str,
+        headers: &[(&str, &str)],
+    ) -> Result<String> {
         let mut roots = rustls::RootCertStore::empty();
         roots.add(trust.clone())?;
         let config = rustls::ClientConfig::builder_with_provider(Arc::new(
@@ -424,7 +611,12 @@ mod tests {
         let mut s = connector
             .connect(ServerName::try_from("localhost")?, tcp)
             .await?;
-        s.write_all(REQUEST).await?;
+        let mut req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n");
+        for (k, v) in headers {
+            req.push_str(&format!("{k}: {v}\r\n"));
+        }
+        req.push_str("\r\n");
+        s.write_all(req.as_bytes()).await?;
         let mut out = Vec::new();
         // The server may close without close_notify; keep what was read.
         let _ = s.read_to_end(&mut out).await;
@@ -597,6 +789,152 @@ mod tests {
         assert!(Source::from_vars(bad_service).is_err());
         let bad_mode = |k: &str| (k == "TLS_MODE").then(|| "on".to_string());
         assert!(Source::from_vars(bad_mode).is_err());
+    }
+
+    #[test]
+    fn plain_http_allowed_table() {
+        let get = Method::GET;
+        let cases: &[(&Method, &str, bool, bool)] = &[
+            (&get, "/version", false, true),
+            (&get, "/v1/attestation/report", false, true),
+            (&get, "/version", true, false),
+            (&get, "/v1/attestation/report", true, false),
+            (&Method::HEAD, "/version", false, false),
+            (&Method::OPTIONS, "/version", false, false),
+            (&Method::POST, "/version", false, false),
+            (&get, "/version/", false, false),
+            (&get, "//version", false, false),
+            (&get, "/Version", false, false),
+            (&get, "/version%2F", false, false),
+            (&get, "/v1/attestation/report/", false, false),
+            (&get, "/secret", false, false),
+            (&get, "/", false, false),
+            (&get, "", false, false),
+        ];
+        for (m, path, auth, want) in cases {
+            assert_eq!(
+                plain_http_allowed(m, path, *auth),
+                *want,
+                "{m} {path} {auth}"
+            );
+        }
+    }
+
+    #[test]
+    fn plain_http_from_vars() {
+        let of = |v: Option<&'static str>| {
+            PlainHttp::from_vars(move |k| (k == "TLS_PLAIN_HTTP").then(|| v.map(String::from))?)
+        };
+        assert_eq!(of(None), PlainHttp::Enforce);
+        assert_eq!(of(Some("")), PlainHttp::Enforce);
+        assert_eq!(of(Some("enforce")), PlainHttp::Enforce);
+        assert_eq!(of(Some("log")), PlainHttp::Log);
+        assert_eq!(of(Some(" allow ")), PlainHttp::Allow);
+        assert_eq!(of(Some("garbage")), PlainHttp::Enforce);
+        assert_eq!(of(Some("ALLOW")), PlainHttp::Enforce);
+    }
+
+    #[test]
+    fn route_labels_are_fixed() {
+        assert_eq!(route_label("/version"), "version");
+        assert_eq!(route_label("/v1/attestation/report"), "attestation");
+        assert_eq!(route_label("/secret?token=abc"), "other");
+    }
+
+    #[test]
+    fn refusal_log_is_rate_limited_and_counts_suppressed() {
+        let (last, sup) = (AtomicU64::new(0), AtomicU64::new(0));
+        assert_eq!(refusal_log_slot(&last, &sup, 100), Some(0));
+        assert_eq!(refusal_log_slot(&last, &sup, 100), None);
+        assert_eq!(refusal_log_slot(&last, &sup, 100), None);
+        assert_eq!(refusal_log_slot(&last, &sup, 101), Some(2));
+        assert_eq!(refusal_log_slot(&last, &sup, 102), Some(0));
+    }
+
+    #[tokio::test]
+    async fn enforce_serves_exempt_routes_over_plain_http() {
+        let addr = start_server_with(SharedAcceptor::default(), PlainHttp::Enforce).await;
+        for path in [
+            "/version",
+            "/version?x=1",
+            "/v1/attestation/report?nonce=ab",
+        ] {
+            let r = plain_req(addr, "GET", path, &[]).await;
+            assert!(r.starts_with("HTTP/1.1 200"), "{path}: {r}");
+        }
+        let r = plain_req(addr, "GET", "/version", &[]).await;
+        assert!(r.ends_with("version-body"), "{r}");
+    }
+
+    #[tokio::test]
+    async fn enforce_refuses_everything_else_over_plain_http() {
+        let addr = start_server_with(SharedAcceptor::default(), PlainHttp::Enforce).await;
+        assert_refused(&plain_req(addr, "GET", "/secret", &[]).await);
+        assert_refused(&plain_req(addr, "GET", "/nope", &[]).await);
+        assert_refused(&plain_req(addr, "GET", "/secret", &[("Authorization", "Bearer t")]).await);
+        assert_refused(&plain_req(addr, "GET", "/version", &[("Authorization", "x")]).await);
+        assert_refused(&plain_req(addr, "GET", "/version", &[("Authorization", "")]).await);
+        assert_refused(
+            &plain_req(
+                addr,
+                "GET",
+                "/v1/attestation/report?nonce=ab",
+                &[("Authorization", "Bearer t")],
+            )
+            .await,
+        );
+        for method in ["HEAD", "OPTIONS", "POST"] {
+            let r = plain_req(addr, method, "/version", &[]).await;
+            assert!(r.starts_with("HTTP/1.1 403"), "{method}: {r}");
+            assert!(!r.contains("version-body"), "{method}: {r}");
+        }
+        for path in ["/version/", "//version", "/Version", "/version%2F"] {
+            assert_refused(&plain_req(addr, "GET", path, &[]).await);
+        }
+        let r = plain_req(addr, "GET", "/secret", &[]).await;
+        assert!(
+            r.to_ascii_lowercase().contains("content-type: text/plain"),
+            "{r}"
+        );
+    }
+
+    #[tokio::test]
+    async fn enforce_leaves_tls_unchanged() {
+        let cert = test_cert();
+        let addr = start_server_with(loaded(&cert), PlainHttp::Enforce).await;
+        let auth = [("Authorization", "Bearer t")];
+        for headers in [&[][..], &auth[..]] {
+            let r = tls_req(addr, &cert.der, "/secret", headers).await.unwrap();
+            assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+            assert!(r.ends_with("secret-body"), "{r}");
+        }
+        let r = tls_req(addr, &cert.der, "/version", &auth).await.unwrap();
+        assert!(r.ends_with("version-body"), "{r}");
+        assert_refused(&plain_req(addr, "GET", "/secret", &auth).await);
+    }
+
+    #[tokio::test]
+    async fn enforce_without_certificate_fails_closed() {
+        let cert = test_cert();
+        let addr = start_server_with(SharedAcceptor::default(), PlainHttp::Enforce).await;
+        assert!(plain_req(addr, "GET", "/version", &[])
+            .await
+            .starts_with("HTTP/1.1 200"));
+        assert_refused(&plain_req(addr, "GET", "/secret", &[]).await);
+        assert!(tls_get(addr, &cert.der).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn log_and_allow_modes_serve_plain_http() {
+        for policy in [PlainHttp::Log, PlainHttp::Allow] {
+            let addr = start_server_with(SharedAcceptor::default(), policy).await;
+            let auth = [("Authorization", "Bearer t")];
+            let r = plain_req(addr, "GET", "/secret", &auth).await;
+            assert!(r.starts_with("HTTP/1.1 200"), "{policy:?}: {r}");
+            assert!(r.ends_with("secret-body"), "{policy:?}: {r}");
+            let r = plain_req(addr, "GET", "/version", &auth).await;
+            assert!(r.ends_with("version-body"), "{policy:?}: {r}");
+        }
     }
 
     #[test]
