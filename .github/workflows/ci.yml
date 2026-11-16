@@ -74,8 +74,8 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
 
-      - name: Check the config parses as YAML
-        run: python3 -c 'import sys, yaml; yaml.safe_load(open(sys.argv[1]))' otelcol/config.yaml
+      - name: Check the config content
+        run: python3 otelcol/check_config.py otelcol/config.yaml
 
       - name: Validate the config with the pinned collector image
         run: |

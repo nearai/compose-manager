@@ -502,8 +502,18 @@ compose decides which user runs it. `build.yml` builds it on every push, signs i
 (keyless), attaches build provenance and pushes `:staging` plus an immutable
 `staging-<date>-<sha>` tag, exactly like the launcher image. `promote.yml` and `rollback.yml` retag
 it together with the other images; `promote-compose-manager.yml` leaves it untouched and fails if
-its `:prod` or `:latest` digest changes. CI checks that `config.yaml` parses as YAML and runs
-`otelcol-contrib validate` against it in the pinned image with dummy values.
+its `:prod` or `:latest` digest changes. CI runs `otelcol-contrib validate` against `config.yaml`
+in the pinned image with dummy values, and `otelcol/check_config.py`, which pins what the config
+must and must not do:
+
+- only the four receivers it has today, and no OTLP input or other listener;
+- only `compose-manager`, `compose-manager-launcher` and `dns-cloudflare` container logs leave the
+  CVM (`filter/management_logs`, after `transform/docker_metadata`);
+- Docker Stats reports the image ID, uptime and restarts with the Compose labels the dashboard
+  uses, and the raw Compose config path label is deleted before export;
+- every pipeline starts with `memory_limiter` and exports only to the gateway, through one FIFO
+  queue persisted to `file_storage`;
+- the config reads only the environment variables listed below.
 
 The configuration reads these environment variables, which the CVM compose must provide:
 `MONITORING_INGEST_TOKEN`, `MONITORING_OTLP_ENDPOINT` (full HTTPS URL of the telemetry gateway),
