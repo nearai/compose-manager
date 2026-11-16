@@ -64,6 +64,9 @@ receivers:
         enabled: true
       container.restarts:
         enabled: true
+      # Docker healthcheck state (starting, healthy, unhealthy) per container.
+      container.state.health.status:
+        enabled: true
 
   prometheus/self:
     config:
@@ -170,6 +173,16 @@ service:
       exporters: [otlphttp/gateway]
   telemetry:
     metrics:
-      address: localhost:8888
+      # Served on localhost:8888 for the prometheus/self receiver above.
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: localhost
+                port: 8888
+                # Keep the service_name / service_instance_id / service_version
+                # labels the collector's own metrics had before readers.
+                with_resource_constant_labels:
+                  included: [service.name, service.instance.id, service.version]
     logs:
       level: info

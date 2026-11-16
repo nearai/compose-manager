@@ -71,7 +71,7 @@ def check(text: str) -> list[str]:
             errors.append(f"docker_stats must map {label} to {name}")
     if stats.get("resource_attributes", {}).get("container.image.id", {}).get("enabled") is not True:
         errors.append("docker_stats must report container.image.id")
-    for metric in ("container.uptime", "container.restarts"):
+    for metric in ("container.uptime", "container.restarts", "container.state.health.status"):
         if stats.get("metrics", {}).get(metric, {}).get("enabled") is not True:
             errors.append(f"docker_stats must enable {metric}")
     if receivers["hostmetrics/cvm"].get("root_path") != "${env:CVM_HOSTMETRICS_ROOT_PATH}":
@@ -122,6 +122,16 @@ def check(text: str) -> list[str]:
         "spike_limit_mib"
     ) != "${env:OTELCOL_MEMORY_SPIKE_LIMIT_MIB}":
         errors.append("memory_limiter limits must come from env")
+
+    # The collector's own metrics: served on localhost:8888 for prometheus/self,
+    # keeping the service_* labels dashboards group by.
+    readers = cfg["service"].get("telemetry", {}).get("metrics", {}).get("readers", [])
+    prom = readers[0].get("pull", {}).get("exporter", {}).get("prometheus", {}) if len(readers) == 1 else {}
+    if prom.get("host") != "localhost" or prom.get("port") != 8888:
+        errors.append("self metrics must use one pull reader on localhost:8888")
+    included = set(prom.get("with_resource_constant_labels", {}).get("included", []))
+    if not {"service.name", "service.instance.id", "service.version"} <= included:
+        errors.append("self metrics must keep service.name, service.instance.id and service.version labels")
     return errors
 
 
