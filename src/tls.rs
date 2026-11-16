@@ -14,8 +14,8 @@
 //! in the app compose writes it to the `certs` volume). By default it is
 //! copied out of the certbot container with `docker cp -L`, so no extra
 //! volume mount is needed, and re-read periodically to pick up renewals. If no
-//! certificate can be loaded, only the unauthenticated plain-HTTP routes are
-//! served (unless `TLS_PLAIN_HTTP=allow`) and loading is retried.
+//! certificate can be loaded, the plain-HTTP policy applies (by default only
+//! the unauthenticated routes are served) and loading is retried.
 //!
 //! Configuration:
 //! - `TLS_MODE`: `container` (default), `files`, or `off`.
@@ -201,20 +201,50 @@ fn refusal_log_slot(last: &AtomicU64, suppressed: &AtomicU64, now_secs: u64) -> 
     }
 }
 
-fn log_plain_http(mode: PlainHttp, method: &Method, path: &str, has_auth: bool, status: u16) {
+/// Fixed log label for a request method; never the client-sent string.
+fn method_label(method: &Method) -> &'static str {
+    match *method {
+        Method::GET => "GET",
+        Method::HEAD => "HEAD",
+        Method::POST => "POST",
+        Method::PUT => "PUT",
+        Method::DELETE => "DELETE",
+        Method::OPTIONS => "OPTIONS",
+        Method::PATCH => "PATCH",
+        _ => "other",
+    }
+}
+
+/// The `decision` log field used in log mode, where the handler's own status
+/// is not known at this point.
+const DECISION_WOULD_REFUSE: &str = "would_refuse";
+
+fn log_plain_http(mode: PlainHttp, method: &Method, path: &str, has_auth: bool) {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
     if let Some(suppressed) = refusal_log_slot(&LAST_REFUSAL_LOG, &SUPPRESSED_REFUSALS, now) {
-        warn!(
-            method = %method,
-            route = route_label(path),
-            status,
-            has_auth,
-            mode = mode.label(),
-            suppressed,
-            "plain-http request not allowed"
-        );
+        if mode == PlainHttp::Enforce {
+            warn!(
+                method = method_label(method),
+                route = route_label(path),
+                status = 403u16,
+                has_auth,
+                mode = mode.label(),
+                suppressed,
+                "plain-http request not allowed"
+            );
+        } else {
+            warn!(
+                method = method_label(method),
+                route = route_label(path),
+                decision = DECISION_WOULD_REFUSE,
+                has_auth,
+                mode = mode.label(),
+                suppressed,
+                "plain-http request not allowed"
+            );
+        }
     }
 }
 
@@ -371,7 +401,7 @@ async fn run_docker(args: &[&str]) -> Result<String> {
 pub async fn start(source: Source) -> SharedAcceptor {
     let shared = SharedAcceptor::default();
     if source == Source::Off {
-        info!("TLS disabled (TLS_MODE=off); serving plain HTTP only");
+        info!("TLS disabled (TLS_MODE=off)");
         return shared;
     }
     match load(&source).await {
@@ -380,7 +410,10 @@ pub async fn start(source: Source) -> SharedAcceptor {
             info!("TLS certificate loaded");
         }
         Err(e) => {
-            error!(error_kind = error_kind(&e), "TLS certificate not loaded; only unauthenticated plain HTTP routes are served until it is")
+            error!(
+                error_kind = error_kind(&e),
+                "TLS certificate not loaded; plain-HTTP policy applies until it is"
+            )
         }
     }
     let bg = shared.clone();
@@ -462,10 +495,10 @@ async fn handle(
                 let has_auth = req.headers().contains_key(AUTHORIZATION);
                 if !plain_http_allowed(req.method(), req.uri().path(), has_auth) {
                     if policy == PlainHttp::Enforce {
-                        log_plain_http(policy, req.method(), req.uri().path(), has_auth, 403);
+                        log_plain_http(policy, req.method(), req.uri().path(), has_auth);
                         return Ok(refusal());
                     }
-                    log_plain_http(policy, req.method(), req.uri().path(), has_auth, 200);
+                    log_plain_http(policy, req.method(), req.uri().path(), has_auth);
                 }
             }
             app.oneshot(req).await
@@ -534,6 +567,8 @@ mod tests {
                 get(|| async { "attestation-body" }),
             )
             .route("/secret", get(|| async { "secret-body" }))
+            .route("/status", get(|| async { "status-body" }))
+            .route("/docker/ps", get(|| async { "ps-body" }))
     }
 
     async fn start_server_with(
@@ -808,6 +843,10 @@ mod tests {
             (&get, "/version%2F", false, false),
             (&get, "/v1/attestation/report/", false, false),
             (&get, "/secret", false, false),
+            (&get, "/status", false, false),
+            (&get, "/status", true, false),
+            (&get, "/docker/ps", false, false),
+            (&get, "/docker/ps", true, false),
             (&get, "/", false, false),
             (&get, "", false, false),
         ];
@@ -832,6 +871,15 @@ mod tests {
         assert_eq!(of(Some(" allow ")), PlainHttp::Allow);
         assert_eq!(of(Some("garbage")), PlainHttp::Enforce);
         assert_eq!(of(Some("ALLOW")), PlainHttp::Enforce);
+    }
+
+    #[test]
+    fn method_labels_are_fixed() {
+        assert_eq!(method_label(&Method::GET), "GET");
+        assert_eq!(method_label(&Method::PATCH), "PATCH");
+        assert_eq!(method_label(&Method::TRACE), "other");
+        let custom = Method::from_bytes(b"SECRET-TOKEN").unwrap();
+        assert_eq!(method_label(&custom), "other");
     }
 
     #[test]
@@ -890,6 +938,12 @@ mod tests {
         }
         for path in ["/version/", "//version", "/Version", "/version%2F"] {
             assert_refused(&plain_req(addr, "GET", path, &[]).await);
+        }
+        for path in ["/status", "/docker/ps"] {
+            let r = plain_req(addr, "GET", path, &[]).await;
+            assert_refused(&r);
+            assert!(!r.contains("-body"), "{path}: {r}");
+            assert_refused(&plain_req(addr, "GET", path, &[("Authorization", "Bearer t")]).await);
         }
         let r = plain_req(addr, "GET", "/secret", &[]).await;
         assert!(

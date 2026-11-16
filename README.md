@@ -310,7 +310,9 @@ not affected.
 `TLS_PLAIN_HTTP` controls this: `enforce` (default; unset, empty or unknown values also mean
 `enforce`), `log` (serve everything but log the requests that would be refused) or `allow` (no
 restriction). Refusals are logged at warn level with the method, a fixed route label, whether an
-`Authorization` header was present and the mode, at most one line per second.
+`Authorization` header was present and the mode, at most one line per second. In `log` mode the
+line carries `decision=would_refuse` instead of a status. If the bearer token was ever sent over
+plain HTTP, rotate it (see [Authentication & token rotation](#authentication--token-rotation)).
 
 The certificate is the one the CVM already maintains: by default compose-manager copies
 `fullchain.pem` and `privkey.pem` out of the certbot container with `docker cp -L`, so no extra

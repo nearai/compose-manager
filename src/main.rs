@@ -4384,6 +4384,8 @@ async fn main() -> Result<()> {
     let plain_http = tls::PlainHttp::from_env();
     if tls_source == tls::Source::Off && plain_http == tls::PlainHttp::Enforce {
         error!("plain HTTP policy is enforce and TLS is off: authenticated routes are refused; set TLS_PLAIN_HTTP=allow only for local development");
+    } else if tls_source == tls::Source::Off {
+        warn!("TLS is off and the plain HTTP policy is not enforce: authenticated requests are served over plain HTTP");
     }
     let acceptor = tls::start(tls_source.clone()).await;
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
