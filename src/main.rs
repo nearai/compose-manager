@@ -1890,6 +1890,17 @@ impl Stream for NdjsonStream {
                                     error!(error = %e, "Failed to persist deployed.json");
                                 }
                             }
+                            // One outcome line per finished compose_up, so log
+                            // queries can tell a requested tag from a deployed one.
+                            if notice.action.action == "compose_up" {
+                                let tag = notice.action.tag.as_deref().unwrap_or("");
+                                let file = notice.action.file.as_deref().unwrap_or("");
+                                if status.success() {
+                                    info!(action = "compose_up", project = %notice.project, tag = %tag, file = %file, "Compose deploy succeeded");
+                                } else {
+                                    warn!(action = "compose_up", project = %notice.project, tag = %tag, file = %file, exit_code = ?status.code(), "Compose deploy failed");
+                                }
+                            }
                         }
 
                         // Clean up temp env file
