@@ -14,6 +14,7 @@ env:
   REGISTRY: docker.io
   IMAGE_REPOSITORY: ${{ vars.DOCKER_REGISTRY_USER }}/compose-manager
   LAUNCHER_IMAGE_REPOSITORY: ${{ vars.DOCKER_REGISTRY_USER }}/compose-manager-launcher
+  OTELCOL_IMAGE_REPOSITORY: ${{ vars.DOCKER_REGISTRY_USER }}/compose-manager-otelcol
 
 concurrency:
   group: prod-image-mutation
@@ -97,15 +98,19 @@ jobs:
 
           resolve_image "CM" "${{ env.IMAGE_REPOSITORY }}"
           resolve_image "LAUNCHER" "${{ env.LAUNCHER_IMAGE_REPOSITORY }}"
+          resolve_image "OTELCOL" "${{ env.OTELCOL_IMAGE_REPOSITORY }}"
 
           if [ "$CM_SHORT_SHA" != "$LAUNCHER_SHORT_SHA" ]; then
             echo "::warning::compose-manager and launcher resolved different source suffixes (${CM_SHORT_SHA} vs ${LAUNCHER_SHORT_SHA}); using compose-manager suffix for the shared production tag."
+          fi
+          if [ "$CM_SHORT_SHA" != "$OTELCOL_SHORT_SHA" ]; then
+            echo "::warning::compose-manager and otelcol resolved different source suffixes (${CM_SHORT_SHA} vs ${OTELCOL_SHORT_SHA}); using compose-manager suffix for the shared production tag."
           fi
 
       - name: Verify staging images were built and signed by build.yml on master
         run: |
           set -euo pipefail
-          for pair in "${CM_IMAGE}@${CM_DIGEST}" "${LAUNCHER_IMAGE}@${LAUNCHER_DIGEST}"; do
+          for pair in "${CM_IMAGE}@${CM_DIGEST}" "${LAUNCHER_IMAGE}@${LAUNCHER_DIGEST}" "${OTELCOL_IMAGE}@${OTELCOL_DIGEST}"; do
             cosign verify \
               --certificate-identity-regexp '^https://github\.com/nearai/compose-manager/\.github/workflows/build\.yml@refs/heads/master$' \
               --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
@@ -131,10 +136,17 @@ jobs:
           skopeo copy --all "docker://${LAUNCHER_IMAGE}@${LAUNCHER_DIGEST}" "docker://${LAUNCHER_IMAGE}:${LAUNCHER_PROD_STAMPED_TAG}"
           skopeo copy --all "docker://${LAUNCHER_IMAGE}@${LAUNCHER_DIGEST}" "docker://${LAUNCHER_IMAGE}:latest"
 
+          OTELCOL_PROD_STAMPED_TAG="${CM_PROD_STAMPED_TAG}"
+          skopeo copy --all "docker://${OTELCOL_IMAGE}@${OTELCOL_DIGEST}" "docker://${OTELCOL_IMAGE}:prod"
+          skopeo copy --all "docker://${OTELCOL_IMAGE}@${OTELCOL_DIGEST}" "docker://${OTELCOL_IMAGE}:${OTELCOL_PROD_STAMPED_TAG}"
+          skopeo copy --all "docker://${OTELCOL_IMAGE}@${OTELCOL_DIGEST}" "docker://${OTELCOL_IMAGE}:latest"
+
           echo "CM_PROD_STAMPED_TAG=${CM_PROD_STAMPED_TAG}" >> "$GITHUB_ENV"
           echo "CM_PROD_STAMPED_REF=${CM_IMAGE}:${CM_PROD_STAMPED_TAG}" >> "$GITHUB_ENV"
           echo "LAUNCHER_PROD_STAMPED_TAG=${LAUNCHER_PROD_STAMPED_TAG}" >> "$GITHUB_ENV"
           echo "LAUNCHER_PROD_STAMPED_REF=${LAUNCHER_IMAGE}:${LAUNCHER_PROD_STAMPED_TAG}" >> "$GITHUB_ENV"
+          echo "OTELCOL_PROD_STAMPED_TAG=${OTELCOL_PROD_STAMPED_TAG}" >> "$GITHUB_ENV"
+          echo "OTELCOL_PROD_STAMPED_REF=${OTELCOL_IMAGE}:${OTELCOL_PROD_STAMPED_TAG}" >> "$GITHUB_ENV"
 
       - name: Confirm prod tags resolve to the promoted digests
         run: |
@@ -155,6 +167,7 @@ jobs:
 
           confirm_image "$CM_IMAGE" "$CM_DIGEST" "$CM_PROD_STAMPED_TAG"
           confirm_image "$LAUNCHER_IMAGE" "$LAUNCHER_DIGEST" "$LAUNCHER_PROD_STAMPED_TAG"
+          confirm_image "$OTELCOL_IMAGE" "$OTELCOL_DIGEST" "$OTELCOL_PROD_STAMPED_TAG"
 
       - name: Create GitHub release
         env:
@@ -181,6 +194,14 @@ jobs:
           - **Digest**: \`${LAUNCHER_DIGEST}\`
           - **Source short-sha**: \`${LAUNCHER_SHORT_SHA}\`
           - **Sigstore**: https://search.sigstore.dev/?hash=${LAUNCHER_DIGEST}
+
+          ### compose-manager-otelcol
+          - **Image**: \`${OTELCOL_IMAGE}:prod\`
+          - **Stamped image**: \`${OTELCOL_PROD_STAMPED_REF}\`
+          - **Compatibility alias**: \`${OTELCOL_IMAGE}:latest\`
+          - **Digest**: \`${OTELCOL_DIGEST}\`
+          - **Source short-sha**: \`${OTELCOL_SHORT_SHA}\`
+          - **Sigstore**: https://search.sigstore.dev/?hash=${OTELCOL_DIGEST}
           EOF
           )
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
@@ -205,4 +226,10 @@ jobs:
             echo "- stamped tag: \`${LAUNCHER_PROD_STAMPED_REF}\`"
             echo "- latest alias: \`${LAUNCHER_IMAGE}:latest\`"
             echo "- digest: \`${LAUNCHER_DIGEST}\`"
+            echo ""
+            echo "### compose-manager-otelcol"
+            echo "- prod: \`${OTELCOL_IMAGE}:prod\`"
+            echo "- stamped tag: \`${OTELCOL_PROD_STAMPED_REF}\`"
+            echo "- latest alias: \`${OTELCOL_IMAGE}:latest\`"
+            echo "- digest: \`${OTELCOL_DIGEST}\`"
           } >> "$GITHUB_STEP_SUMMARY"

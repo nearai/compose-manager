@@ -1,10 +1,11 @@
 name: Promote compose-manager only
 
 # Promotes the compose-manager image (:staging -> :prod and :latest) and leaves
-# compose-manager-launcher untouched. Running CVMs pick up the new image through
+# compose-manager-launcher and compose-manager-otelcol untouched. Running CVMs pick up the new image through
 # their launcher, which recreates only the compose-manager container. The
 # launcher image is pinned in each CVM's measured compose and changes only when
-# the CVM is redeployed, so it is promoted separately (promote.yml).
+# the CVM is redeployed, so it is promoted separately (promote.yml), together
+# with the collector image.
 
 permissions:
   contents: write
@@ -13,13 +14,14 @@ on:
   workflow_dispatch:
     inputs:
       confirm:
-        description: 'Type "promote" to confirm promoting compose-manager :staging to :prod and :latest (launcher unchanged)'
+        description: 'Type "promote" to confirm promoting compose-manager :staging to :prod and :latest (launcher and otelcol unchanged)'
         required: true
 
 env:
   REGISTRY: docker.io
   IMAGE_REPOSITORY: ${{ vars.DOCKER_REGISTRY_USER }}/compose-manager
   LAUNCHER_IMAGE_REPOSITORY: ${{ vars.DOCKER_REGISTRY_USER }}/compose-manager-launcher
+  OTELCOL_IMAGE_REPOSITORY: ${{ vars.DOCKER_REGISTRY_USER }}/compose-manager-otelcol
 
 concurrency:
   group: prod-image-mutation
@@ -65,6 +67,15 @@ jobs:
             digest=$(skopeo inspect --raw "docker://${{ env.REGISTRY }}/${{ env.LAUNCHER_IMAGE_REPOSITORY }}:${tag}" | sha256sum | cut -d' ' -f1)
             echo "LAUNCHER_${tag^^}_BEFORE=sha256:${digest}" >> "$GITHUB_ENV"
             echo "compose-manager-launcher:${tag} = sha256:${digest}"
+          done
+
+      - name: Record otelcol tags (must not change)
+        run: |
+          set -euo pipefail
+          for tag in prod latest; do
+            digest=$(skopeo inspect --raw "docker://${{ env.REGISTRY }}/${{ env.OTELCOL_IMAGE_REPOSITORY }}:${tag}" | sha256sum | cut -d' ' -f1)
+            echo "OTELCOL_${tag^^}_BEFORE=sha256:${digest}" >> "$GITHUB_ENV"
+            echo "compose-manager-otelcol:${tag} = sha256:${digest}"
           done
 
       - name: Resolve staging digest and source SHA
@@ -124,7 +135,7 @@ jobs:
           echo "CM_PROD_STAMPED_TAG=${CM_PROD_STAMPED_TAG}" >> "$GITHUB_ENV"
           echo "CM_PROD_STAMPED_REF=${CM_IMAGE}:${CM_PROD_STAMPED_TAG}" >> "$GITHUB_ENV"
 
-      - name: Confirm prod tags resolve to the promoted digest and the launcher is unchanged
+      - name: Confirm prod tags resolve to the promoted digest and the launcher and otelcol are unchanged
         run: |
           set -euo pipefail
           for tag in prod "$CM_PROD_STAMPED_TAG" latest; do
@@ -139,6 +150,14 @@ jobs:
             after="sha256:$(skopeo inspect --raw "docker://${{ env.REGISTRY }}/${{ env.LAUNCHER_IMAGE_REPOSITORY }}:${tag}" | sha256sum | cut -d' ' -f1)"
             if [ "$after" != "${!before_var}" ]; then
               echo "::error::compose-manager-launcher:${tag} changed from ${!before_var} to ${after}"
+              exit 1
+            fi
+          done
+          for tag in prod latest; do
+            before_var="OTELCOL_${tag^^}_BEFORE"
+            after="sha256:$(skopeo inspect --raw "docker://${{ env.REGISTRY }}/${{ env.OTELCOL_IMAGE_REPOSITORY }}:${tag}" | sha256sum | cut -d' ' -f1)"
+            if [ "$after" != "${!before_var}" ]; then
+              echo "::error::compose-manager-otelcol:${tag} changed from ${!before_var} to ${after}"
               exit 1
             fi
           done
@@ -163,6 +182,9 @@ jobs:
 
           ### compose-manager-launcher
           - Not promoted. \`:prod\` stays \`${LAUNCHER_PROD_BEFORE}\`.
+
+          ### compose-manager-otelcol
+          - Not promoted. \`:prod\` stays \`${OTELCOL_PROD_BEFORE}\`.
           EOF
           )
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
@@ -182,4 +204,5 @@ jobs:
             echo "- digest: \`${CM_DIGEST}\`"
             echo ""
             echo "compose-manager-launcher not promoted (\`:prod\` = \`${LAUNCHER_PROD_BEFORE}\`)."
+            echo "compose-manager-otelcol not promoted (\`:prod\` = \`${OTELCOL_PROD_BEFORE}\`)."
           } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,175 @@
+receivers:
+  filelog/docker_containers:
+    include: [/var/lib/docker/containers/*/*-json.log]
+    start_at: end
+    storage: file_storage
+    include_file_path: true
+    operators:
+      - type: json_parser
+        parse_from: body
+        parse_to: attributes
+        timestamp:
+          parse_from: attributes.time
+          layout_type: gotime
+          layout: '2006-01-02T15:04:05.999999999Z07:00'
+        on_error: send_quiet
+      - type: move
+        from: attributes.log
+        to: body
+        if: 'attributes.log != nil'
+      - type: move
+        from: attributes.stream
+        to: attributes["log.iostream"]
+        if: 'attributes.stream != nil'
+      - type: remove
+        field: attributes.time
+        if: 'attributes.time != nil'
+      - type: regex_parser
+        parse_from: attributes["log.file.path"]
+        regex: '/var/lib/docker/containers/(?P<container_id>[a-f0-9]{12})[a-f0-9]*/'
+        on_error: send_quiet
+      - type: add
+        field: attributes["service.name"]
+        value: cvm-docker
+
+  hostmetrics/cvm:
+    collection_interval: 30s
+    root_path: ${env:CVM_HOSTMETRICS_ROOT_PATH}
+    scrapers:
+      cpu: {}
+      memory: {}
+      load: {}
+      paging: {}
+      network: {}
+      disk: {}
+      filesystem:
+        exclude_mount_points:
+          mount_points: ["^/dev(/.*)?$", "^/proc(/.*)?$", "^/sys(/.*)?$", "^/run(/.*)?$", "^/var/lib/docker(/.*)?$"]
+          match_type: regexp
+
+  docker_stats/cvm:
+    endpoint: unix:///var/run/docker.sock
+    collection_interval: 30s
+    timeout: 10s
+    api_version: "1.44"
+    container_labels_to_metric_labels:
+      com.docker.compose.service: compose_service
+      com.docker.compose.project: compose_project
+      com.docker.compose.project.config_files: compose_config_path
+    resource_attributes:
+      container.image.id:
+        enabled: true
+    metrics:
+      container.uptime:
+        enabled: true
+      container.restarts:
+        enabled: true
+
+  prometheus/self:
+    config:
+      scrape_configs:
+        - job_name: otelcol-management
+          scrape_interval: 30s
+          static_configs:
+            - targets: ['localhost:8888']
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: ${env:OTELCOL_MEMORY_LIMIT_MIB}
+    spike_limit_mib: ${env:OTELCOL_MEMORY_SPIKE_LIMIT_MIB}
+
+  resource:
+    attributes:
+      - key: host.name
+        value: ${env:DD_HOSTNAME}
+        action: upsert
+      - key: cvm.name
+        value: ${env:CVM_NAME}
+        action: upsert
+      - key: host.machine
+        value: ${env:CVM_HOST}
+        action: insert
+      - key: deployment.environment
+        value: ${env:ENV}
+        action: upsert
+      - key: service.namespace
+        value: near-ai
+        action: insert
+
+  transform/compose_inventory:
+    error_mode: silent
+    metric_statements:
+      - context: resource
+        statements:
+          # Export one Compose Manager workspace-relative YAML path.
+          # Remove the raw Docker label before processing its value.
+          - set(cache["config_path"], attributes["compose_config_path"])
+          - delete_key(attributes, "compose_config_path")
+          - set(cache["matched"], ExtractPatterns(cache["config_path"], "^/app/work/(?P<file>([A-Za-z0-9_-][A-Za-z0-9._-]*/)*[A-Za-z0-9_-][A-Za-z0-9._-]*[.]ya?ml)$")) where IsString(cache["config_path"])
+          - set(attributes["compose_file"], cache["matched"]["file"]) where cache["matched"] != nil
+
+  transform/docker_metadata:
+    error_mode: ignore
+    log_statements:
+      - context: log
+        statements:
+          - set(attributes["service.name"], attributes["attrs"]["com.docker.compose.service"]) where attributes["attrs"] != nil and attributes["attrs"]["com.docker.compose.service"] != nil
+          - set(attributes["service.name"], ParseJSON(attributes["attrs"]["com.datadoghq.ad.logs"])[0]["service"]) where attributes["attrs"] != nil and attributes["attrs"]["com.datadoghq.ad.logs"] != nil
+          - set(attributes["log.source"], ParseJSON(attributes["attrs"]["com.datadoghq.ad.logs"])[0]["source"]) where attributes["attrs"] != nil and attributes["attrs"]["com.datadoghq.ad.logs"] != nil
+          - set(attributes["container.name"], attributes["attrs"]["com.docker.compose.service"]) where attributes["attrs"] != nil and attributes["attrs"]["com.docker.compose.service"] != nil
+
+  filter/management_logs:
+    error_mode: ignore
+    logs:
+      log_record:
+        - 'attributes["service.name"] != "compose-manager" and attributes["service.name"] != "compose-manager-launcher" and attributes["service.name"] != "dns-cloudflare"'
+
+  groupbyattrs/docker_service:
+    keys:
+      - service.name
+      - container.name
+      - log.source
+      - log.iostream
+
+  batch:
+    send_batch_size: 1024
+    send_batch_max_size: 2048
+    timeout: 5s
+
+exporters:
+  otlphttp/gateway:
+    endpoint: ${env:MONITORING_OTLP_ENDPOINT}
+    headers:
+      Authorization: "Bearer ${env:MONITORING_INGEST_TOKEN}"
+    # Keep source requests FIFO before the central gateway.
+    sending_queue:
+      num_consumers: 1
+      queue_size: 128
+      storage: file_storage
+
+extensions:
+  file_storage:
+    directory: /var/lib/otelcol-management/storage
+    create_directory: true
+
+service:
+  extensions: [file_storage]
+  pipelines:
+    logs/cvm:
+      receivers: [filelog/docker_containers]
+      processors: [memory_limiter, resource, transform/docker_metadata, filter/management_logs, groupbyattrs/docker_service, batch]
+      exporters: [otlphttp/gateway]
+    metrics/cvm_system:
+      receivers: [hostmetrics/cvm, docker_stats/cvm]
+      processors: [memory_limiter, resource, transform/compose_inventory, batch]
+      exporters: [otlphttp/gateway]
+    metrics/self:
+      receivers: [prometheus/self]
+      processors: [memory_limiter, resource, batch]
+      exporters: [otlphttp/gateway]
+  telemetry:
+    metrics:
+      address: localhost:8888
+    logs:
+      level: info
