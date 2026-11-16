@@ -248,11 +248,11 @@ The handler runs `nsenter -t 1 -m -u -i -n -p -- systemctl <action> dstack-guest
 **Examples:**
 ```bash
 # Restart the dstack guest agent (e.g. to retry a stuck TDX quote attempt)
-curl -X POST http://localhost:8080/dstack-agent/restart \
+curl -k -X POST https://localhost:8080/dstack-agent/restart \
   -H "Authorization: Bearer your-secret-token"
 
 # Check status
-curl -X POST http://localhost:8080/dstack-agent/status \
+curl -k -X POST https://localhost:8080/dstack-agent/status \
   -H "Authorization: Bearer your-secret-token"
 ```
 
@@ -292,23 +292,38 @@ Checkout a specific git tag.
 | `TLS_CERT_SERVICE` | No | `dstack/certbot` | `container` mode: compose `<project>/<service>` whose container holds the certificate |
 | `TLS_CERT_DIR` | No | `/etc/letsencrypt/live/completions.near.ai` | `container` mode: directory with `fullchain.pem` and `privkey.pem` |
 | `TLS_CERT_FILE`, `TLS_KEY_FILE` | `files` mode | - | PEM certificate chain and private key |
+| `TLS_PLAIN_HTTP` | No | `enforce` | What to do with plain-HTTP requests other than the two allowed routes: `enforce` (refuse with 403), `log` (serve, but log what would be refused) or `allow` (serve everything). Unknown values mean `enforce` (see [TLS](#tls)) |
 
 ## TLS
 
 Port 8080 serves both TLS and plain HTTP. Each connection is routed by its first byte: a TLS
-ClientHello starts with `0x16`, which no HTTP request does. Remote clients should use
-`https://`. Plain HTTP remains for local callers inside the CVM (the launcher health check, the
-attestation fetch from the model proxies).
+ClientHello starts with `0x16`, which no HTTP request does. Clients should use `https://`.
+
+Over plain HTTP only two unauthenticated routes are served: `GET /version` and
+`GET /v1/attestation/report` (for an in-host health check and attestation clients). A plain-HTTP
+request is served only if it is a `GET` for exactly one of those paths (the query string is
+ignored) and carries no `Authorization` header. Everything else, including `HEAD`, other paths and
+any request with an `Authorization` header, gets `403 Forbidden` with the body `https required`
+before any handler runs, so bearer tokens are never accepted in the clear. TLS connections are
+not affected.
+
+`TLS_PLAIN_HTTP` controls this: `enforce` (default; unset, empty or unknown values also mean
+`enforce`), `log` (serve everything but log the requests that would be refused) or `allow` (no
+restriction). Refusals are logged at warn level with the method, a fixed route label, whether an
+`Authorization` header was present and the mode, at most one line per second. In `log` mode the
+line carries `decision=would_refuse` instead of a status. If the bearer token was ever sent over
+plain HTTP, rotate it (see [Authentication & token rotation](#authentication--token-rotation)).
 
 The certificate is the one the CVM already maintains: by default compose-manager copies
 `fullchain.pem` and `privkey.pem` out of the certbot container with `docker cp -L`, so no extra
 volume mount is needed. It is re-read every 6 hours to pick up renewals (every minute until the
-first successful load). If no certificate can be loaded, or `TLS_MODE` is invalid, the port serves
-plain HTTP only and logs an error; startup never fails because of TLS.
+first successful load). If no certificate can be loaded, only the two plain-HTTP routes above
+work until one loads (unless `TLS_PLAIN_HTTP=allow`); startup never fails because of TLS.
 
-Requests that carry an `Authorization` header over plain HTTP are logged as
-`plain-http authenticated request` with the peer address, so callers that still need to move to
-`https://` show up in the logs.
+`TLS_MODE=off`, or an invalid TLS configuration, means TLS is never available, so with the default
+policy every authenticated route is refused. An error is logged at startup in that case. For
+local development, run with `TLS_MODE=off` and `TLS_PLAIN_HTTP=allow`, set in the container
+environment.
 
 ```bash
 curl https://<host-name>:8080/version
@@ -360,33 +375,33 @@ cargo run --release
 
 ```bash
 # Checkout a tag
-curl -X POST http://localhost:8080/git/checkout \
+curl -k -X POST https://localhost:8080/git/checkout \
   -H "Authorization: Bearer your-secret-token" \
   -H "Content-Type: application/json" \
   -d '{"tag": "v1.0.0"}'
 
 # Start containers (default compose file)
-curl -X POST http://localhost:8080/compose/up \
+curl -k -X POST https://localhost:8080/compose/up \
   -H "Authorization: Bearer your-secret-token"
 
 # Start containers (specific compose file)
-curl -X POST http://localhost:8080/compose/up \
+curl -k -X POST https://localhost:8080/compose/up \
   -H "Authorization: Bearer your-secret-token" \
   -H "Content-Type: application/json" \
   -d '{"file": "docker-compose.prod.yml"}'
 
 # Stop containers
-curl -X POST http://localhost:8080/compose/down \
+curl -k -X POST https://localhost:8080/compose/down \
   -H "Authorization: Bearer your-secret-token"
 
 # Stop containers and remove volumes
-curl -X POST http://localhost:8080/compose/down \
+curl -k -X POST https://localhost:8080/compose/down \
   -H "Authorization: Bearer your-secret-token" \
   -H "Content-Type: application/json" \
   -d '{"volumes": true}'
 
 # Clean up unused volumes and images
-curl -X POST http://localhost:8080/docker/clean \
+curl -k -X POST https://localhost:8080/docker/clean \
   -H "Authorization: Bearer your-secret-token" \
   -H "Content-Type: application/json" \
   -d '{"volumes": true, "images": true}'

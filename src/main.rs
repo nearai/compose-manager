@@ -4378,9 +4378,15 @@ async fn main() -> Result<()> {
     // TLS and plain HTTP share port 8080; see src/tls.rs. A missing or
     // unreadable certificate only disables TLS, never the server.
     let tls_source = tls::Source::from_env().unwrap_or_else(|e| {
-        error!(error = %format!("{e:#}"), "invalid TLS configuration; serving plain HTTP only");
+        error!(error_kind = tls::error_kind(&e), "invalid TLS configuration; TLS is off");
         tls::Source::Off
     });
+    let plain_http = tls::PlainHttp::from_env();
+    if tls_source == tls::Source::Off && plain_http == tls::PlainHttp::Enforce {
+        error!("plain HTTP policy is enforce and TLS is off: authenticated routes are refused; set TLS_PLAIN_HTTP=allow only for local development");
+    } else if tls_source == tls::Source::Off {
+        warn!("TLS is off and the plain HTTP policy is not enforce: authenticated requests are served over plain HTTP");
+    }
     let acceptor = tls::start(tls_source.clone()).await;
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
     info!(
@@ -4388,7 +4394,7 @@ async fn main() -> Result<()> {
         tls_loaded = acceptor.is_loaded(),
         "Server listening on port 8080 (TLS and plain HTTP)"
     );
-    tls::serve(listener, app, acceptor).await?;
+    tls::serve(listener, app, acceptor, plain_http).await?;
 
     Ok(())
 }
