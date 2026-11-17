@@ -69,13 +69,39 @@ jobs:
             echo "compose-manager-launcher:${tag} = sha256:${digest}"
           done
 
+      - name: Define otelcol tag helper
+        run: |
+          # The otelcol :prod and :latest tags only exist after the first full
+          # promote.yml run. Record a missing tag as "absent" so this
+          # compose-manager-only promotion still works before then; any other
+          # registry error still fails the run.
+          cat > "$RUNNER_TEMP/otelcol_tag.sh" <<'EOF'
+          otelcol_tag_digest() {
+            local tag="$1" manifest code
+            manifest="$RUNNER_TEMP/otelcol-${tag}.manifest"
+            if skopeo inspect --raw "docker://${REGISTRY}/${OTELCOL_IMAGE_REPOSITORY}:${tag}" > "$manifest"; then
+              echo "sha256:$(sha256sum "$manifest" | cut -d' ' -f1)"
+              return 0
+            fi
+            code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 --retry 2 --retry-delay 2 \
+              "https://hub.docker.com/v2/namespaces/${OTELCOL_IMAGE_REPOSITORY%%/*}/repositories/${OTELCOL_IMAGE_REPOSITORY#*/}/tags/${tag}")
+            if [ "$code" = "404" ]; then
+              echo "absent"
+              return 0
+            fi
+            echo "::error::Could not read compose-manager-otelcol:${tag} (Docker Hub tag API returned ${code})" >&2
+            return 1
+          }
+          EOF
+
       - name: Record otelcol tags (must not change)
         run: |
           set -euo pipefail
+          source "$RUNNER_TEMP/otelcol_tag.sh"
           for tag in prod latest; do
-            digest=$(skopeo inspect --raw "docker://${{ env.REGISTRY }}/${{ env.OTELCOL_IMAGE_REPOSITORY }}:${tag}" | sha256sum | cut -d' ' -f1)
-            echo "OTELCOL_${tag^^}_BEFORE=sha256:${digest}" >> "$GITHUB_ENV"
-            echo "compose-manager-otelcol:${tag} = sha256:${digest}"
+            digest=$(otelcol_tag_digest "$tag")
+            echo "OTELCOL_${tag^^}_BEFORE=${digest}" >> "$GITHUB_ENV"
+            echo "compose-manager-otelcol:${tag} = ${digest}"
           done
 
       - name: Resolve staging digest and source SHA
@@ -153,9 +179,11 @@ jobs:
               exit 1
             fi
           done
+          source "$RUNNER_TEMP/otelcol_tag.sh"
           for tag in prod latest; do
             before_var="OTELCOL_${tag^^}_BEFORE"
-            after="sha256:$(skopeo inspect --raw "docker://${{ env.REGISTRY }}/${{ env.OTELCOL_IMAGE_REPOSITORY }}:${tag}" | sha256sum | cut -d' ' -f1)"
+            # An absent tag must still be absent.
+            after=$(otelcol_tag_digest "$tag")
             if [ "$after" != "${!before_var}" ]; then
               echo "::error::compose-manager-otelcol:${tag} changed from ${!before_var} to ${after}"
               exit 1

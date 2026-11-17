@@ -502,7 +502,10 @@ compose decides which user runs it. `build.yml` builds it on every push, signs i
 (keyless), attaches build provenance and pushes `:staging` plus an immutable
 `staging-<date>-<sha>` tag, exactly like the launcher image. `promote.yml` and `rollback.yml` retag
 it together with the other images; `promote-compose-manager.yml` leaves it untouched and fails if
-its `:prod` or `:latest` digest changes. CI runs `otelcol-contrib validate` against `config.yaml`
+its `:prod` or `:latest` digest changes. Until the first `promote.yml` run creates those tags,
+`promote-compose-manager.yml` records them as absent and fails if either appears, and
+`rollback.yml` leaves the collector's tags alone when the target `prod-*` tag has no collector
+image. Any registry error other than a missing tag still fails both workflows. CI runs `otelcol-contrib validate` against `config.yaml`
 in the pinned image with dummy values, and `otelcol/check_config.py`, which pins what the config
 must and must not do:
 
