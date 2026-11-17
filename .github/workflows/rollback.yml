@@ -24,6 +24,7 @@ env:
   REGISTRY: docker.io
   IMAGE_REPOSITORY: ${{ vars.DOCKER_REGISTRY_USER }}/compose-manager
   LAUNCHER_IMAGE_REPOSITORY: ${{ vars.DOCKER_REGISTRY_USER }}/compose-manager-launcher
+  OTELCOL_IMAGE_REPOSITORY: ${{ vars.DOCKER_REGISTRY_USER }}/compose-manager-otelcol
 
 jobs:
   rollback-prod:
@@ -63,10 +64,31 @@ jobs:
           set -euo pipefail
           CM_IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}"
           LAUNCHER_IMAGE="${{ env.REGISTRY }}/${{ env.LAUNCHER_IMAGE_REPOSITORY }}"
+          OTELCOL_IMAGE="${{ env.REGISTRY }}/${{ env.OTELCOL_IMAGE_REPOSITORY }}"
           TARGET_TAG="$TARGET_TAG_INPUT"
+
+          # Prints the otelcol tag's digest, or "absent" when Docker Hub reports
+          # that the tag does not exist. Fails on any other registry error.
+          otelcol_tag_digest() {
+            local tag="$1" digest code
+            digest=$(skopeo inspect "docker://${OTELCOL_IMAGE}:${tag}" | jq -r '.Digest' || true)
+            if [ -n "$digest" ] && [ "$digest" != "null" ]; then
+              echo "$digest"
+              return 0
+            fi
+            code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 --retry 2 --retry-delay 2 \
+              "https://hub.docker.com/v2/namespaces/${{ vars.DOCKER_REGISTRY_USER }}/repositories/compose-manager-otelcol/tags/${tag}")
+            if [ "$code" = "404" ]; then
+              echo "absent"
+              return 0
+            fi
+            echo "::error::Could not read compose-manager-otelcol:${tag} (Docker Hub tag API returned ${code})" >&2
+            return 1
+          }
 
           CM_CURRENT_DIGEST=$(skopeo inspect "docker://${CM_IMAGE}:prod" 2>/dev/null | jq -r '.Digest' || true)
           LAUNCHER_CURRENT_DIGEST=$(skopeo inspect "docker://${LAUNCHER_IMAGE}:prod" 2>/dev/null | jq -r '.Digest' || true)
+          OTELCOL_CURRENT_DIGEST=$(otelcol_tag_digest prod)
           if [ -z "$CM_CURRENT_DIGEST" ] || [ "$CM_CURRENT_DIGEST" = "null" ]; then
             echo "::error::Failed to inspect current compose-manager :prod digest."
             exit 1
@@ -104,6 +126,7 @@ jobs:
 
           CM_TARGET_DIGEST=$(skopeo inspect "docker://${CM_IMAGE}:${TARGET_TAG}" 2>/dev/null | jq -r '.Digest' || true)
           LAUNCHER_TARGET_DIGEST=$(skopeo inspect "docker://${LAUNCHER_IMAGE}:${TARGET_TAG}" 2>/dev/null | jq -r '.Digest' || true)
+          OTELCOL_TARGET_DIGEST=$(otelcol_tag_digest "$TARGET_TAG")
           if [ -z "$CM_TARGET_DIGEST" ] || [ "$CM_TARGET_DIGEST" = "null" ]; then
             echo "::error::compose-manager tag ${TARGET_TAG} not found"
             exit 1
@@ -112,27 +135,45 @@ jobs:
             echo "::error::compose-manager-launcher tag ${TARGET_TAG} not found"
             exit 1
           fi
-          if [ "$CM_TARGET_DIGEST" = "$CM_CURRENT_DIGEST" ] && [ "$LAUNCHER_TARGET_DIGEST" = "$LAUNCHER_CURRENT_DIGEST" ]; then
-            echo "::error::Target tag ${TARGET_TAG} already matches current :prod for both images."
+          # Tags from before the otelcol image existed have no otelcol
+          # counterpart. Those launchers do not run it, so leave its tags as
+          # they are and roll back the other two images.
+          if [ "$OTELCOL_TARGET_DIGEST" = "absent" ]; then
+            OTELCOL_ROLLBACK=false
+            echo "::warning::compose-manager-otelcol has no ${TARGET_TAG} tag; leaving its :prod (${OTELCOL_CURRENT_DIGEST}) unchanged."
+          else
+            OTELCOL_ROLLBACK=true
+          fi
+          if [ "$CM_TARGET_DIGEST" = "$CM_CURRENT_DIGEST" ] && [ "$LAUNCHER_TARGET_DIGEST" = "$LAUNCHER_CURRENT_DIGEST" ] && { [ "$OTELCOL_ROLLBACK" = false ] || [ "$OTELCOL_TARGET_DIGEST" = "$OTELCOL_CURRENT_DIGEST" ]; }; then
+            echo "::error::Target tag ${TARGET_TAG} already matches current :prod for all images."
             exit 1
           fi
 
           AUDIT_TAG="prod-rollback-$(date -u +%Y%m%d-%H%M%S)-from-${TARGET_TAG#prod-}"
           echo "cm_image=${CM_IMAGE}" >> "$GITHUB_OUTPUT"
           echo "launcher_image=${LAUNCHER_IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "otelcol_image=${OTELCOL_IMAGE}" >> "$GITHUB_OUTPUT"
           echo "target_tag=${TARGET_TAG}" >> "$GITHUB_OUTPUT"
           echo "cm_target_digest=${CM_TARGET_DIGEST}" >> "$GITHUB_OUTPUT"
           echo "launcher_target_digest=${LAUNCHER_TARGET_DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "otelcol_target_digest=${OTELCOL_TARGET_DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "otelcol_rollback=${OTELCOL_ROLLBACK}" >> "$GITHUB_OUTPUT"
           echo "cm_previous_digest=${CM_CURRENT_DIGEST}" >> "$GITHUB_OUTPUT"
           echo "launcher_previous_digest=${LAUNCHER_CURRENT_DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "otelcol_previous_digest=${OTELCOL_CURRENT_DIGEST}" >> "$GITHUB_OUTPUT"
           echo "audit_tag=${AUDIT_TAG}" >> "$GITHUB_OUTPUT"
 
       - name: Verify rollback targets were built and signed by build.yml on master
         run: |
           set -euo pipefail
-          for pair in \
-            "${{ steps.resolve.outputs.cm_image }}@${{ steps.resolve.outputs.cm_target_digest }}" \
-            "${{ steps.resolve.outputs.launcher_image }}@${{ steps.resolve.outputs.launcher_target_digest }}"; do
+          pairs=(
+            "${{ steps.resolve.outputs.cm_image }}@${{ steps.resolve.outputs.cm_target_digest }}"
+            "${{ steps.resolve.outputs.launcher_image }}@${{ steps.resolve.outputs.launcher_target_digest }}"
+          )
+          if [ "${{ steps.resolve.outputs.otelcol_rollback }}" = true ]; then
+            pairs+=("${{ steps.resolve.outputs.otelcol_image }}@${{ steps.resolve.outputs.otelcol_target_digest }}")
+          fi
+          for pair in "${pairs[@]}"; do
             cosign verify \
               --certificate-identity-regexp '^https://github\.com/nearai/compose-manager/\.github/workflows/build\.yml@refs/heads/master$' \
               --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
@@ -155,6 +196,9 @@ jobs:
 
           retag_image "${{ steps.resolve.outputs.cm_image }}" "${{ steps.resolve.outputs.cm_target_digest }}"
           retag_image "${{ steps.resolve.outputs.launcher_image }}" "${{ steps.resolve.outputs.launcher_target_digest }}"
+          if [ "${{ steps.resolve.outputs.otelcol_rollback }}" = true ]; then
+            retag_image "${{ steps.resolve.outputs.otelcol_image }}" "${{ steps.resolve.outputs.otelcol_target_digest }}"
+          fi
 
       - name: Confirm rollback tags resolve to the target digests
         run: |
@@ -174,6 +218,9 @@ jobs:
 
           confirm_image "${{ steps.resolve.outputs.cm_image }}" "${{ steps.resolve.outputs.cm_target_digest }}"
           confirm_image "${{ steps.resolve.outputs.launcher_image }}" "${{ steps.resolve.outputs.launcher_target_digest }}"
+          if [ "${{ steps.resolve.outputs.otelcol_rollback }}" = true ]; then
+            confirm_image "${{ steps.resolve.outputs.otelcol_image }}" "${{ steps.resolve.outputs.otelcol_target_digest }}"
+          fi
 
       - name: Create GitHub release
         env:
@@ -182,6 +229,20 @@ jobs:
         run: |
           set -euo pipefail
           TAG="${{ steps.resolve.outputs.audit_tag }}"
+          if [ "${{ steps.resolve.outputs.otelcol_rollback }}" = true ]; then
+            OTELCOL_NOTES=$(cat <<EOF
+          - **Image**: \`${{ steps.resolve.outputs.otelcol_image }}:prod\`
+          - **Compatibility alias**: \`${{ steps.resolve.outputs.otelcol_image }}:latest\`
+          - **Rolled back to**: \`${{ steps.resolve.outputs.otelcol_image }}:${{ steps.resolve.outputs.target_tag }}\`
+          - **Audit tag**: \`${{ steps.resolve.outputs.otelcol_image }}:${TAG}\`
+          - **New digest**: \`${{ steps.resolve.outputs.otelcol_target_digest }}\`
+          - **Previous digest**: \`${{ steps.resolve.outputs.otelcol_previous_digest }}\`
+          - **Sigstore**: https://search.sigstore.dev/?hash=${{ steps.resolve.outputs.otelcol_target_digest }}
+          EOF
+            )
+          else
+            OTELCOL_NOTES="- Not rolled back: no \`${{ steps.resolve.outputs.target_tag }}\` tag. \`:prod\` stays \`${{ steps.resolve.outputs.otelcol_previous_digest }}\`."
+          fi
           NOTES=$(cat <<EOF
           ## Production Rollback
 
@@ -202,6 +263,9 @@ jobs:
           - **New digest**: \`${{ steps.resolve.outputs.launcher_target_digest }}\`
           - **Previous digest**: \`${{ steps.resolve.outputs.launcher_previous_digest }}\`
           - **Sigstore**: https://search.sigstore.dev/?hash=${{ steps.resolve.outputs.launcher_target_digest }}
+
+          ### compose-manager-otelcol
+          ${OTELCOL_NOTES}
           EOF
           )
           if gh release view "$TAG" >/dev/null 2>&1; then
@@ -222,6 +286,14 @@ jobs:
             echo "### compose-manager-launcher"
             echo "- target digest: \`${{ steps.resolve.outputs.launcher_target_digest }}\`"
             echo "- previous digest: \`${{ steps.resolve.outputs.launcher_previous_digest }}\`"
+            echo ""
+            echo "### compose-manager-otelcol"
+            if [ "${{ steps.resolve.outputs.otelcol_rollback }}" = true ]; then
+              echo "- target digest: \`${{ steps.resolve.outputs.otelcol_target_digest }}\`"
+            else
+              echo "- not rolled back (no \`${{ steps.resolve.outputs.target_tag }}\` tag)"
+            fi
+            echo "- previous digest: \`${{ steps.resolve.outputs.otelcol_previous_digest }}\`"
             echo ""
             echo "- audit tag: \`${{ steps.resolve.outputs.audit_tag }}\`"
           } >> "$GITHUB_STEP_SUMMARY"

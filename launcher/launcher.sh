@@ -51,6 +51,25 @@ APP_COMPOSE_FILE="${LAUNCHER_APP_COMPOSE_FILE:-/dstack-app/docker-compose.yaml}"
 # token, so the stability check below cannot validate it.
 TELEMETRY_PROBE_URL="${LAUNCHER_TELEMETRY_PROBE_URL:-}"
 OTEL_STABLE_SECONDS="${LAUNCHER_OTEL_STABLE_SECONDS:-15}"
+# Signed collector image channel. Optional: when OTELCOL_IMAGE_REPO is unset
+# (or the app-compose is not mounted) the collector update is a no-op. It uses
+# the same channel tag and cosign identity as compose-manager. The CVM
+# app-compose must declare the service image as
+#   image: ${OTELCOL_MANAGEMENT_IMAGE:-<pinned repo@digest>}
+# so the digest the launcher records in $ENV_FILE takes effect.
+OTELCOL_REPO="${OTELCOL_IMAGE_REPO:-}"
+OTELCOL_IMAGE_KEY="OTELCOL_MANAGEMENT_IMAGE"
+OTELCOL_BACKOFF_SECONDS="${LAUNCHER_OTELCOL_BACKOFF_SECONDS:-1800}"
+# Restart requests: POST /admin/launcher/restart writes this file on the shared
+# work volume ({"id","target","requested_at"}); the launcher restarts the named
+# container (only the two managed ones) and reports the result in the state
+# file (restart_last_*). The request file is left in place; a request counts as
+# handled when its id equals restart_last_id.
+RESTART_REQUEST_FILE="${LAUNCHER_RESTART_REQUEST_FILE:-/app/work/launcher-restart-request.json}"
+# The launcher manages exactly these two containers and no others.
+MANAGED_CONTAINERS=(compose-manager otelcol-management)
+# Serializes image swaps, env-override applies and restarts (mkdir lock).
+LOCK_DIR="${LAUNCHER_LOCK_DIR:-${STATE_FILE}.lock}"
 # Targets in apply order, and the keys each owns. Keep in sync with: the Rust
 # KEY_TARGETS/ALLOWED_KEYS (src/env_overrides.rs), the README allowed-keys
 # table, and for compose-manager the non-plumbing substitutions in
@@ -69,11 +88,19 @@ APPLY_TOUCHED=0
 OTEL_ENV_TMP=""
 
 POLL_CYCLE=0
+# Set by read_restart_request.
+REQ_ID=""
+REQ_TARGET=""
 
 # ── Logging ───────────────────────────────────────────────────────────
 
 log()       { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] [launcher] $*"; }
 log_error() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] [launcher] ERROR: $*" >&2; }
+
+cleanup_exit() {
+    cleanup_otel_tmp
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+}
 
 # ── State management ──────────────────────────────────────────────────
 
@@ -96,6 +123,18 @@ write_state() {
     jq --arg k "$1" --arg v "$2" '.[$k] = $v' "$STATE_FILE" > "$tmp" && mv "$tmp" "$STATE_FILE"
 }
 
+# Sets several keys in one atomic file replace: write_state_many k1 v1 k2 v2 ...
+write_state_many() {
+    local tmp="${STATE_FILE}.tmp" filter="." args=() i=0
+    while [ "$#" -ge 2 ]; do
+        args+=(--arg "k${i}" "$1" --arg "v${i}" "$2")
+        filter="${filter} | .[\$k${i}] = \$v${i}"
+        i=$((i + 1))
+        shift 2
+    done
+    jq "${args[@]}" "$filter" "$STATE_FILE" > "$tmp" && mv "$tmp" "$STATE_FILE"
+}
+
 state_has_key() {
     jq -e --arg k "$1" 'has($k)' "$STATE_FILE" > /dev/null 2>&1
 }
@@ -115,6 +154,13 @@ write_env_var() {
     else
         printf '%s=%s\n' "$key" "$value" >> "$ENV_FILE"
     fi
+}
+
+remove_env_var() {
+    local key="$1" tmp="${ENV_FILE}.tmp"
+    [ -f "$ENV_FILE" ] || return 0
+    grep -v "^${key}=" "$ENV_FILE" > "$tmp" || true
+    mv "$tmp" "$ENV_FILE"
 }
 
 # ── Registry helpers ──────────────────────────────────────────────────
@@ -219,6 +265,23 @@ wait_for_healthy() {
     done
     log_error "Health check failed after ${timeout}s"
     return 1
+}
+
+# ── Serialization ─────────────────────────────────────────────────────
+
+# The launcher is one sequential loop, so image swaps, env-override applies and
+# restarts cannot overlap by construction. This lock makes that explicit and
+# guards against re-entry: a nested call finds the lock taken and skips (the
+# next tick picks the work up).
+with_lock() {
+    local rc=0
+    if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+        log "Another launcher operation is in progress; skipping ${1}"
+        return 75
+    fi
+    "$@" || rc=$?
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+    return "$rc"
 }
 
 # ── Compose helper ────────────────────────────────────────────────────
@@ -425,12 +488,25 @@ wait_for_otel_stable() {
     return 0
 }
 
+# The recorded collector image as an env line (OTELCOL_MANAGEMENT_IMAGE=ref),
+# or nothing when none is recorded or the value is malformed.
+otel_image_line() {
+    local v
+    v="$(grep "^${OTELCOL_IMAGE_KEY}=" "$ENV_FILE" 2>/dev/null | head -n1 | cut -d= -f2-)" || v=""
+    if [[ "$v" =~ ^[a-z0-9][a-z0-9._/:-]*@sha256:[0-9a-f]{64}$ ]]; then
+        printf '%s=%s\n' "$OTELCOL_IMAGE_KEY" "$v"
+    fi
+    return 0
+}
+
 # Recreates otelcol-management from the app-compose with the base env plus a
-# temporary 0600 env file holding ONLY this target's lines (taken from $1).
-# Neither .env.launcher nor the full overrides file is passed.
+# temporary 0600 env file holding ONLY this target's override lines (taken from
+# $1) and the recorded collector image. Neither .env.launcher nor the full
+# overrides file is passed. "force" adds --force-recreate.
 apply_otelcol_target() {
     local file="$1" rc dir envtmp
-    local args=()
+    local args=() up_flags=(-d --no-deps)
+    [ "${2:-}" = "force" ] && up_flags=(-d --no-deps --force-recreate)
     dir="$(dirname "$OVERRIDES_FILE")"
     if ! envtmp="$(umask 077; mktemp "${dir}/.otel-env.XXXXXX")"; then
         APPLY_REASON="could not create a temporary env file in ${dir}"
@@ -439,10 +515,11 @@ apply_otelcol_target() {
     OTEL_ENV_TMP="$envtmp"
     chmod 600 "$envtmp"
     target_lines otelcol-management "$file" > "$envtmp"
+    otel_image_line >> "$envtmp"
     [ -f "$BASE_ENV_FILE" ] && args+=(--env-file "$BASE_ENV_FILE")
     args+=(--env-file "$envtmp")
     APPLY_TOUCHED=1
-    docker compose -p "$COMPOSE_PROJECT" -f "$APP_COMPOSE_FILE" "${args[@]}" up -d --no-deps otelcol-management > /dev/null 2>&1 && rc=0 || rc=$?
+    docker compose -p "$COMPOSE_PROJECT" -f "$APP_COMPOSE_FILE" "${args[@]}" up "${up_flags[@]}" otelcol-management > /dev/null 2>&1 && rc=0 || rc=$?
     cleanup_otel_tmp
     if [ "$rc" -ne 0 ]; then
         APPLY_REASON="docker compose up failed for otelcol-management"
@@ -580,7 +657,9 @@ rollback_env_overrides() {
 # that have keys are re-applied even if the hash matches (used at bootstrap:
 # after a CVM reboot dstack recreates the containers from the app-compose
 # WITHOUT overrides). Independent of the image-update backoff.
-apply_env_overrides() {
+apply_env_overrides() { with_lock _apply_env_overrides "$@"; }
+
+_apply_env_overrides() {
     local force="${1:-}" snap="${OVERRIDES_LAST_GOOD}.candidate"
     local tick_hash reason t hash
     local todo=()
@@ -664,6 +743,270 @@ bootstrap_env_overrides() {
     fi
 }
 
+# ── Collector image update (otelcol-management) ──────────────────────
+
+# Prints why the collector update is off and returns 0, or returns 1 when on.
+otelcol_disabled_reason() {
+    if [ -z "$OTELCOL_REPO" ]; then
+        echo "OTELCOL_IMAGE_REPO is not set"
+        return 0
+    fi
+    if [ ! -r "$APP_COMPOSE_FILE" ]; then
+        echo "app-compose is not mounted at ${APP_COMPOSE_FILE}"
+        return 0
+    fi
+    return 1
+}
+
+# Records the collector update status in the state file, logging only when it
+# changes (so a disabled launcher reports it once, not every poll).
+otelcol_note_status() {
+    if [ "$(read_state otelcol_status)" != "$1" ]; then
+        log "Collector image update: $1"
+        write_state otelcol_status "$1"
+    fi
+}
+
+# Recreates only otelcol-management with the recorded image and the current
+# (valid) overrides. Sets APPLY_REASON on failure.
+otelcol_recreate() {
+    local file="$OVERRIDES_FILE"
+    if [ -s "$file" ] && ! validate_overrides_file > /dev/null; then
+        file=/dev/null
+    fi
+    apply_otelcol_target "$file" force
+}
+
+otelcol_record_failure() {
+    local backoff_epoch
+    backoff_epoch=$(( $(date +%s) + OTELCOL_BACKOFF_SECONDS ))
+    write_state_many otelcol_error "$1" otelcol_backoff_until_epoch "$backoff_epoch"
+    log "Collector update backoff until epoch ${backoff_epoch}"
+}
+
+# Puts the previous image value back (or none, so the app-compose default
+# applies), recreates, and records the failure plus backoff.
+otelcol_rollback() {
+    local old_image="$1" new_digest="$2" reason="$3" critical=""
+    log_error "Collector update to ${new_digest:0:19} failed: ${reason} — restoring the previous image"
+    if [ -n "$old_image" ]; then
+        write_env_var "$OTELCOL_IMAGE_KEY" "$old_image"
+    else
+        remove_env_var "$OTELCOL_IMAGE_KEY"
+    fi
+    if otelcol_recreate; then
+        log "Collector rollback successful"
+    else
+        critical=" CRITICAL: otelcol-management unhealthy after the rollback (${APPLY_REASON})."
+        log_error "CRITICAL: collector rollback also failed — manual intervention required"
+    fi
+    otelcol_record_failure "update to ${new_digest:0:19} failed: ${reason}; previous image restored.${critical}"
+}
+
+_poll_otelcol() {
+    local reason remote_digest current_digest image_ref old_image backoff_until
+    if reason="$(otelcol_disabled_reason)"; then
+        otelcol_note_status "disabled: ${reason}"
+        return 0
+    fi
+    otelcol_note_status "enabled"
+
+    backoff_until="$(read_state otelcol_backoff_until_epoch)"
+    if [ -n "$backoff_until" ]; then
+        if [ "$(date +%s)" -lt "$backoff_until" ]; then
+            log "Collector update in backoff (until epoch ${backoff_until}), skipping"
+            return 0
+        fi
+        write_state otelcol_backoff_until_epoch ""
+        log "Collector backoff expired, resuming"
+    fi
+
+    remote_digest="$(fetch_remote_digest "$OTELCOL_REPO" "$CHANNEL")"
+    if [ -z "$remote_digest" ]; then
+        log_error "Failed to fetch remote digest for ${OTELCOL_REPO}:${CHANNEL}"
+        return 1
+    fi
+    if ! valid_digest "$remote_digest"; then
+        log_error "Collector digest has unexpected format: '${remote_digest}'"
+        return 1
+    fi
+    current_digest="$(read_state otelcol_digest)"
+    if [ "$remote_digest" = "$current_digest" ]; then
+        log "Collector up to date (${remote_digest:0:19}...)"
+        return 0
+    fi
+
+    log "New collector image detected: ${remote_digest} (current: ${current_digest:-unknown})"
+    image_ref="${OTELCOL_REPO}@${remote_digest}"
+    old_image="$(grep "^${OTELCOL_IMAGE_KEY}=" "$ENV_FILE" 2>/dev/null | head -n1 | cut -d'=' -f2- || echo "")"
+
+    # The service must exist in the app-compose before anything is pulled.
+    if ! otel_preflight /dev/null; then
+        log_error "Collector update skipped: ${APPLY_REASON}"
+        otelcol_record_failure "update skipped: ${APPLY_REASON}"
+        return 1
+    fi
+    log "Pulling ${image_ref}..."
+    if ! docker pull "$image_ref"; then
+        log_error "Pull failed for ${image_ref}"
+        return 1
+    fi
+    if ! verify_attestation "$image_ref"; then
+        log_error "Attestation failed — skipping collector update"
+        return 1
+    fi
+
+    write_env_var "$OTELCOL_IMAGE_KEY" "$image_ref"
+    log "Applying collector update..."
+    if otelcol_recreate; then
+        write_state_many otelcol_digest "$remote_digest" \
+            otelcol_last_update "$(date -u +%Y-%m-%dT%H:%M:%SZ)" otelcol_error ""
+        log "Collector update successful: ${remote_digest}"
+    else
+        otelcol_rollback "$old_image" "$remote_digest" "$APPLY_REASON"
+        return 1
+    fi
+}
+
+_poll_all() {
+    local rc=0
+    with_lock _poll_compose_manager || rc=1
+    with_lock _poll_otelcol || rc=1
+    return "$rc"
+}
+
+# Startup: seed the collector baseline from the running container, or re-apply
+# the recorded image (a CVM reboot recreates the container from the app-compose
+# default, dropping the signed image). Skipped when overrides were just applied
+# with the image included (the running image then already matches).
+bootstrap_otelcol() {
+    local reason current ref running config_image digest
+    if reason="$(otelcol_disabled_reason)"; then
+        otelcol_note_status "disabled: ${reason}"
+        return 0
+    fi
+    otelcol_note_status "enabled"
+    running="$(docker inspect otelcol-management --format '{{.Config.Image}}' 2>/dev/null || true)"
+    current="$(read_state otelcol_digest)"
+    if [ -z "$current" ]; then
+        config_image="$running"
+        case "$config_image" in
+            "${OTELCOL_REPO}@sha256:"*)
+                digest="${config_image##*@}"
+                if valid_digest "$digest"; then
+                    write_state otelcol_digest "$digest"
+                    write_env_var "$OTELCOL_IMAGE_KEY" "$config_image"
+                    log "Seeded collector digest from running container: ${config_image}"
+                fi
+                ;;
+            *) log "Could not resolve a collector digest from the running container — will deploy on first poll" ;;
+        esac
+        return 0
+    fi
+    ref="${OTELCOL_REPO}@${current}"
+    write_env_var "$OTELCOL_IMAGE_KEY" "$ref"
+    if [ "$running" = "$ref" ]; then
+        log "Collector already runs the recorded image (${current:0:19}...)"
+        return 0
+    fi
+    log "Re-applying the recorded collector image ${ref}"
+    if otel_preflight /dev/null && otelcol_recreate; then
+        log "Recorded collector image re-applied"
+        return 0
+    fi
+    reason="$APPLY_REASON"
+    log_error "Re-applying the recorded collector image failed (${reason}) — reverting to the app-compose image"
+    remove_env_var "$OTELCOL_IMAGE_KEY"
+    otelcol_recreate || log_error "CRITICAL: otelcol-management unhealthy after reverting — manual intervention required"
+    write_state otelcol_digest ""
+    otelcol_record_failure "re-applying the recorded image after a restart failed: ${reason}"
+}
+
+# ── Restart requests ──────────────────────────────────────────────────
+
+is_managed_container() {
+    local c
+    for c in "${MANAGED_CONTAINERS[@]}"; do
+        [ "$c" = "$1" ] && return 0
+    done
+    return 1
+}
+
+# restart_finish ID TARGET OUTCOME REASON — outcome: ok | failed | rejected |
+# abandoned. The id is written with the rest in one atomic state update.
+restart_finish() {
+    write_state_many restart_supported "1" restart_last_target "$2" \
+        restart_last_outcome "$3" restart_last_reason "$4" \
+        restart_last_finished_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" restart_last_id "$1"
+    log "Restart request ${1}: target=${2} outcome=${3}${4:+ (${4})}"
+}
+
+# Reads the request file into REQ_ID / REQ_TARGET. A malformed file gets a
+# synthetic id (sha256 prefix) so it is rejected once, not on every tick.
+read_restart_request() {
+    local fid
+    REQ_ID=""; REQ_TARGET=""
+    [ -s "$RESTART_REQUEST_FILE" ] || return 1
+    REQ_ID="$(jq -r '.id | strings' "$RESTART_REQUEST_FILE" 2>/dev/null)" || REQ_ID=""
+    REQ_TARGET="$(jq -r '.target | strings' "$RESTART_REQUEST_FILE" 2>/dev/null)" || REQ_TARGET=""
+    if ! [[ "$REQ_ID" =~ ^[A-Za-z0-9-]{8,64}$ ]]; then
+        fid="$(sha256sum "$RESTART_REQUEST_FILE" | cut -c1-12)"
+        REQ_ID="invalid-${fid}"
+        REQ_TARGET=""
+    fi
+    return 0
+}
+
+_process_restart_request() {
+    local safe_target reason
+    read_restart_request || return 0
+    [ "$REQ_ID" != "$(read_state restart_last_id)" ] || return 0
+
+    if ! is_managed_container "$REQ_TARGET"; then
+        # Log a sanitized, bounded copy of the name only.
+        safe_target="$(printf '%s' "$REQ_TARGET" | LC_ALL=C tr -cd 'A-Za-z0-9._-' | cut -c1-64)"
+        log_error "Rejected restart request ${REQ_ID}: target '${safe_target}' is not a managed container"
+        restart_finish "$REQ_ID" "$safe_target" rejected "target is not a managed container"
+        return 0
+    fi
+
+    log "Restarting ${REQ_TARGET} (request ${REQ_ID})"
+    APPLY_REASON=""
+    if ! docker restart "$REQ_TARGET" > /dev/null 2>&1; then
+        restart_finish "$REQ_ID" "$REQ_TARGET" failed "docker restart failed"
+        return 0
+    fi
+    case "$REQ_TARGET" in
+        compose-manager)
+            if wait_for_healthy "$HEALTH_TIMEOUT"; then
+                restart_finish "$REQ_ID" "$REQ_TARGET" ok ""
+            else
+                restart_finish "$REQ_ID" "$REQ_TARGET" failed "compose-manager did not become healthy after the restart"
+            fi
+            ;;
+        otelcol-management)
+            if wait_for_otel_stable; then
+                restart_finish "$REQ_ID" "$REQ_TARGET" ok ""
+            else
+                reason="${APPLY_REASON:-otelcol-management is not stable after the restart}"
+                restart_finish "$REQ_ID" "$REQ_TARGET" failed "$reason"
+            fi
+            ;;
+    esac
+}
+
+process_restart_request() { with_lock _process_restart_request; }
+
+# A request left over from before this launcher started (for example across a
+# CVM reboot) is closed as abandoned instead of restarting a container later.
+bootstrap_restart_requests() {
+    write_state restart_supported "1"
+    read_restart_request || return 0
+    if [ "$REQ_ID" != "$(read_state restart_last_id)" ]; then
+        restart_finish "$REQ_ID" "$(printf '%s' "$REQ_TARGET" | LC_ALL=C tr -cd 'A-Za-z0-9._-' | cut -c1-64)" abandoned "launcher started before the request was processed"
+    fi
+}
+
 # Sleeps up to POLL_INTERVAL in ENV_WATCH_INTERVAL steps, checking the overrides
 # file after each step. Keeps the image-poll cadence at POLL_INTERVAL.
 wait_with_env_watch() {
@@ -684,6 +1027,7 @@ wait_with_env_watch() {
         sleep "$step"
         waited=$((waited + step))
         apply_env_overrides || log_error "Env overrides check failed"
+        process_restart_request || log_error "Restart request check failed"
     done
 }
 
@@ -778,7 +1122,10 @@ bootstrap() {
 _poll_cycle() {
     POLL_CYCLE=$((POLL_CYCLE + 1))
     log "Poll cycle #${POLL_CYCLE} (${IMAGE_REPO}:${CHANNEL})"
+    _poll_all
+}
 
+_poll_compose_manager() {
     # Backoff check
     local backoff_until_epoch; backoff_until_epoch="$(read_state "backoff_until_epoch")"
     if [ -n "$backoff_until_epoch" ]; then
@@ -855,12 +1202,17 @@ main() {
     log "  state:       ${STATE_FILE}"
     log "  overrides:   ${OVERRIDES_FILE} (watch ${ENV_WATCH_INTERVAL}s)"
     log "  app-compose: ${APP_COMPOSE_FILE}"
+    log "  collector:   ${OTELCOL_REPO:-<disabled>}"
+    log "  restart req: ${RESTART_REQUEST_FILE}"
 
-    trap cleanup_otel_tmp EXIT
+    trap cleanup_exit EXIT
     init_state
+    rmdir "$LOCK_DIR" 2>/dev/null || true
     docker_login
     bootstrap
     bootstrap_env_overrides || log_error "Bootstrap env overrides apply failed"
+    with_lock bootstrap_otelcol || log_error "Bootstrap collector image apply failed"
+    bootstrap_restart_requests || log_error "Bootstrap restart requests failed"
 
     log "Entering poll loop"
     while true; do

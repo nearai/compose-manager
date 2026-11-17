@@ -30,6 +30,7 @@ use tokio::{
 use tracing::{error, info, warn};
 
 mod env_overrides;
+mod launcher_restart;
 mod tls;
 
 // --- Vendored dstack client (lightweight, avoids pulling in alloy) ---
@@ -4290,6 +4291,10 @@ async fn main() -> Result<()> {
         .route("/dstack-agent/:action", post(dstack_agent_action))
         .route("/admin/kernel/algif-blacklist", post(algif_blacklist_action))
         .route("/admin/env", get(env_overrides::get_env).put(env_overrides::put_env))
+        .route(
+            "/admin/launcher/restart",
+            get(launcher_restart::get_restart).post(launcher_restart::post_restart),
+        )
         .route("/v1/attestation/report", get(attestation_report))
         .route("/version", get(version))
         .with_state(state);
