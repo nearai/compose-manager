@@ -183,7 +183,15 @@ jobs:
           SHORT_SHA=$(echo "${GITHUB_SHA}" | cut -c1-7)
           STAMP=$(date -u +%Y%m%d)
           STAGING_STAMPED_REF="${{ env.REGISTRY }}/${{ env.LAUNCHER_IMAGE_REPOSITORY }}:staging-${STAMP}-${SHORT_SHA}"
-          skopeo copy "docker://${{ env.REGISTRY }}/${{ env.LAUNCHER_IMAGE_REPOSITORY }}@${{ steps.build.outputs.digest }}" "docker://${STAGING_STAMPED_REF}"
+          BUILD_DIGEST="${{ steps.build.outputs.digest }}"
+          # --all copies the whole image index, so the stamped tag keeps the
+          # digest the signature was made on.
+          skopeo copy --all "docker://${{ env.REGISTRY }}/${{ env.LAUNCHER_IMAGE_REPOSITORY }}@${BUILD_DIGEST}" "docker://${STAGING_STAMPED_REF}"
+          STAMPED_DIGEST=$(skopeo inspect --raw "docker://${STAGING_STAMPED_REF}" | sha256sum | cut -d' ' -f1)
+          if [ "${STAMPED_DIGEST}" != "${BUILD_DIGEST#sha256:}" ]; then
+            echo "::error::Stamped tag digest sha256:${STAMPED_DIGEST} does not match build digest ${BUILD_DIGEST}"
+            exit 1
+          fi
           echo "LAUNCHER_STAGING_STAMPED_REFERENCE=${STAGING_STAMPED_REF}" >> "$GITHUB_ENV"
 
       - name: Generate build summary
@@ -271,7 +279,15 @@ jobs:
           SHORT_SHA=$(echo "${GITHUB_SHA}" | cut -c1-7)
           STAMP=$(date -u +%Y%m%d)
           STAGING_STAMPED_REF="${{ env.REGISTRY }}/${{ env.OTELCOL_IMAGE_REPOSITORY }}:staging-${STAMP}-${SHORT_SHA}"
-          skopeo copy "docker://${{ env.REGISTRY }}/${{ env.OTELCOL_IMAGE_REPOSITORY }}@${{ steps.build.outputs.digest }}" "docker://${STAGING_STAMPED_REF}"
+          BUILD_DIGEST="${{ steps.build.outputs.digest }}"
+          # --all copies the whole image index, so the stamped tag keeps the
+          # digest the signature was made on.
+          skopeo copy --all "docker://${{ env.REGISTRY }}/${{ env.OTELCOL_IMAGE_REPOSITORY }}@${BUILD_DIGEST}" "docker://${STAGING_STAMPED_REF}"
+          STAMPED_DIGEST=$(skopeo inspect --raw "docker://${STAGING_STAMPED_REF}" | sha256sum | cut -d' ' -f1)
+          if [ "${STAMPED_DIGEST}" != "${BUILD_DIGEST#sha256:}" ]; then
+            echo "::error::Stamped tag digest sha256:${STAMPED_DIGEST} does not match build digest ${BUILD_DIGEST}"
+            exit 1
+          fi
           echo "OTELCOL_STAGING_STAMPED_REFERENCE=${STAGING_STAMPED_REF}" >> "$GITHUB_ENV"
 
       - name: Generate build summary
