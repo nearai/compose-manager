@@ -57,5 +57,8 @@ jobs:
       - name: Check launcher syntax
         run: bash -n launcher/launcher.sh
 
+      - name: Check compose-manager logging options
+        run: python3 launcher/test/compose_logging_test.py
+
       - name: Run launcher env-override tests
         run: bash launcher/test/env_overrides_test.sh

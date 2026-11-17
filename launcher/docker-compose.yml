@@ -35,6 +35,16 @@ services:
       - ENV_FILES=/app/.env
     labels:
       com.datadoghq.ad.logs: '[{"source": "compose-manager", "service": "compose-manager"}]'
+    # Same logging options as the other management containers in the CVM app
+    # compose. The `labels` option copies these container labels into every
+    # json-file log line; the log collector uses them to name the service and
+    # drops lines without them. launcher/test/compose_logging_test.py pins this.
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "10"
+        labels: "com.datadoghq.ad.logs,com.docker.compose.service"
 
 volumes:
   work:
