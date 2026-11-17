@@ -45,3 +45,17 @@ jobs:
       - name: Run dashboard tests
         working-directory: dashboard
         run: cargo test --all-targets --locked
+
+  launcher:
+    name: Launcher checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Check launcher syntax
+        run: bash -n launcher/launcher.sh
+
+      - name: Run launcher env-override tests
+        run: bash launcher/test/env_overrides_test.sh
