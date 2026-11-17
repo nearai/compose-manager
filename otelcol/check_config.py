@@ -76,6 +76,10 @@ def check(text: str) -> list[str]:
             errors.append(f"docker_stats must enable {metric}")
     if receivers["hostmetrics/cvm"].get("root_path") != "${env:CVM_HOSTMETRICS_ROOT_PATH}":
         errors.append("hostmetrics root_path must come from CVM_HOSTMETRICS_ROOT_PATH")
+    # Dashboards and alerts count CPUs from the per-CPU system.cpu.time series.
+    cpu = (receivers["hostmetrics/cvm"].get("scrapers", {}).get("cpu") or {}).get("metrics") or {}
+    if set((cpu.get("system.cpu.time") or {}).get("attributes") or []) != {"cpu", "state"}:
+        errors.append("hostmetrics cpu must keep the cpu and state attributes on system.cpu.time")
 
     # The raw Compose config path label must be dropped before export.
     system = pipelines["metrics/cvm_system"]

@@ -36,7 +36,12 @@ receivers:
     collection_interval: 30s
     root_path: ${env:CVM_HOSTMETRICS_ROOT_PATH}
     scrapers:
-      cpu: {}
+      cpu:
+        metrics:
+          # The cpu attribute is opt-in since 0.157.0; keep one series per
+          # logical CPU and state, as earlier collector versions sent.
+          system.cpu.time:
+            attributes: [cpu, state]
       memory: {}
       load: {}
       paging: {}

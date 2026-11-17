@@ -512,8 +512,12 @@ must and must not do:
 - only the four receivers it has today, and no OTLP input or other listener;
 - only `compose-manager`, `compose-manager-launcher` and `dns-cloudflare` container logs leave the
   CVM (`filter/management_logs`, after `transform/docker_metadata`);
-- Docker Stats reports the image ID, uptime and restarts with the Compose labels the dashboard
-  uses, and the raw Compose config path label is deleted before export;
+- Docker Stats reports the image ID, uptime, restarts and healthcheck state with the Compose
+  labels the dashboard uses, and the raw Compose config path label is deleted before export;
+- `system.cpu.time` keeps its per-CPU `cpu` attribute next to `state` (opt-in since collector
+  0.157.0);
+- the collector's own metrics are served on `localhost:8888` with the `service.name`,
+  `service.instance.id` and `service.version` labels;
 - every pipeline starts with `memory_limiter` and exports only to the gateway, through one FIFO
   queue persisted to `file_storage`;
 - the config reads only the environment variables listed below.
