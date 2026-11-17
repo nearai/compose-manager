@@ -498,6 +498,143 @@ are authenticating with is also valid there, or you lose access until you can us
   `_otelcol_management`): `env_overrides_applied_sha256_*`, `env_overrides_applied_at_*`,
   `env_overrides_error_*`, `env_overrides_rejected_sha256_*`.
 
+## Collector image updates and container restarts through the launcher
+
+The launcher manages exactly two containers: `compose-manager` and `otelcol-management` (the
+OpenTelemetry collector for management telemetry). It never touches any other container; model
+containers are compose-manager's job. Besides the compose-manager image channel and the env
+overrides above, it can
+
+1. update the collector's image and configuration from a signed image channel, and
+2. restart either container on request,
+
+both without a CVM restart. Image swaps, env-override applies and restarts run one at a time.
+
+### Collector image
+
+`otelcol/` builds `compose-manager-otelcol`: the pinned upstream `opentelemetry-collector-contrib`
+image plus `otelcol/config.yaml` at `/etc/otelcol-management/config.yaml` (default command
+`--config=/etc/otelcol-management/config.yaml`). The image keeps the base image's user; the CVM
+compose decides which user runs it. `build.yml` builds it on every push, signs it with cosign
+(keyless), attaches build provenance and pushes `:staging` plus an immutable
+`staging-<date>-<sha>` tag, exactly like the launcher image. `promote.yml` and `rollback.yml` retag
+it together with the other images; `promote-compose-manager.yml` leaves it untouched and fails if
+its `:prod` or `:latest` digest changes. Until the first `promote.yml` run creates those tags,
+`promote-compose-manager.yml` records them as absent and fails if either appears, and
+`rollback.yml` leaves the collector's tags alone when the target `prod-*` tag has no collector
+image. Any registry error other than a missing tag still fails both workflows. CI runs `otelcol-contrib validate` against `config.yaml`
+in the pinned image with dummy values, and `otelcol/check_config.py`, which pins what the config
+must and must not do:
+
+- only the four receivers it has today, and no OTLP input or other listener;
+- only `compose-manager`, `compose-manager-launcher` and `dns-cloudflare` container logs leave the
+  CVM (`filter/management_logs`, after `transform/docker_metadata`);
+- Docker Stats reports the image ID, uptime, restarts and healthcheck state with the Compose
+  labels the dashboard uses, and the raw Compose config path label is deleted before export;
+- `system.cpu.time` keeps its per-CPU `cpu` attribute next to `state` (opt-in since collector
+  0.157.0);
+- the collector's own metrics are served on `localhost:8888` with the `service.name`,
+  `service.instance.id` and `service.version` labels;
+- every pipeline starts with `memory_limiter` and exports only to the gateway, through one FIFO
+  queue persisted to `file_storage`;
+- the config reads only the environment variables listed below.
+
+The configuration reads these environment variables, which the CVM compose must provide:
+`MONITORING_INGEST_TOKEN`, `MONITORING_OTLP_ENDPOINT` (full HTTPS URL of the telemetry gateway),
+`OTELCOL_MEMORY_LIMIT_MIB`, `OTELCOL_MEMORY_SPIKE_LIMIT_MIB`, `CVM_NAME`, `CVM_HOST`,
+`DD_HOSTNAME`, `ENV` and `CVM_HOSTMETRICS_ROOT_PATH`.
+
+### Required shape of the `otelcol-management` service
+
+The service in the CVM app-compose must take its image from a variable, carry no inline
+configuration, and run with whatever user and mounts it needs (for example the Docker socket and
+the container log directory for the collector's receivers):
+
+```yaml
+services:
+  otelcol-management:
+    image: ${OTELCOL_MANAGEMENT_IMAGE:-<repo>@sha256:<pinned digest>}
+    user: "0:0"          # if the receivers need it; the image does not set it
+    restart: unless-stopped
+    environment:
+      - MONITORING_INGEST_TOKEN=${MONITORING_INGEST_TOKEN}
+      - MONITORING_OTLP_ENDPOINT=${MONITORING_OTLP_ENDPOINT}
+      # ... the other variables listed above ...
+    # no `configs:` / inline config and no `command:` override: the config is in the image
+```
+
+The launcher container needs `OTELCOL_IMAGE_REPO=<registry-user>/compose-manager-otelcol` in its
+environment, the app-compose mounted read-only at `/dstack-app/docker-compose.yaml`, and the same
+`LAUNCHER_CHANNEL` and `LAUNCHER_COSIGN_IDENTITY_REGEXP` it already uses for compose-manager.
+
+### Update flow
+
+On every poll cycle (after the compose-manager check) the launcher:
+
+1. reads the channel tag's digest and rejects anything that is not `sha256:<64 hex>`;
+2. checks that the app-compose defines `otelcol-management`;
+3. pulls `<repo>@<digest>` and verifies its cosign signature (same identity as compose-manager);
+4. writes `OTELCOL_MANAGEMENT_IMAGE=<repo>@<digest>` to its env file (`.env.launcher`);
+5. recreates only `otelcol-management` (`docker compose -p dstack -f <app-compose> ... up -d
+   --no-deps --force-recreate otelcol-management`) with the decrypted CVM env plus a temporary
+   `0600` env file holding the image and the current `MONITORING_INGEST_TOKEN` override, if any;
+6. runs the same stability check as for env overrides (the container stays up and does not
+   restart for `LAUNCHER_OTEL_STABLE_SECONDS`).
+
+If the recreate or the stability check fails, the launcher puts the previous image value back (or
+removes the variable so the app-compose default applies), recreates again, records the failure in
+`otelcol_error` and backs off for 30 minutes (`LAUNCHER_OTELCOL_BACKOFF_SECONDS`). The compose-manager
+image channel is not blocked by that backoff. A failed signature check or pull changes nothing.
+
+The update is a no-op, reported once in the log and as `otelcol_status` in the state file, when
+`OTELCOL_IMAGE_REPO` is unset or the app-compose is not mounted, so existing CVMs keep working
+unchanged. After a CVM reboot, dstack recreates the container from the app-compose default; the
+launcher re-applies the recorded digest at startup (and seeds it from the running container if
+none is recorded yet). If re-applying fails, it reverts to the app-compose image, clears the
+recorded digest and backs off.
+
+State keys (`launcher-state.json`): `otelcol_status`, `otelcol_digest`, `otelcol_last_update`,
+`otelcol_error`, `otelcol_backoff_until_epoch`. Env override applies (`MONITORING_INGEST_TOKEN`)
+keep passing the recorded image, so rotating the token never reverts the collector image.
+
+### Restarting a managed container
+
+```bash
+# Ask the launcher to restart one of the two containers
+curl -X POST https://<host-name>:8080/admin/launcher/restart \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"target": "otelcol-management"}'
+# 202 {"status":"accepted","request_id":"<32 hex>","target":"otelcol-management","requested_at":"<rfc3339>"}
+
+# Check the result
+curl https://<host-name>:8080/admin/launcher/restart -H "Authorization: Bearer <token>"
+# {"status":"ok","launcher_reported":true,"targets":["compose-manager","otelcol-management"],
+#  "request":{"id":"<32 hex>","target":"otelcol-management","requested_at":"...","status":"handled"},
+#  "result":{"id":"<32 hex>","target":"otelcol-management","outcome":"ok","reason":"","finished_at":"..."}}
+```
+
+`target` must be exactly `compose-manager` or `otelcol-management`; anything else is `400`. The
+request is a `0600` file (`launcher-restart-request.json`, written atomically) on the shared work
+volume containing the request id, the target and a timestamp. While a request is pending the API
+answers `409` (a request the launcher never reported on stops blocking after 15 minutes). The
+launcher watches for the file on the same interval as the env overrides, runs `docker restart
+<target>`, health checks it (`LAUNCHER_HEALTH_URL` for compose-manager, the stability check for the
+collector) and records `restart_last_id`, `restart_last_target`, `restart_last_outcome`
+(`ok`, `failed`, `rejected`), `restart_last_reason` and `restart_last_finished_at` in the state
+file. The request's `status` is `pending`, `handled` or `unhandled` (older than 15 minutes with no
+result). Restarting compose-manager restarts the process serving this API, so poll `GET` until the
+server answers again. A request left over from before the launcher started is closed as
+`abandoned`, never executed later. Requests and results never contain environment values.
+
+### Rollout
+
+The launcher image is pinned in the measured app-compose, so the first rollout of this launcher
+(and of the `OTELCOL_MANAGEMENT_IMAGE` / `OTELCOL_IMAGE_REPO` plumbing in the app-compose) still
+needs one CVM upgrade per host. After that, collector image and config changes need only a new
+image on the channel, and either container can be restarted through the API. Until the upgrade,
+`GET /admin/launcher/restart` reports `launcher_reported: false` and requests are not processed.
+
 ## Usage
 
 ### Running locally

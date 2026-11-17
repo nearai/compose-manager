@@ -62,3 +62,40 @@ jobs:
 
       - name: Run launcher env-override tests
         run: bash launcher/test/env_overrides_test.sh
+
+      - name: Run launcher collector and restart tests
+        run: bash launcher/test/otelcol_restart_test.sh
+
+      - name: Shellcheck launcher scripts
+        run: shellcheck -S warning launcher/launcher.sh launcher/test/*.sh
+
+  otelcol:
+    name: Collector config checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Check the config content
+        run: python3 otelcol/check_config.py otelcol/config.yaml
+
+      - name: Validate the config with the pinned collector image
+        run: |
+          set -euo pipefail
+          image=$(sed -n 's/^FROM //p' otelcol/Dockerfile)
+          docker run --rm \
+            -v "${PWD}/otelcol/config.yaml:/cfg.yaml:ro" \
+            -e MONITORING_INGEST_TOKEN=dummy-token-0123456789 \
+            -e MONITORING_OTLP_ENDPOINT=https://telemetry.example.com \
+            -e OTELCOL_MEMORY_LIMIT_MIB=512 \
+            -e OTELCOL_MEMORY_SPIKE_LIMIT_MIB=128 \
+            -e CVM_NAME=example-cvm \
+            -e CVM_HOST=example-host \
+            -e DD_HOSTNAME=example-host \
+            -e ENV=test \
+            -e CVM_HOSTMETRICS_ROOT_PATH=/ \
+            "$image" validate --config=/cfg.yaml
+
+      - name: Build the collector image
+        run: docker build otelcol
