@@ -189,9 +189,9 @@ jobs:
           retag_image() {
             local image="$1"
             local digest="$2"
-            skopeo copy "docker://${image}@${digest}" "docker://${image}:prod"
-            skopeo copy "docker://${image}@${digest}" "docker://${image}:latest"
-            skopeo copy "docker://${image}@${digest}" "docker://${image}:${{ steps.resolve.outputs.audit_tag }}"
+            skopeo copy --all "docker://${image}@${digest}" "docker://${image}:prod"
+            skopeo copy --all "docker://${image}@${digest}" "docker://${image}:latest"
+            skopeo copy --all "docker://${image}@${digest}" "docker://${image}:${{ steps.resolve.outputs.audit_tag }}"
           }
 
           retag_image "${{ steps.resolve.outputs.cm_image }}" "${{ steps.resolve.outputs.cm_target_digest }}"

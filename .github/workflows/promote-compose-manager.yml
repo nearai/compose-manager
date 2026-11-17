@@ -155,9 +155,9 @@ jobs:
           set -euo pipefail
           STAMP=$(date -u +%Y%m%d)
           CM_PROD_STAMPED_TAG="prod-${STAMP}-${CM_SHORT_SHA}"
-          skopeo copy "docker://${CM_IMAGE}@${CM_DIGEST}" "docker://${CM_IMAGE}:prod"
-          skopeo copy "docker://${CM_IMAGE}@${CM_DIGEST}" "docker://${CM_IMAGE}:${CM_PROD_STAMPED_TAG}"
-          skopeo copy "docker://${CM_IMAGE}@${CM_DIGEST}" "docker://${CM_IMAGE}:latest"
+          skopeo copy --all "docker://${CM_IMAGE}@${CM_DIGEST}" "docker://${CM_IMAGE}:prod"
+          skopeo copy --all "docker://${CM_IMAGE}@${CM_DIGEST}" "docker://${CM_IMAGE}:${CM_PROD_STAMPED_TAG}"
+          skopeo copy --all "docker://${CM_IMAGE}@${CM_DIGEST}" "docker://${CM_IMAGE}:latest"
           echo "CM_PROD_STAMPED_TAG=${CM_PROD_STAMPED_TAG}" >> "$GITHUB_ENV"
           echo "CM_PROD_STAMPED_REF=${CM_IMAGE}:${CM_PROD_STAMPED_TAG}" >> "$GITHUB_ENV"
 
