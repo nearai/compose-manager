@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "component": "compose-manager",
+  "snapshot": "20251020T000000Z",
+  "architecture": "amd64",
+  "image": "nearaidev/apt-bundle-compose-manager@sha256:3ca8a75cf13ab4cb76f9a2c09e0d3b1c22e4d7eeb4f6d0ebcf685b534f76867f",
+  "debian_manifest": "debian-packages.txt",
+  "docker_manifest": "docker-packages.txt",
+  "upstream_base_head": "c7fbaaf5f8a993c6a3c53ac3748ed3b28bafcea3",
+  "publication_pending": true,
+  "helper_pending": false,
+  "docker_key_fingerprint": "9DC858229FC7DD38854AE2D88D81803C0EBFCD88",
+  "helper_sha256": "20d710d30ff44ac93325a7c686366bdc110160c873409dc69affb9bded71eb34"
+}
