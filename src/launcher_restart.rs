@@ -29,7 +29,8 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use chrono::{DateTime, Utc};
+use crate::timestamp_now;
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use std::{
     io,
@@ -165,14 +166,12 @@ async fn write_request(work_dir: &Path, req: &RestartRequest) -> io::Result<()> 
 
 /// A request is pending while the launcher has not reported its id and it is
 /// not older than [`PENDING_MAX_AGE_SECS`].
-fn is_pending(req: &RestartRequest, result: Option<&LauncherResult>, now: DateTime<Utc>) -> bool {
+fn is_pending(req: &RestartRequest, result: Option<&LauncherResult>, now: Timestamp) -> bool {
     if result.is_some_and(|r| r.id == req.id) {
         return false;
     }
-    match DateTime::parse_from_rfc3339(&req.requested_at) {
-        Ok(at) => (now - at.with_timezone(&Utc)).num_seconds() < PENDING_MAX_AGE_SECS,
-        Err(_) => false,
-    }
+    crate::parse_record_timestamp(&req.requested_at)
+        .is_some_and(|at| now.duration_since(at).as_secs() < PENDING_MAX_AGE_SECS)
 }
 
 /// `POST /admin/launcher/restart` with `{"target": "compose-manager" |
@@ -209,7 +208,7 @@ pub(crate) async fn post_restart(
         let _guard = RESTART_LOCK.lock().await;
         let view = read_launcher_view(&state.work_dir).await;
         match read_request(&state.work_dir).await {
-            Ok(Some(existing)) if is_pending(&existing, view.result.as_ref(), Utc::now()) => {
+            Ok(Some(existing)) if is_pending(&existing, view.result.as_ref(), Timestamp::now()) => {
                 return (
                     StatusCode::CONFLICT,
                     Json(serde_json::json!({
@@ -231,7 +230,7 @@ pub(crate) async fn post_restart(
         let request = RestartRequest {
             id: new_request_id(),
             target,
-            requested_at: Utc::now().to_rfc3339(),
+            requested_at: timestamp_now(),
         };
         if let Err(e) = write_request(&state.work_dir, &request).await {
             warn!(error_kind = ?e.kind(), "Failed to write launcher restart request file");
@@ -243,7 +242,7 @@ pub(crate) async fn post_restart(
     };
 
     let action = DeploymentAction {
-        timestamp: Utc::now().to_rfc3339(),
+        timestamp: timestamp_now(),
         action: "launcher_restart".into(),
         file: Some(REQUEST_FILE_NAME.into()),
         services: vec![request.target.clone()],
@@ -280,7 +279,7 @@ pub(crate) async fn get_restart(State(state): State<Arc<AppState>>, headers: Hea
     let view = read_launcher_view(&state.work_dir).await;
     let request_json = request.as_ref().map(|r| {
         let handled = view.result.as_ref().is_some_and(|res| res.id == r.id);
-        let pending = is_pending(r, view.result.as_ref(), Utc::now());
+        let pending = is_pending(r, view.result.as_ref(), Timestamp::now());
         let status = if handled {
             "handled"
         } else if pending {
@@ -434,7 +433,7 @@ mod tests {
             let on_disk: RestartRequest = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
             assert_eq!(on_disk.id, id);
             assert_eq!(on_disk.target, *target);
-            assert!(DateTime::parse_from_rfc3339(&on_disk.requested_at).is_ok());
+            assert!(on_disk.requested_at.parse::<Timestamp>().is_ok());
             // No temp file left behind.
             let leftovers: Vec<_> = std::fs::read_dir(&dir)
                 .unwrap()
@@ -490,7 +489,7 @@ mod tests {
         let old = RestartRequest {
             id: "a".repeat(32),
             target: "compose-manager".into(),
-            requested_at: (Utc::now() - chrono::Duration::seconds(PENDING_MAX_AGE_SECS + 5)).to_rfc3339(),
+            requested_at: (Timestamp::now() - jiff::SignedDuration::from_secs(PENDING_MAX_AGE_SECS + 5)).to_string(),
         };
         write_request(&dir, &old).await.unwrap();
         let (status, body) = call(&state, "POST", Some(TOKEN), r#"{"target":"compose-manager"}"#).await;

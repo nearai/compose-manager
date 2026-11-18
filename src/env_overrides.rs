@@ -32,7 +32,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use chrono::Utc;
+use crate::timestamp_now;
 use serde::Deserialize;
 use sha2::Digest;
 use std::{
@@ -489,7 +489,7 @@ pub(crate) async fn put_env(
             // changed keys in `services` and the resulting file hash. No
             // `container`: which container is recreated depends on the keys.
             let action = DeploymentAction {
-                timestamp: Utc::now().to_rfc3339(),
+                timestamp: timestamp_now(),
                 action: name.into(),
                 file: Some(OVERRIDES_FILE_NAME.into()),
                 file_sha256: sha256.clone(),
