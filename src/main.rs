@@ -7,7 +7,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use chrono::{DateTime, Utc};
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
@@ -522,7 +522,7 @@ impl AppState {
             Ok(guard) => {
                 *self.in_flight.lock().expect("in_flight mutex poisoned") = Some(InFlightOp {
                     action: action.to_string(),
-                    started_at: Utc::now().to_rfc3339(),
+                    started_at: timestamp_now(),
                     tag: tag.clone(),
                     file,
                     services,
@@ -797,6 +797,19 @@ fn write_temp_env_file(work_dir: &Path, env: &HashMap<String, String>) -> Result
     Ok(path)
 }
 
+/// Action and restart records use an explicit UTC offset and groups of three fractional digits.
+fn timestamp_now() -> String {
+    let now = OffsetDateTime::now_utc();
+    let nanos = now.nanosecond();
+    let fraction = match nanos {
+        0 => String::new(),
+        n if n % 1_000_000 == 0 => format!(".{:03}", n / 1_000_000),
+        n if n % 1_000 == 0 => format!(".{:06}", n / 1_000),
+        n => format!(".{n:09}"),
+    };
+    format!("{}T{:02}:{:02}:{:02}{fraction}+00:00", now.date(), now.hour(), now.minute(), now.second())
+}
+
 // --- GitHub ---
 
 #[derive(Deserialize)]
@@ -812,11 +825,12 @@ struct GitHubCommitDetail {
 
 #[derive(Deserialize)]
 struct GitHubCommitter {
-    date: DateTime<Utc>,
+    #[serde(with = "time::serde::rfc3339")]
+    date: OffsetDateTime,
 }
 
 struct TagInfo {
-    commit_date: DateTime<Utc>,
+    commit_date: OffsetDateTime,
     commit_sha: String,
 }
 
@@ -858,7 +872,7 @@ async fn validate_tag(state: &AppState, tag: &str) -> Result<TagInfo, (StatusCod
         (code, e.to_string())
     })?;
 
-    let min_age = Utc::now() - chrono::Duration::hours(state.min_tag_age_hours);
+    let min_age = OffsetDateTime::now_utc() - time::Duration::hours(state.min_tag_age_hours);
     if tag_info.commit_date > min_age {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -1165,10 +1179,10 @@ const ACTION_LOG_RETENTION_DAYS: i64 = 7;
 /// (they can change what is running). Order of kept entries is preserved.
 fn prune_actions(
     actions: &mut Vec<DeploymentAction>,
-    now: DateTime<Utc>,
+    now: OffsetDateTime,
     deployed: &[DeployedRecord],
 ) -> usize {
-    let cutoff = now - chrono::Duration::days(ACTION_LOG_RETENTION_DAYS);
+    let cutoff = now - time::Duration::days(ACTION_LOG_RETENTION_DAYS);
     let last_started = actions
         .iter()
         .rposition(|a| a.action == "compose_manager_started");
@@ -1196,7 +1210,7 @@ fn prune_actions(
         if Some(i) == last_started {
             return true;
         }
-        if match DateTime::parse_from_rfc3339(&a.timestamp) {
+        if match OffsetDateTime::parse(&a.timestamp, &Rfc3339) {
             Ok(t) => t >= cutoff,
             Err(_) => true,
         } {
@@ -1227,7 +1241,7 @@ fn deployed_snapshot(state: &AppState) -> Vec<DeployedRecord> {
 /// stored log. Pure; takes no lock and never writes.
 fn report_actions(
     actions: &[DeploymentAction],
-    now: DateTime<Utc>,
+    now: OffsetDateTime,
     deployed: &[DeployedRecord],
 ) -> Vec<DeploymentAction> {
     let mut v = actions.to_vec();
@@ -1254,7 +1268,7 @@ async fn record_action(state: &Arc<AppState>, action: &DeploymentAction) -> Resu
     let deployed = deployed_snapshot(state);
     let mut actions = state.actions.write().await;
     actions.push(action.clone());
-    let removed = prune_actions(&mut actions, Utc::now(), &deployed);
+    let removed = prune_actions(&mut actions, OffsetDateTime::now_utc(), &deployed);
     if removed > 0 {
         info!(removed, kept = actions.len(), "Pruned action log");
     }
@@ -2399,7 +2413,7 @@ async fn compose_up(
 
         let actor = extract_actor(&headers);
         let action = DeploymentAction {
-            timestamp: Utc::now().to_rfc3339(),
+            timestamp: timestamp_now(),
             action: "compose_stage".into(),
             image: None,
             tag: Some(payload.tag.clone()),
@@ -2454,7 +2468,7 @@ async fn compose_up(
 
     let actor = extract_actor(&headers);
     let action = DeploymentAction {
-        timestamp: Utc::now().to_rfc3339(),
+        timestamp: timestamp_now(),
         action: "compose_up".into(),
         image: None,
         tag: Some(payload.tag.clone()),
@@ -2571,7 +2585,7 @@ async fn compose_down(
 
     let actor = extract_actor(&headers);
     let action = DeploymentAction {
-        timestamp: Utc::now().to_rfc3339(),
+        timestamp: timestamp_now(),
         action: "compose_down".into(),
         image: None,
         tag: Some(payload.tag),
@@ -2706,7 +2720,7 @@ async fn docker_restart(
         Ok(_) => {
             let actor = extract_actor(&headers);
             let action = DeploymentAction {
-                timestamp: Utc::now().to_rfc3339(),
+                timestamp: timestamp_now(),
                 action: "docker_restart".into(),
                 image: None,
                 tag: None,
@@ -2753,7 +2767,7 @@ async fn docker_clean(
         Ok(_) => {
             let actor = extract_actor(&headers);
             let action = DeploymentAction {
-                timestamp: Utc::now().to_rfc3339(),
+                timestamp: timestamp_now(),
                 action: "docker_clean".into(),
                 image: None,
                 tag: None,
@@ -2912,7 +2926,7 @@ async fn docker_evict(
     }
 
     let action = DeploymentAction {
-        timestamp: Utc::now().to_rfc3339(),
+        timestamp: timestamp_now(),
         action: "docker_evict".into(),
         image: None,
         tag: None,
@@ -3033,7 +3047,7 @@ async fn attestation_report(
     let deployed = deployed_snapshot(&state);
     let actions = {
         let guard = state.actions.read().await;
-        report_actions(&guard, Utc::now(), &deployed)
+        report_actions(&guard, OffsetDateTime::now_utc(), &deployed)
     };
 
     let (actions_hash_hex, report_data) = attestation_binding(&actions, &nonce_bytes);
@@ -3209,7 +3223,7 @@ async fn algif_blacklist_action(
     };
     let actor = extract_actor(&headers);
     let action = DeploymentAction {
-        timestamp: Utc::now().to_rfc3339(),
+        timestamp: timestamp_now(),
         action: action_name.into(),
         image: None,
         tag: None,
@@ -3319,7 +3333,7 @@ async fn dstack_agent_action(
     // are valuable forensic signal), then map systemctl exit to HTTP status.
     let actor = extract_actor(&headers);
     let act = DeploymentAction {
-        timestamp: Utc::now().to_rfc3339(),
+        timestamp: timestamp_now(),
         action: format!("dstack_agent_{}", action),
         image: None,
         tag: None,
@@ -4374,7 +4388,7 @@ async fn main() -> Result<()> {
     // Best-effort: a disk-persist failure still leaves the entry in memory for
     // this process, which is what attestation reads.
     let _ = record_action(&state, &DeploymentAction {
-        timestamp: Utc::now().to_rfc3339(),
+        timestamp: timestamp_now(),
         action: "compose_manager_started".into(),
         container: Some("compose-manager".into()),
         image: running_image,
@@ -5260,10 +5274,8 @@ mod tests {
         }
     }
 
-    fn fixed_now() -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339("2026-11-13T12:00:00+00:00")
-            .unwrap()
-            .with_timezone(&Utc)
+    fn fixed_now() -> OffsetDateTime {
+        OffsetDateTime::parse("2026-11-13T12:00:00+00:00", &Rfc3339).unwrap()
     }
 
     #[test]
@@ -5475,7 +5487,7 @@ mod tests {
             .collect(),
         );
         let state = Arc::new(inner);
-        let new = act(&Utc::now().to_rfc3339(), "docker_restart");
+        let new = act(&timestamp_now(), "docker_restart");
         record_action(&state, &new).await.unwrap();
         let mem = state.actions.read().await.clone();
         let names: Vec<_> = mem.iter().map(|a| a.action.as_str()).collect();
