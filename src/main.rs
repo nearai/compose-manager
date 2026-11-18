@@ -7,7 +7,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+use jiff::{SignedDuration, Timestamp};
 use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
@@ -797,24 +797,21 @@ fn write_temp_env_file(work_dir: &Path, env: &HashMap<String, String>) -> Result
     Ok(path)
 }
 
-fn parse_record_timestamp(value: &str) -> Option<OffsetDateTime> {
-    if !matches!(value.as_bytes().get(10), Some(b'T' | b't' | b' ')) {
-        return None;
-    }
-    OffsetDateTime::parse(value, &Rfc3339).ok()
+fn parse_record_timestamp(value: &str) -> Option<Timestamp> {
+    value.parse().ok()
 }
 
 /// Action and restart records use an explicit UTC offset and groups of three fractional digits.
 fn timestamp_now() -> String {
-    let now = OffsetDateTime::now_utc();
-    let nanos = now.nanosecond();
-    let fraction = match nanos {
-        0 => String::new(),
-        n if n % 1_000_000 == 0 => format!(".{:03}", n / 1_000_000),
-        n if n % 1_000 == 0 => format!(".{:06}", n / 1_000),
-        n => format!(".{n:09}"),
+    let now = Timestamp::now();
+    let nanos = now.subsec_nanosecond();
+    let digits = match nanos {
+        0 => 0,
+        n if n % 1_000_000 == 0 => 3,
+        n if n % 1_000 == 0 => 6,
+        _ => 9,
     };
-    format!("{}T{:02}:{:02}:{:02}{fraction}+00:00", now.date(), now.hour(), now.minute(), now.second())
+    format!("{:.digits$}", now.display_with_offset(jiff::tz::Offset::UTC))
 }
 
 // --- GitHub ---
@@ -832,12 +829,11 @@ struct GitHubCommitDetail {
 
 #[derive(Deserialize)]
 struct GitHubCommitter {
-    #[serde(with = "time::serde::rfc3339")]
-    date: OffsetDateTime,
+    date: Timestamp,
 }
 
 struct TagInfo {
-    commit_date: OffsetDateTime,
+    commit_date: Timestamp,
     commit_sha: String,
 }
 
@@ -879,7 +875,7 @@ async fn validate_tag(state: &AppState, tag: &str) -> Result<TagInfo, (StatusCod
         (code, e.to_string())
     })?;
 
-    let min_age = OffsetDateTime::now_utc() - time::Duration::hours(state.min_tag_age_hours);
+    let min_age = Timestamp::now() - SignedDuration::from_hours(state.min_tag_age_hours);
     if tag_info.commit_date > min_age {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -1186,10 +1182,10 @@ const ACTION_LOG_RETENTION_DAYS: i64 = 7;
 /// (they can change what is running). Order of kept entries is preserved.
 fn prune_actions(
     actions: &mut Vec<DeploymentAction>,
-    now: OffsetDateTime,
+    now: Timestamp,
     deployed: &[DeployedRecord],
 ) -> usize {
-    let cutoff = now - time::Duration::days(ACTION_LOG_RETENTION_DAYS);
+    let cutoff = now - SignedDuration::from_hours(24 * ACTION_LOG_RETENTION_DAYS);
     let last_started = actions
         .iter()
         .rposition(|a| a.action == "compose_manager_started");
@@ -1245,7 +1241,7 @@ fn deployed_snapshot(state: &AppState) -> Vec<DeployedRecord> {
 /// stored log. Pure; takes no lock and never writes.
 fn report_actions(
     actions: &[DeploymentAction],
-    now: OffsetDateTime,
+    now: Timestamp,
     deployed: &[DeployedRecord],
 ) -> Vec<DeploymentAction> {
     let mut v = actions.to_vec();
@@ -1272,7 +1268,7 @@ async fn record_action(state: &Arc<AppState>, action: &DeploymentAction) -> Resu
     let deployed = deployed_snapshot(state);
     let mut actions = state.actions.write().await;
     actions.push(action.clone());
-    let removed = prune_actions(&mut actions, OffsetDateTime::now_utc(), &deployed);
+    let removed = prune_actions(&mut actions, Timestamp::now(), &deployed);
     if removed > 0 {
         info!(removed, kept = actions.len(), "Pruned action log");
     }
@@ -3051,7 +3047,7 @@ async fn attestation_report(
     let deployed = deployed_snapshot(&state);
     let actions = {
         let guard = state.actions.read().await;
-        report_actions(&guard, OffsetDateTime::now_utc(), &deployed)
+        report_actions(&guard, Timestamp::now(), &deployed)
     };
 
     let (actions_hash_hex, report_data) = attestation_binding(&actions, &nonce_bytes);
@@ -5278,8 +5274,8 @@ mod tests {
         }
     }
 
-    fn fixed_now() -> OffsetDateTime {
-        OffsetDateTime::parse("2026-11-13T12:00:00+00:00", &Rfc3339).unwrap()
+    fn fixed_now() -> Timestamp {
+        "2026-11-13T12:00:00+00:00".parse().unwrap()
     }
 
     #[test]
@@ -5321,7 +5317,7 @@ mod tests {
 
     #[test]
     fn prune_actions_keeps_unparseable_timestamp() {
-        let mut v = vec![act("not-a-date", "compose_up"), act("2020-01-01T00:00:00+00:00", "x")];
+        let mut v = vec![act("not-a-date", "compose_up"), act("2020-01-01T00:00Z[UTC]", "x")];
         assert_eq!(prune_actions(&mut v, fixed_now(), &[]), 1);
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].timestamp, "not-a-date");
