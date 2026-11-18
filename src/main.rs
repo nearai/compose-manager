@@ -797,6 +797,13 @@ fn write_temp_env_file(work_dir: &Path, env: &HashMap<String, String>) -> Result
     Ok(path)
 }
 
+fn parse_record_timestamp(value: &str) -> Option<OffsetDateTime> {
+    if !matches!(value.as_bytes().get(10), Some(b'T' | b't' | b' ')) {
+        return None;
+    }
+    OffsetDateTime::parse(value, &Rfc3339).ok()
+}
+
 /// Action and restart records use an explicit UTC offset and groups of three fractional digits.
 fn timestamp_now() -> String {
     let now = OffsetDateTime::now_utc();
@@ -1210,10 +1217,7 @@ fn prune_actions(
         if Some(i) == last_started {
             return true;
         }
-        if match OffsetDateTime::parse(&a.timestamp, &Rfc3339) {
-            Ok(t) => t >= cutoff,
-            Err(_) => true,
-        } {
+        if parse_record_timestamp(&a.timestamp).is_none_or(|t| t >= cutoff) {
             return true;
         }
         anchors.iter().any(|(f, anchor)| {

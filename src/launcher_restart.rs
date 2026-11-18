@@ -30,7 +30,9 @@ use axum::{
     Json,
 };
 use crate::timestamp_now;
-use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+use time::OffsetDateTime;
+#[cfg(test)]
+use time::format_description::well_known::Rfc3339;
 use serde::{Deserialize, Serialize};
 use std::{
     io,
@@ -170,10 +172,8 @@ fn is_pending(req: &RestartRequest, result: Option<&LauncherResult>, now: Offset
     if result.is_some_and(|r| r.id == req.id) {
         return false;
     }
-    match OffsetDateTime::parse(&req.requested_at, &Rfc3339) {
-        Ok(at) => (now - at).whole_seconds() < PENDING_MAX_AGE_SECS,
-        Err(_) => false,
-    }
+    crate::parse_record_timestamp(&req.requested_at)
+        .is_some_and(|at| (now - at).whole_seconds() < PENDING_MAX_AGE_SECS)
 }
 
 /// `POST /admin/launcher/restart` with `{"target": "compose-manager" |
