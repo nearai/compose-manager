@@ -4073,26 +4073,50 @@ async fn containers_serving_model(model: &str) -> Result<Vec<String>> {
     let mut args: Vec<&str> = vec!["inspect"];
     args.extend(ids.iter().copied());
     let raw = run_command_async("docker", &args).await?;
+    serving_containers_from_inspect(&raw, model)
+}
 
+/// Deserialize a field that may be missing or an explicit JSON `null` into
+/// its `Default` value.
+fn deserialize_null_default<'de, D, T>(deserializer: D) -> std::result::Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+/// Parse the JSON array printed by `docker inspect` and return the names of
+/// the containers that serve `model`. Missing or `null` argv/env fields are
+/// treated as empty; invalid JSON is an error.
+fn serving_containers_from_inspect(raw: &str, model: &str) -> Result<Vec<String>> {
     #[derive(Deserialize)]
     struct ContainerConfig {
-        #[serde(default, rename = "Cmd")]
+        #[serde(default, rename = "Cmd", deserialize_with = "deserialize_null_default")]
         cmd: Vec<String>,
-        #[serde(default, rename = "Env")]
+        #[serde(default, rename = "Env", deserialize_with = "deserialize_null_default")]
         env: Vec<String>,
     }
     #[derive(Deserialize)]
     struct Inspected {
-        #[serde(default, rename = "Name")]
+        #[serde(
+            default,
+            rename = "Name",
+            deserialize_with = "deserialize_null_default"
+        )]
         name: String,
-        #[serde(default, rename = "Args")]
+        #[serde(
+            default,
+            rename = "Args",
+            deserialize_with = "deserialize_null_default"
+        )]
         args: Vec<String>,
         #[serde(default, rename = "Config")]
         config: Option<ContainerConfig>,
     }
 
-    let inspected: Vec<Inspected> = serde_json::from_str(&raw)
-        .with_context(|| "failed to parse `docker inspect` output")?;
+    let inspected: Vec<Inspected> =
+        serde_json::from_str(raw).with_context(|| "failed to parse `docker inspect` output")?;
 
     let mut matches = Vec::new();
     for c in inspected {
@@ -4445,6 +4469,64 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- container inspect parsing ---
+
+    #[test]
+    fn inspect_null_fields_do_not_error_and_serving_container_is_reported() {
+        let raw = r#"[
+            {"Name": "/idle", "Args": null, "Config": {"Cmd": null, "Env": null}},
+            {"Name": "/serving", "Args": ["--model", "org/model-a"], "Config": {"Cmd": null, "Env": ["A=b"]}}
+        ]"#;
+        let got = serving_containers_from_inspect(raw, "org/model-a").unwrap();
+        assert_eq!(got, vec!["serving".to_string()]);
+    }
+
+    #[test]
+    fn inspect_null_config_does_not_error() {
+        let raw = r#"[{"Name": "/idle", "Args": null, "Config": null}]"#;
+        assert!(serving_containers_from_inspect(raw, "org/model-a")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn inspect_missing_fields_do_not_error() {
+        assert!(serving_containers_from_inspect("[{}]", "org/model-a")
+            .unwrap()
+            .is_empty());
+        let raw = r#"[{"Name": "/idle", "Config": {}}]"#;
+        assert!(serving_containers_from_inspect(raw, "org/model-a")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn inspect_invalid_json_fails_closed() {
+        assert!(serving_containers_from_inspect("not json", "org/model-a").is_err());
+        assert!(serving_containers_from_inspect("", "org/model-a").is_err());
+        assert!(serving_containers_from_inspect(r#"{"Name": "/x"}"#, "org/model-a").is_err());
+    }
+
+    #[test]
+    fn inspect_does_not_match_model_sharing_a_prefix() {
+        let raw = r#"[
+            {"Name": "/other", "Args": ["--model", "org/model-a-other"], "Config": {"Env": ["MODEL_NAME=org/model-a-other"]}}
+        ]"#;
+        assert!(serving_containers_from_inspect(raw, "org/model-a")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn inspect_matches_model_from_cmd_and_env() {
+        let raw = r#"[
+            {"Name": "/by-cmd", "Args": null, "Config": {"Cmd": ["--model-path=org/model-a"], "Env": null}},
+            {"Name": "/by-env", "Config": {"Env": ["MODEL_NAME=org/model-a"]}}
+        ]"#;
+        let got = serving_containers_from_inspect(raw, "org/model-a").unwrap();
+        assert_eq!(got, vec!["by-cmd".to_string(), "by-env".to_string()]);
+    }
 
     // --- request path / tag validation ---
 
