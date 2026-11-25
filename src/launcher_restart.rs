@@ -329,6 +329,8 @@ mod tests {
             bearer_tokens: vec![TOKEN.into()],
             github_owner: "test".into(),
             github_repo_name: "test".into(),
+            github_api_base: url::Url::parse(crate::GITHUB_API_BASE).unwrap(),
+            default_branch: tokio::sync::OnceCell::new(),
             min_tag_age_hours: 0,
             work_dir: work_dir.to_path_buf(),
             env_files: vec![],
