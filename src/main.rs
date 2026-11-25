@@ -1043,12 +1043,22 @@ async fn default_branch(state: &AppState) -> Result<&str, (StatusCode, String)> 
             }
             let repo: GitHubRepo = resp.json().await
                 .map_err(|_| github_unavailable(WHAT, "unexpected GitHub API response"))?;
-            validate_tag_name(&repo.default_branch)
-                .map_err(|_| github_unavailable(WHAT, "unexpected branch name from GitHub"))?;
+            if !is_usable_branch_name(&repo.default_branch) {
+                return Err(github_unavailable(WHAT, "unexpected branch name from GitHub"));
+            }
             Ok(repo.default_branch)
         })
         .await
         .map(String::as_str)
+}
+
+/// Whether a branch name reported by GitHub can be placed in a request path:
+/// `/`-separated components, none of them empty, `.` or `..`, and no control
+/// characters. Any other character is fine, because each component is
+/// percent-encoded as its own path segment.
+fn is_usable_branch_name(name: &str) -> bool {
+    !name.chars().any(char::is_control)
+        && name.split('/').all(|c| !c.is_empty() && c != "." && c != "..")
 }
 
 /// True when the comparison `<sha>...<branch>` says `sha` is the branch head or
@@ -6893,6 +6903,24 @@ Build cache usage: 0B
         let (state, requests) = fake_github("release/2026", 0).await;
         assert!(validate_deploy_tag(&state, MAIN_OLD).await.is_ok());
         assert!(requests.lock().unwrap().contains(&compare_request(MAIN_OLD, "release/2026")));
+    }
+
+    #[tokio::test]
+    async fn default_branch_may_use_characters_a_request_tag_may_not() {
+        let (state, requests) = fake_github("release+prod", 0).await;
+        assert!(validate_tag_name("release+prod").is_err());
+        assert!(validate_deploy_tag(&state, MAIN_OLD).await.is_ok());
+        assert!(requests.lock().unwrap().contains(&compare_request(MAIN_OLD, "release+prod")));
+    }
+
+    #[test]
+    fn branch_name_check_only_refuses_what_cannot_be_a_path() {
+        for good in ["main", "release/2026", "release+prod", "feature#1", "gr\u{f6}\u{df}e", "a.b", "v1@2"] {
+            assert!(is_usable_branch_name(good), "should accept {:?}", good);
+        }
+        for bad in ["", "/main", "main/", "a//b", ".", "..", "a/../b", "a/./b", "a\nb", "a\0b"] {
+            assert!(!is_usable_branch_name(bad), "should refuse {:?}", bad);
+        }
     }
 
     #[test]
