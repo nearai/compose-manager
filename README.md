@@ -24,14 +24,38 @@ Start containers with `docker compose up -d`.
 {"file": "docker-compose.prod.yml"}
 ```
 
+**`tag`:** a tag, branch name or commit SHA of the configured repository. It is
+resolved to a commit, and the compose file is read at that commit. The commit
+must be at least `MIN_TAG_AGE_HOURS` old and must be on the repository's default
+branch (the branch head or one of its ancestors). A tag or commit that is not on
+the default branch is refused with `400`; if GitHub cannot answer the check, the
+request is refused with `502`. This applies to every mode of `/compose/up`
+(apply, `dry_run`, `materialize_only`). The default branch is looked up once per
+process.
+
+**`file`:** a relative path of `/`-separated components made of `[A-Za-z0-9._-]`.
+No component may start with `.`, and the first component may not be one of
+compose-manager's own files in the work directory (`actions.json`,
+`deployed.json`, `.env.launcher`, `env-overrides`, `compose-manager.yml`,
+`launcher-state.json`, `launcher-restart-request.json`), nor one of those names
+followed by a dot suffix such as `.tmp` or `.lock`. The same rule applies to
+`file` in `/compose/down` and `/compose/logs`.
+
 **`dry_run` (plan-only):** set `"dry_run": true` to PLAN a change without applying
 it. compose-manager simulates ONLY the `up` phase with docker compose's global
 `--dry-run`, so automation can see the per-service config-hash recreate verdict
 (which `file_sha256` cannot predict) before SIGTERMing a model mid-warmup. It is
-genuinely read-only: no action is recorded, no deployed state is written, and
-nothing is pulled/built/spawned. All scoping fields (`tag`, `file`, `project`,
-`services`, `env`, `force_recreate`) are honored so the plan reflects the EXACT
-command a real apply with the same body would run.
+genuinely read-only: no action is recorded, no deployed state is written,
+nothing is written to the work directory, and nothing is pulled/built/spawned.
+The fetched compose file and the request's `env` are placed in a private
+temporary directory outside the work directory, which is removed when the
+stream ends. Compose is given the file's usual directory as
+`--project-directory`, so relative paths in the file resolve as they do on a
+real apply. Because the planned file is not kept, a later `/compose/down` or
+`/compose/logs` for the same `file` reads the copy left by the last apply or
+`materialize_only` run. All scoping fields (`tag`, `file`, `project`, `services`, `env`,
+`force_recreate`) are honored so the plan reflects what a real apply with the
+same body would do.
 
 The streamed NDJSON carries the RAW dry-run output lines (the documented
 contract) plus a terminal additive `plan` event with a best-effort parsed
@@ -82,8 +106,11 @@ Stop containers with `docker compose down`.
 {"file": "docker-compose.prod.yml", "volumes": true}
 ```
 
-- `file`: Specify compose file (optional)
+- `file`: Specify compose file (optional; same naming rule as `/compose/up`)
 - `volumes`: Also remove volumes with `-v` flag (default: false)
+
+`/compose/down` reads nothing from the repository: `tag` must resolve to a
+commit that is at least `MIN_TAG_AGE_HOURS` old, and is recorded with the action.
 
 ### POST /compose/logs
 
@@ -741,9 +768,10 @@ docker run -d \
 | Code | Description |
 |------|-------------|
 | 200 | Success |
-| 400 | Bad request (tag not found, tag too recent) |
+| 400 | Bad request (tag not found, tag too recent, tag not on the default branch, invalid file name) |
 | 401 | Unauthorized (missing or invalid token) |
 | 500 | Internal server error (git/docker command failed) |
+| 502 | GitHub could not confirm that the tag is on the default branch |
 
 ## License
 

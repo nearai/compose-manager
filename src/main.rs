@@ -25,7 +25,7 @@ use subtle::ConstantTimeEq;
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::Command as AsyncCommand,
-    sync::{Mutex, RwLock},
+    sync::{Mutex, OnceCell, RwLock},
 };
 use tracing::{error, info, warn};
 
@@ -469,6 +469,12 @@ struct AppState {
     bearer_tokens: Vec<String>,
     github_owner: String,
     github_repo_name: String,
+    /// Base URL of the GitHub REST API (`GITHUB_API_BASE`). Not configurable;
+    /// tests point it at a local server.
+    github_api_base: url::Url,
+    /// Default branch of the repository, looked up on first use and kept for
+    /// the life of the process.
+    default_branch: OnceCell<String>,
     min_tag_age_hours: i64,
     work_dir: PathBuf,
     env_files: Vec<String>,
@@ -658,11 +664,12 @@ struct ComposeRequest {
     /// PLAN-only mode. When true, simulate the `up` with docker compose's global
     /// `--dry-run` and report what WOULD recreate, WITHOUT applying anything.
     /// Genuinely read-only: no action recorded, no deployed_* / deployed.json
-    /// write, nothing pulled/built/spawned. Lets automation see the per-service
-    /// config-hash recreate verdict (which file_sha256 cannot predict) before
-    /// SIGTERMing a model mid-warmup. Honors all scoping fields (tag/file/
-    /// project/services/env/force_recreate) so the plan reflects the EXACT
-    /// command a real apply with the same body would run. See `compose_up`.
+    /// write, nothing written to the work directory, nothing pulled/built/
+    /// spawned. Lets automation see the per-service config-hash recreate
+    /// verdict (which file_sha256 cannot predict) before SIGTERMing a model
+    /// mid-warmup. Honors all scoping fields (tag/file/project/services/env/
+    /// force_recreate) so the plan reflects what a real apply with the same
+    /// body would do. See `compose_up`.
     #[serde(default)]
     dry_run: bool,
     /// Pre-materialize artifacts (pull images + run in-CVM `build:` + download
@@ -788,13 +795,115 @@ fn write_temp_env_file(work_dir: &Path, env: &HashMap<String, String>) -> Result
     let mut bytes = [0u8; 8];
     rand::thread_rng().fill_bytes(&mut bytes);
     let path = work_dir.join(format!(".env.tmp.{}", hex::encode(bytes)));
-    let content: String = env
-        .iter()
+    std::fs::write(&path, env_file_content(env)).context("Failed to write temp env file")?;
+    Ok(path)
+}
+
+/// The request's `env` map as the body of a Compose `--env-file`.
+fn env_file_content(env: &HashMap<String, String>) -> String {
+    env.iter()
         .map(|(k, v)| format!("{}={}", k, v))
         .collect::<Vec<_>>()
-        .join("\n");
-    std::fs::write(&path, content).context("Failed to write temp env file")?;
-    Ok(path)
+        .join("\n")
+}
+
+/// The files of a plan-only (`dry_run`) request. They live in a private
+/// directory under the system temp dir, so planning writes nothing into the
+/// work directory. The directory is removed when this value is dropped.
+struct PlanFiles {
+    dir: PathBuf,
+    /// The fetched compose file.
+    compose_file: PathBuf,
+    /// The request's `env`, when it has any.
+    env_file: Option<PathBuf>,
+    /// Directory the compose file occupies on a real apply, relative to the
+    /// work directory (`.` for a top-level file). Passed to Compose as
+    /// `--project-directory` so relative paths in the file resolve as they do
+    /// on a real apply.
+    project_dir: String,
+}
+
+impl Drop for PlanFiles {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Compose arguments of a plan-only run: `up_args` as a real apply runs them,
+/// behind the global `--project-directory` flag (it must precede the
+/// subcommand).
+fn plan_phase_args<'a>(plan: &'a PlanFiles, up_args: &[&'a str]) -> Vec<&'a str> {
+    let mut args = vec!["--project-directory", plan.project_dir.as_str()];
+    args.extend_from_slice(up_args);
+    args
+}
+
+/// Writes the inputs of a plan-only request to a new private directory under
+/// the system temp dir. `file` goes through the same name checks as on a real
+/// apply.
+fn stage_plan_files(
+    work_dir: &Path,
+    file: &str,
+    content: &str,
+    env: &HashMap<String, String>,
+) -> Result<PlanFiles, String> {
+    stage_plan_files_in(&std::env::temp_dir(), work_dir, file, content, env)
+}
+
+/// `stage_plan_files` with the temp dir given. Refuses a temp dir that is
+/// inside `work_dir`, so the plan files are never written there.
+fn stage_plan_files_in(
+    tmp_root: &Path,
+    work_dir: &Path,
+    file: &str,
+    content: &str,
+    env: &HashMap<String, String>,
+) -> Result<PlanFiles, String> {
+    use std::io::Write;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+
+    safe_target_path(work_dir, file)?;
+    let (project_dir, name) = file.rsplit_once('/').unwrap_or((".", file));
+
+    let tmp_root = std::fs::canonicalize(tmp_root)
+        .map_err(|e| format!("Failed to resolve temp dir: {}", e))?;
+    // The work directory may not exist yet; then nothing can be inside it.
+    if std::fs::canonicalize(work_dir).is_ok_and(|work| tmp_root.starts_with(work)) {
+        return Err("Failed to stage plan files: temp dir is inside the work dir".into());
+    }
+    let dir = tmp_root.join(format!("compose-manager-plan-{:016x}", rand::random::<u64>()));
+    if dir.to_str().is_none() {
+        return Err("Failed to stage plan files: temp dir path is not valid UTF-8".into());
+    }
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&dir)
+        .map_err(|e| format!("Failed to create plan dir: {}", e))?;
+    // From here on the directory is removed on every return path.
+    let mut plan = PlanFiles {
+        compose_file: dir.join(name),
+        env_file: None,
+        project_dir: project_dir.to_string(),
+        dir,
+    };
+
+    let write_private = |path: &Path, body: &str| -> Result<(), String> {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .and_then(|mut f| f.write_all(body.as_bytes()))
+            .map_err(|e| format!("Failed to write plan file: {}", e))
+    };
+    write_private(&plan.compose_file, content)?;
+    if !env.is_empty() {
+        // The compose file name never starts with a dot, so this cannot clash.
+        let env_file = plan.dir.join(".env.plan");
+        write_private(&env_file, &env_file_content(env))?;
+        plan.env_file = Some(env_file);
+    }
+    Ok(plan)
 }
 
 fn parse_record_timestamp(value: &str) -> Option<Timestamp> {
@@ -837,15 +946,24 @@ struct TagInfo {
     commit_sha: String,
 }
 
-async fn get_tag_info(state: &AppState, tag: &str) -> Result<TagInfo> {
-    let mut url = url::Url::parse("https://api.github.com/repos/").expect("static url");
+const GITHUB_API_BASE: &str = "https://api.github.com/";
+
+/// `<api base>/repos/<owner>/<repo>` followed by `segments`, each pushed as one
+/// path segment.
+fn repo_api_url<'a>(state: &AppState, segments: impl IntoIterator<Item = &'a str>) -> Result<url::Url> {
+    let mut url = state.github_api_base.clone();
     {
         let mut seg = url.path_segments_mut().map_err(|_| anyhow!("cannot-be-a-base url"))?;
-        seg.pop_if_empty().push(&state.github_owner).push(&state.github_repo_name).push("commits");
-        for c in tag.split('/') {
-            seg.push(c);
+        seg.pop_if_empty().push("repos").push(&state.github_owner).push(&state.github_repo_name);
+        for s in segments {
+            seg.push(s);
         }
     }
+    Ok(url)
+}
+
+async fn get_tag_info(state: &AppState, tag: &str) -> Result<TagInfo> {
+    let url = repo_api_url(state, std::iter::once("commits").chain(tag.split('/')))?;
 
     let resp = state.http.get(url)
         .header("User-Agent", "compose-manager")
@@ -886,23 +1004,175 @@ async fn validate_tag(state: &AppState, tag: &str) -> Result<TagInfo, (StatusCod
     Ok(tag_info)
 }
 
+#[derive(Deserialize)]
+struct GitHubRepo {
+    default_branch: String,
+}
+
+#[derive(Deserialize)]
+struct GitHubComparison {
+    status: String,
+    behind_by: u64,
+    merge_base_commit: GitHubCommitRef,
+}
+
+#[derive(Deserialize)]
+struct GitHubCommitRef {
+    sha: String,
+}
+
+/// Maps a failed GitHub lookup to a 502 that names what could not be checked.
+fn github_unavailable(what: &str, detail: impl std::fmt::Display) -> (StatusCode, String) {
+    (StatusCode::BAD_GATEWAY, format!("could not check {}: {}", what, detail))
+}
+
+/// The default branch of the configured repository, asked from GitHub on first
+/// use. A failed lookup is not remembered, so the next request tries again.
+async fn default_branch(state: &AppState) -> Result<&str, (StatusCode, String)> {
+    const WHAT: &str = "the repository's default branch";
+    state
+        .default_branch
+        .get_or_try_init(|| async {
+            let url = repo_api_url(state, []).map_err(|e| github_unavailable(WHAT, e))?;
+            let resp = state.http.get(url)
+                .header("User-Agent", "compose-manager")
+                .send().await
+                .map_err(|_| github_unavailable(WHAT, "GitHub API request failed"))?;
+            if !resp.status().is_success() {
+                return Err(github_unavailable(WHAT, format!("GitHub API returned HTTP {}", resp.status().as_u16())));
+            }
+            let repo: GitHubRepo = resp.json().await
+                .map_err(|_| github_unavailable(WHAT, "unexpected GitHub API response"))?;
+            if !is_usable_branch_name(&repo.default_branch) {
+                return Err(github_unavailable(WHAT, "unexpected branch name from GitHub"));
+            }
+            Ok(repo.default_branch)
+        })
+        .await
+        .map(String::as_str)
+}
+
+/// Whether a branch name reported by GitHub can be placed in a request path:
+/// `/`-separated components, none of them empty, `.` or `..`, and no control
+/// characters. Any other character is fine, because each component is
+/// percent-encoded as its own path segment.
+fn is_usable_branch_name(name: &str) -> bool {
+    !name.chars().any(char::is_control)
+        && name.split('/').all(|c| !c.is_empty() && c != "." && c != "..")
+}
+
+/// True when the comparison `<sha>...<branch>` says `sha` is the branch head or
+/// one of its ancestors: the branch is not behind it and their merge base is
+/// `sha` itself.
+fn comparison_contains(cmp: &GitHubComparison, sha: &str) -> bool {
+    matches!(cmp.status.as_str(), "ahead" | "identical")
+        && cmp.behind_by == 0
+        && cmp.merge_base_commit.sha == sha
+}
+
+/// Requires the commit `sha` (what `tag` resolved to) to be on the default
+/// branch of the configured repository: the branch head or one of its
+/// ancestors. Anything GitHub does not positively confirm is refused: 400 when
+/// the commit is not on the branch, 502 when the check itself could not be
+/// completed.
+async fn ensure_on_default_branch(state: &AppState, tag: &str, sha: &str) -> Result<(), (StatusCode, String)> {
+    const WHAT: &str = "the tag against the default branch";
+    ensure_commit_sha(sha).map_err(|e| github_unavailable(WHAT, e))?;
+    let branch = default_branch(state).await?;
+
+    // compare/<sha>...heads/<branch>: `heads/` selects the branch by its
+    // qualified name. Asking for the second page of one commit keeps the
+    // changed-file list out of the response.
+    let base = format!("{}...heads", sha);
+    let mut url = repo_api_url(state, ["compare", base.as_str()].into_iter().chain(branch.split('/')))
+        .map_err(|e| github_unavailable(WHAT, e))?;
+    url.query_pairs_mut().append_pair("per_page", "1").append_pair("page", "2");
+
+    let resp = state.http.get(url)
+        .header("User-Agent", "compose-manager")
+        .send().await
+        .map_err(|_| github_unavailable(WHAT, "GitHub API request failed"))?;
+
+    let not_on_branch = || {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("tag '{}' is not on the default branch: commit {} is not reachable from '{}'", tag, sha, branch),
+        )
+    };
+    let status = resp.status();
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Err(not_on_branch());
+    }
+    if !status.is_success() {
+        return Err(github_unavailable(WHAT, format!("GitHub API returned HTTP {}", status.as_u16())));
+    }
+    let cmp: GitHubComparison = resp.json().await
+        .map_err(|_| github_unavailable(WHAT, "unexpected GitHub API response"))?;
+    if !comparison_contains(&cmp, sha) {
+        return Err(not_on_branch());
+    }
+    Ok(())
+}
+
+/// Resolves the `tag` of a deploy request: everything `validate_tag` checks,
+/// and the commit must be on the repository's default branch.
+async fn validate_deploy_tag(state: &AppState, tag: &str) -> Result<TagInfo, (StatusCode, String)> {
+    let tag_info = validate_tag(state, tag).await?;
+    ensure_on_default_branch(state, tag, &tag_info.commit_sha).await?;
+    Ok(tag_info)
+}
+
 // --- Request path validation ---
 
 const MAX_COMPOSE_FILE_LEN: usize = 255;
 const MAX_TAG_LEN: usize = 200;
 
+/// Entries that compose-manager and its launcher keep at the top of the work
+/// directory. Compose files are placed in the same directory, so a request path
+/// may not start with one of these names.
+const RESERVED_WORK_DIR_NAMES: &[&str] = &[
+    "actions.json",
+    "deployed.json",
+    ".env.launcher",
+    "env-overrides",
+    "compose-manager.yml",
+    "launcher-state.json",
+    "launcher-restart-request.json",
+];
+
+/// True when `name` is a reserved work directory entry, or one followed by a
+/// dot suffix (`actions.json.tmp`, `launcher-state.json.lock`). ASCII case is
+/// ignored.
+fn is_reserved_work_dir_name(name: &str) -> bool {
+    let name = name.as_bytes();
+    RESERVED_WORK_DIR_NAMES.iter().any(|reserved| {
+        let reserved = reserved.as_bytes();
+        name.len() >= reserved.len()
+            && name[..reserved.len()].eq_ignore_ascii_case(reserved)
+            && (name.len() == reserved.len() || name[reserved.len()] == b'.')
+    })
+}
+
 /// Validates the `file` field: a relative path of `/`-separated components made
-/// only of `[A-Za-z0-9._-]`; no empty, `.` or `..` components.
+/// only of `[A-Za-z0-9._-]`; no empty component, none starting with `.` (which
+/// also excludes `.` and `..`), and a first component that is not reserved for
+/// compose-manager's own files (see `RESERVED_WORK_DIR_NAMES`).
 fn validate_compose_file(file: &str) -> Result<(), String> {
     if file.is_empty() || file.len() > MAX_COMPOSE_FILE_LEN {
         return Err("invalid file: must be 1-255 characters".into());
     }
     for comp in file.split('/') {
-        if comp.is_empty() || comp == "." || comp == ".."
+        if comp.is_empty()
             || !comp.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
         {
             return Err("invalid file: must be a relative path of [A-Za-z0-9._-] components".into());
         }
+        if comp.starts_with('.') {
+            return Err("invalid file: path components must not start with '.'".into());
+        }
+    }
+    if file.split('/').next().is_some_and(is_reserved_work_dir_name) {
+        return Err("invalid file: name is reserved for compose-manager's own files".into());
     }
     Ok(())
 }
@@ -1620,6 +1890,9 @@ struct NdjsonStream {
     /// materialization done-marker, before `done`. `None` for every other
     /// stream.
     staged: Option<StagedMeta>,
+    /// The scratch files of a `dry_run` plan, kept here so they are removed
+    /// when the stream ends or is dropped. `None` for every other stream.
+    plan_files: Option<PlanFiles>,
 }
 
 /// Metadata for the `materialize_only` terminal `staged` event. The image
@@ -2234,6 +2507,7 @@ fn stream_docker_compose_phased(
         dry_run_lines: if dry_run { Some(Vec::new()) } else { None },
         pending_terminal: None,
         staged: None,
+        plan_files: None,
     })
 }
 
@@ -2285,7 +2559,9 @@ async fn compose_up(
         }
     };
 
-    let tag_info = match validate_tag(&state, &payload.tag).await {
+    // Every mode of this handler (apply, dry_run, materialize_only) reads the
+    // compose file at this commit, so it must be on the default branch.
+    let tag_info = match validate_deploy_tag(&state, &payload.tag).await {
         Ok(info) => info,
         Err((code, msg)) => return err_response(code, msg),
     };
@@ -2304,7 +2580,7 @@ async fn compose_up(
         Err(msg) => return err_response(StatusCode::BAD_REQUEST, msg),
     };
 
-    // Fetch compose file from GitHub and write to work directory
+    // Fetch the compose file from GitHub at the resolved commit.
     let content = match fetch_github_file(&state, &payload.tag, &tag_info.commit_sha, &file).await {
         Ok(c) => c,
         Err(e) => return err_response(StatusCode::BAD_REQUEST, e.to_string()),
@@ -2312,6 +2588,58 @@ async fn compose_up(
 
     let file_sha256 = hex::encode(sha2::Sha256::digest(content.as_bytes()));
 
+    let mut up_args = vec!["up", "-d", "--remove-orphans"];
+    if payload.force_recreate {
+        up_args.push("--force-recreate");
+    }
+
+    // PLAN-only (dry_run): read-only, and handled before anything below
+    // touches the work directory. The fetched compose file and the request's
+    // env file are written to a private directory under the system temp dir
+    // (removed when the stream ends); nothing is created or changed in the
+    // work directory. We simulate ONLY the `up` phase with docker compose's
+    // global `--dry-run` (the recreate verdict comes from up's per-service
+    // config-hash; the pull/build dry-run output is noise) and STOP. We do NOT
+    // record an action, NOT write deployed_* or deployed.json, and attach NO
+    // completion (no Slack, no deployed rotation) and NO endpoint_retry
+    // (recovery only makes sense for a real apply). No container is started
+    // and nothing is pulled or built. All scoping fields (tag/file/project/
+    // services/env/force_recreate) are honored, and `--project-directory`
+    // points at the directory the file occupies on a real apply, so relative
+    // paths resolve the same way and the plan matches what an apply with this
+    // body does.
+    if payload.dry_run {
+        let plan = match stage_plan_files(&state.work_dir, &file, &content, &payload.env) {
+            Ok(p) => p,
+            Err(msg) => {
+                let code = if msg.starts_with("invalid file") { StatusCode::BAD_REQUEST } else { StatusCode::INTERNAL_SERVER_ERROR };
+                return err_response(code, msg);
+            }
+        };
+        let plan_args = plan_phase_args(&plan, &up_args);
+        let mut stream = match stream_docker_compose_phased(
+            &state.work_dir,
+            &project,
+            &[&plan_args],
+            &plan.compose_file.to_string_lossy(),
+            &state.env_files,
+            &payload.services,
+            plan.env_file.clone(),
+            true, // --dry-run
+        ) {
+            Ok(s) => s,
+            Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        };
+        stream.compose_guard = Some(guard);
+        stream.plan_files = Some(plan);
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/x-ndjson")
+            .body(Body::from_stream(stream))
+            .unwrap();
+    }
+
+    // Real apply or stage: place the compose file in the work directory.
     if let Err(e) = tokio::fs::create_dir_all(&state.work_dir).await {
         return err_response(StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create work dir: {}", e));
     }
@@ -2335,42 +2663,6 @@ async fn compose_up(
     // Clone the path before it's moved into the stream, so the retry can pass
     // the same --env-file to the retried `up` (the stream owns cleanup).
     let temp_env_file_for_retry = temp_env_file.clone();
-
-    let mut up_args = vec!["up", "-d", "--remove-orphans"];
-    if payload.force_recreate {
-        up_args.push("--force-recreate");
-    }
-
-    // PLAN-only (dry_run): genuinely read-only. We simulate ONLY the `up` phase
-    // with docker compose's global `--dry-run` (the recreate verdict comes from
-    // up's per-service config-hash; the pull/build dry-run output is noise per
-    // the audit), and STOP. We do NOT record an action, NOT write deployed_* or
-    // deployed.json, and attach NO completion (no Slack, no deployed rotation)
-    // and NO endpoint_retry (recovery only makes sense for a real apply).
-    // Nothing mutates, spawns, pulls, builds, or writes the action log. All
-    // scoping fields (tag/file/project/services/env/force_recreate) are honored
-    // so the plan reflects the EXACT command a real apply with this body runs.
-    if payload.dry_run {
-        let mut stream = match stream_docker_compose_phased(
-            &state.work_dir,
-            &project,
-            &[&up_args],
-            &file,
-            &state.env_files,
-            &payload.services,
-            temp_env_file,
-            true, // --dry-run
-        ) {
-            Ok(s) => s,
-            Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-        };
-        stream.compose_guard = Some(guard);
-        return Response::builder()
-            .status(StatusCode::OK)
-            .header("Content-Type", "application/x-ndjson")
-            .body(Body::from_stream(stream))
-            .unwrap();
-    }
 
     // MATERIALIZE-only: run the prologue (already done above: lock, validate_tag
     // age-guard, fetch+write compose, env validation, temp-env-file, project
@@ -4381,6 +4673,8 @@ async fn main() -> Result<()> {
         bearer_tokens,
         github_owner,
         github_repo_name,
+        github_api_base: url::Url::parse(GITHUB_API_BASE).expect("static url"),
+        default_branch: OnceCell::new(),
         min_tag_age_hours,
         work_dir,
         env_files,
@@ -4547,6 +4841,41 @@ mod tests {
             "docker-compose.yml", "prod/GLM-5.3.yaml", "dir/sub/file.yml",
             "prod/GLM-5.3-Flash-SGL-TP2x4-W4AFP8-Q8Canary.yaml", "prod/Qwen3.5-122B.yaml",
             "scripts/fixtures/pre-v7/small-models.pre-v7.yaml", "a_b/c..d.yml",
+        ] {
+            assert!(validate_compose_file(good).is_ok(), "should accept {:?}", good);
+        }
+    }
+
+    #[test]
+    fn compose_file_validator_rejects_reserved_and_dot_leading_names() {
+        for bad in [
+            // compose-manager's and the launcher's own files
+            "actions.json", "deployed.json", ".env.launcher", "env-overrides", "compose-manager.yml",
+            "launcher-state.json", "launcher-restart-request.json",
+            // their temp and lock siblings, and anything placed under those names
+            "actions.json.tmp", "deployed.json.tmp", "compose-manager.yml.tmp", "launcher-state.json.lock",
+            "launcher-state.json.lock/x.yaml", "actions.json/x.yaml", "env-overrides/prod.yaml",
+            // ASCII case is ignored
+            "Actions.JSON", "COMPOSE-MANAGER.YML",
+            // a component starting with a dot, at any depth
+            ".env", ".env.tmp.0011223344556677", ".hidden/x.yaml", ".github/workflows/ci.yaml",
+            "prod/.env", "prod/.x.yaml.0000000000000001.tmp", "a/.b/c.yaml",
+        ] {
+            assert!(validate_compose_file(bad).is_err(), "should reject {:?}", bad);
+            assert!(safe_target_path(Path::new("/app/work"), bad).is_err(), "should not map {:?}", bad);
+            let (code, _) = validate_request_paths(None, Some(bad)).unwrap_err();
+            assert_eq!(code, StatusCode::BAD_REQUEST, "{:?}", bad);
+        }
+    }
+
+    #[test]
+    fn compose_file_validator_accepts_names_close_to_reserved_ones() {
+        for good in [
+            // reserved names only count as the first component
+            "prod/actions.json", "prod/deployed.json", "staging/compose-manager.yml",
+            // a shared prefix is not a match
+            "actions.jsonl", "deployed.json5", "env-overrides-test.yaml", "compose-manager.yaml",
+            "launcher-state.yaml", "small-models.yaml", "experiments/a.b.yaml",
         ] {
             assert!(validate_compose_file(good).is_ok(), "should accept {:?}", good);
         }
@@ -4730,6 +5059,10 @@ mod tests {
             ("/compose/logs", r#"{"file":"a/../../b"}"#),
             ("/compose/logs", r#"{"file":"a.yml","services":["a b"]}"#),
             ("/docker/restart", r#"{"container":"--time=0"}"#),
+            ("/compose/up", r#"{"tag":"v1","file":"deployed.json"}"#),
+            ("/compose/up", r#"{"tag":"v1","file":".env.launcher","dry_run":true}"#),
+            ("/compose/down", r#"{"tag":"v1","file":"compose-manager.yml"}"#),
+            ("/compose/logs", r#"{"file":"prod/.env"}"#),
         ];
         for (path, body) in cases {
             let (status, msg) = post_json(path, body).await;
@@ -5126,6 +5459,154 @@ mod tests {
         assert!(!args.iter().any(|a| a == "--dry-run"), "real apply must never carry --dry-run");
         assert_eq!(args[0], "compose");
         assert_eq!(args[1], "-p");
+    }
+
+    // --- dry_run writes outside the work directory ---
+
+    /// Every entry under `root`: path relative to it, whether it is a
+    /// directory, and the bytes of a file. Sorted, so two snapshots compare.
+    fn dir_snapshot(root: &Path) -> Vec<(PathBuf, bool, Vec<u8>)> {
+        fn walk(root: &Path, dir: &Path, out: &mut Vec<(PathBuf, bool, Vec<u8>)>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                let rel = path.strip_prefix(root).unwrap().to_path_buf();
+                if std::fs::symlink_metadata(&path).unwrap().is_dir() {
+                    out.push((rel, true, Vec::new()));
+                    walk(root, &path, out);
+                } else {
+                    out.push((rel, false, std::fs::read(&path).unwrap()));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(root, root, &mut out);
+        out.sort();
+        out
+    }
+
+    /// A work directory holding state files and one deployed compose file.
+    fn populated_work_dir() -> PathBuf {
+        let work = temp_work_dir();
+        std::fs::write(work.join("actions.json"), "[]").unwrap();
+        std::fs::write(work.join("deployed.json"), "{}").unwrap();
+        std::fs::write(work.join(".env.launcher"), "A=1\n").unwrap();
+        std::fs::create_dir_all(work.join("prod")).unwrap();
+        std::fs::write(work.join("prod/x.yaml"), "services: {old: {image: a}}\n").unwrap();
+        work
+    }
+
+    #[test]
+    fn staging_a_plan_leaves_the_work_dir_unchanged() {
+        use std::os::unix::fs::PermissionsExt;
+        let work = populated_work_dir();
+        let before = dir_snapshot(&work);
+        let content = "services: {new: {image: b}}\n";
+        let env = HashMap::from([("K".to_string(), "v".to_string())]);
+
+        // An already deployed file, a new file, a new directory, a top-level file.
+        for (file, project_dir) in [
+            ("prod/x.yaml", "prod"),
+            ("prod/new.yaml", "prod"),
+            ("newdir/sub/y.yaml", "newdir/sub"),
+            ("top.yaml", "."),
+        ] {
+            let plan = stage_plan_files(&work, file, content, &env).unwrap();
+            assert_eq!(dir_snapshot(&work), before, "work dir changed while planning {}", file);
+            assert!(!plan.dir.starts_with(work.canonicalize().unwrap()), "{}", plan.dir.display());
+            assert_eq!(plan.project_dir, project_dir);
+            assert_eq!(plan.compose_file.parent(), Some(plan.dir.as_path()));
+            assert_eq!(std::fs::read_to_string(&plan.compose_file).unwrap(), content);
+            let env_file = plan.env_file.clone().expect("env file");
+            assert_eq!(env_file.parent(), Some(plan.dir.as_path()));
+            assert_eq!(std::fs::read_to_string(&env_file).unwrap(), "K=v");
+            let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&plan.dir), 0o700);
+            assert_eq!(mode(&plan.compose_file), 0o600);
+            assert_eq!(mode(&env_file), 0o600);
+
+            let dir = plan.dir.clone();
+            drop(plan);
+            assert!(!dir.exists(), "plan dir must be removed on drop");
+            assert_eq!(dir_snapshot(&work), before, "work dir changed after planning {}", file);
+        }
+
+        // No env in the request: no env file is written.
+        let plan = stage_plan_files(&work, "prod/x.yaml", content, &HashMap::new()).unwrap();
+        assert!(plan.env_file.is_none());
+        assert_eq!(std::fs::read_dir(&plan.dir).unwrap().count(), 1);
+        drop(plan);
+        assert_eq!(dir_snapshot(&work), before);
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn staging_a_plan_does_not_create_a_missing_work_dir() {
+        let work = std::env::temp_dir().join(format!("cm-test-absent-{:016x}", rand::random::<u64>()));
+        let plan = stage_plan_files(&work, "prod/x.yaml", "services: {}\n", &HashMap::new()).unwrap();
+        assert!(plan.compose_file.exists());
+        assert!(!work.exists());
+        drop(plan);
+        assert!(!work.exists());
+    }
+
+    #[test]
+    fn staging_a_plan_applies_the_file_name_checks() {
+        let work = populated_work_dir();
+        let before = dir_snapshot(&work);
+        for bad in ["deployed.json", ".env.launcher", "../x.yaml", "prod/.env", "/etc/x"] {
+            let err = stage_plan_files(&work, bad, "x", &HashMap::new()).err().expect(bad);
+            assert!(err.starts_with("invalid file"), "{:?}: {}", bad, err);
+        }
+        assert_eq!(dir_snapshot(&work), before);
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn staging_a_plan_refuses_a_temp_dir_inside_the_work_dir() {
+        let work = populated_work_dir();
+        std::fs::create_dir_all(work.join("tmp")).unwrap();
+        let before = dir_snapshot(&work);
+        for tmp_root in [work.clone(), work.join("tmp")] {
+            assert!(stage_plan_files_in(&tmp_root, &work, "prod/x.yaml", "x", &HashMap::new()).is_err());
+        }
+        assert_eq!(dir_snapshot(&work), before);
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn plan_command_takes_its_files_from_the_plan_dir() {
+        let work = populated_work_dir();
+        let env = HashMap::from([("K".to_string(), "v".to_string())]);
+        let plan = stage_plan_files(&work, "prod/x.yaml", "services: {}\n", &env).unwrap();
+        let compose_file = plan.compose_file.to_str().unwrap().to_string();
+        let env_file = plan.env_file.as_ref().unwrap().to_str().unwrap().to_string();
+
+        let cmd = build_compose_cmd(
+            &work,
+            "glm",
+            &plan_phase_args(&plan, &["up", "-d", "--remove-orphans"]),
+            &compose_file,
+            &["/app/.env".to_string()],
+            &["vllm".to_string()],
+            plan.env_file.as_deref(),
+            true,
+        );
+        assert_eq!(
+            cmd_args(&cmd),
+            [
+                "compose", "--dry-run", "-p", "glm", "-f", compose_file.as_str(),
+                "--env-file", "/app/.env", "--env-file", env_file.as_str(),
+                // where prod/x.yaml lives on a real apply, relative to the work dir
+                "--project-directory", "prod",
+                "up", "-d", "--remove-orphans", "--", "vllm",
+            ]
+        );
+        assert_eq!(cmd.as_std().get_current_dir(), Some(work.as_path()));
+        let work_real = work.canonicalize().unwrap();
+        for path in [&compose_file, &env_file] {
+            assert!(!Path::new(path).starts_with(&work) && !Path::new(path).starts_with(&work_real), "{}", path);
+        }
+        let _ = std::fs::remove_dir_all(&work);
     }
 
     #[test]
@@ -5958,6 +6439,8 @@ mod tests {
             bearer_tokens: vec!["test-token".into()],
             github_owner: "test".into(),
             github_repo_name: "test".into(),
+            github_api_base: url::Url::parse(GITHUB_API_BASE).unwrap(),
+            default_branch: OnceCell::new(),
             min_tag_age_hours: 0,
             work_dir: PathBuf::from("/tmp/compose-manager-test"),
             env_files: vec![],
@@ -6268,6 +6751,198 @@ Build cache usage: 0B
         // The images-section row must not leak into volume sizes.
         assert!(!sizes.contains_key("foo"));
     }
+
+    // --- deploy tags must be on the default branch ---
+
+    const MAIN_HEAD: &str = "1111111111111111111111111111111111111111";
+    /// An older commit on the default branch; the tag `v1.2.3` points at it.
+    const MAIN_OLD: &str = "2222222222222222222222222222222222222222";
+    /// Head of the branch `feature`, which forked from `MAIN_OLD`.
+    const SIDE_BRANCH: &str = "3333333333333333333333333333333333333333";
+    /// A commit ahead of the default branch.
+    const AHEAD_OF_MAIN: &str = "4444444444444444444444444444444444444444";
+    /// A commit the comparison endpoint does not know.
+    const NOT_COMPARABLE: &str = "5555555555555555555555555555555555555555";
+    /// A commit for which the comparison endpoint fails.
+    const COMPARE_FAILS: &str = "6666666666666666666666666666666666666666";
+
+    /// Answers the three GitHub REST calls made for repository `o/r`.
+    fn fake_github_response(path: &str, default_branch: &str) -> Response {
+        let ok = |v: serde_json::Value| Json(v).into_response();
+        let Some(rest) = path.strip_prefix("/repos/o/r") else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        if rest.is_empty() {
+            return ok(serde_json::json!({"default_branch": default_branch}));
+        }
+        if let Some(reference) = rest.strip_prefix("/commits/") {
+            let sha = match reference {
+                "v1.2.3" => MAIN_OLD,
+                "main" => MAIN_HEAD,
+                "feature" => SIDE_BRANCH,
+                MAIN_HEAD | MAIN_OLD | SIDE_BRANCH | AHEAD_OF_MAIN | NOT_COMPARABLE | COMPARE_FAILS => reference,
+                _ => return StatusCode::NOT_FOUND.into_response(),
+            };
+            return ok(serde_json::json!({
+                "sha": sha,
+                "commit": {"committer": {"date": "2020-01-01T00:00:00Z"}},
+            }));
+        }
+        if let Some(basehead) = rest.strip_prefix("/compare/") {
+            let Some(sha) = basehead.strip_suffix(&format!("...heads/{}", default_branch)) else {
+                return StatusCode::NOT_FOUND.into_response();
+            };
+            let (status, behind_by, merge_base) = match sha {
+                MAIN_HEAD => ("identical", 0, MAIN_HEAD),
+                MAIN_OLD => ("ahead", 0, MAIN_OLD),
+                SIDE_BRANCH => ("diverged", 2, MAIN_OLD),
+                AHEAD_OF_MAIN => ("behind", 1, MAIN_HEAD),
+                COMPARE_FAILS => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                _ => return StatusCode::NOT_FOUND.into_response(),
+            };
+            return ok(serde_json::json!({
+                "status": status,
+                "ahead_by": 7,
+                "behind_by": behind_by,
+                "merge_base_commit": {"sha": merge_base},
+            }));
+        }
+        StatusCode::NOT_FOUND.into_response()
+    }
+
+    /// A test state whose GitHub API is a local server for repository `o/r`,
+    /// plus the path and query of every request that server received. The
+    /// first `failing_repo_lookups` default-branch lookups answer 503.
+    async fn fake_github(
+        default_branch: &'static str,
+        failing_repo_lookups: usize,
+    ) -> (Arc<AppState>, Arc<StdMutex<Vec<String>>>) {
+        let requests = Arc::new(StdMutex::new(Vec::<String>::new()));
+        let seen = requests.clone();
+        let app = Router::new().fallback(move |uri: axum::http::Uri| {
+            let seen = seen.clone();
+            async move {
+                let earlier_lookups = {
+                    let mut seen = seen.lock().unwrap();
+                    let n = seen.iter().filter(|r| r.as_str() == "/repos/o/r").count();
+                    seen.push(uri.path_and_query().map(|p| p.to_string()).unwrap_or_default());
+                    n
+                };
+                if uri.path() == "/repos/o/r" && earlier_lookups < failing_repo_lookups {
+                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                }
+                fake_github_response(uri.path(), default_branch)
+            }
+        });
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let base = format!("http://{}/", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut state = make_test_state();
+        let config = Arc::get_mut(&mut state).unwrap();
+        config.github_owner = "o".into();
+        config.github_repo_name = "r".into();
+        config.github_api_base = url::Url::parse(&base).unwrap();
+        config.http = reqwest::Client::builder().no_proxy().build().unwrap();
+        (state, requests)
+    }
+
+    fn compare_request(sha: &str, branch: &str) -> String {
+        format!("/repos/o/r/compare/{}...heads/{}?per_page=1&page=2", sha, branch)
+    }
+
+    #[tokio::test]
+    async fn deploy_tag_accepts_a_release_tag_and_default_branch_commits() {
+        let (state, requests) = fake_github("main", 0).await;
+        // a release tag, the commit it points at, the branch head, the branch name
+        for (tag, sha) in [("v1.2.3", MAIN_OLD), (MAIN_OLD, MAIN_OLD), (MAIN_HEAD, MAIN_HEAD), ("main", MAIN_HEAD)] {
+            let info = validate_deploy_tag(&state, tag).await.unwrap_or_else(|(code, msg)| panic!("{}: {} {}", tag, code, msg));
+            assert_eq!(info.commit_sha, sha, "{}", tag);
+        }
+        let requests = requests.lock().unwrap();
+        // The resolved commit is the base of the comparison, the branch its head.
+        assert_eq!(requests.iter().filter(|r| **r == compare_request(MAIN_OLD, "main")).count(), 2);
+        assert_eq!(requests.iter().filter(|r| **r == compare_request(MAIN_HEAD, "main")).count(), 2);
+        // The default branch is looked up once.
+        assert_eq!(requests.iter().filter(|r| r.as_str() == "/repos/o/r").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn deploy_tag_refuses_a_commit_that_is_not_on_the_default_branch() {
+        let (state, requests) = fake_github("main", 0).await;
+        // a branch name, its head commit, a commit ahead of the default branch,
+        // a commit GitHub cannot compare with it
+        for tag in ["feature", SIDE_BRANCH, AHEAD_OF_MAIN, NOT_COMPARABLE] {
+            let (code, msg) = validate_deploy_tag(&state, tag).await.err().expect(tag);
+            assert_eq!(code, StatusCode::BAD_REQUEST, "{}: {}", tag, msg);
+            assert!(msg.contains("is not on the default branch") && msg.contains("'main'"), "{}", msg);
+        }
+        assert!(requests.lock().unwrap().contains(&compare_request(SIDE_BRANCH, "main")));
+        // compose_down only records its tag, so it keeps the previous rule.
+        assert_eq!(validate_tag(&state, "feature").await.ok().map(|i| i.commit_sha).as_deref(), Some(SIDE_BRANCH));
+    }
+
+    #[tokio::test]
+    async fn deploy_tag_is_refused_when_github_cannot_confirm_it() {
+        let (state, _) = fake_github("main", 1).await;
+        // The first default-branch lookup fails; nothing is remembered.
+        let (code, msg) = validate_deploy_tag(&state, MAIN_OLD).await.err().unwrap();
+        assert_eq!(code, StatusCode::BAD_GATEWAY, "{}", msg);
+        assert!(msg.contains("HTTP 503"), "{}", msg);
+        assert!(validate_deploy_tag(&state, MAIN_OLD).await.is_ok());
+        // The comparison itself fails.
+        let (code, msg) = validate_deploy_tag(&state, COMPARE_FAILS).await.err().unwrap();
+        assert_eq!(code, StatusCode::BAD_GATEWAY, "{}", msg);
+        assert!(msg.contains("HTTP 500"), "{}", msg);
+    }
+
+    #[tokio::test]
+    async fn default_branch_with_a_slash_keeps_its_path_segments() {
+        let (state, requests) = fake_github("release/2026", 0).await;
+        assert!(validate_deploy_tag(&state, MAIN_OLD).await.is_ok());
+        assert!(requests.lock().unwrap().contains(&compare_request(MAIN_OLD, "release/2026")));
+    }
+
+    #[tokio::test]
+    async fn default_branch_may_use_characters_a_request_tag_may_not() {
+        let (state, requests) = fake_github("release+prod", 0).await;
+        assert!(validate_tag_name("release+prod").is_err());
+        assert!(validate_deploy_tag(&state, MAIN_OLD).await.is_ok());
+        assert!(requests.lock().unwrap().contains(&compare_request(MAIN_OLD, "release+prod")));
+    }
+
+    #[test]
+    fn branch_name_check_only_refuses_what_cannot_be_a_path() {
+        for good in ["main", "release/2026", "release+prod", "feature#1", "gr\u{f6}\u{df}e", "a.b", "v1@2"] {
+            assert!(is_usable_branch_name(good), "should accept {:?}", good);
+        }
+        for bad in ["", "/main", "main/", "a//b", ".", "..", "a/../b", "a/./b", "a\nb", "a\0b"] {
+            assert!(!is_usable_branch_name(bad), "should refuse {:?}", bad);
+        }
+    }
+
+    #[test]
+    fn comparison_contains_needs_status_distance_and_merge_base_to_agree() {
+        let cmp = |status: &str, behind_by: u64, merge_base: &str| GitHubComparison {
+            status: status.into(),
+            behind_by,
+            merge_base_commit: GitHubCommitRef { sha: merge_base.into() },
+        };
+        assert!(comparison_contains(&cmp("ahead", 0, MAIN_OLD), MAIN_OLD));
+        assert!(comparison_contains(&cmp("identical", 0, MAIN_OLD), MAIN_OLD));
+        for bad in [
+            cmp("behind", 1, MAIN_HEAD),
+            cmp("diverged", 2, MAIN_HEAD),
+            cmp("ahead", 1, MAIN_OLD),
+            cmp("ahead", 0, MAIN_HEAD),
+            cmp("unknown", 0, MAIN_OLD),
+        ] {
+            assert!(!comparison_contains(&bad, MAIN_OLD));
+        }
+    }
+
 
     #[tokio::test]
     async fn slack_notification_posts_to_configured_webhook() {
